@@ -48,18 +48,35 @@ absoluto de ~40 minutos**, probablemente el token de Keycloak que hay detrás.
 Consecuencia de diseño: **no existe forma de mantenerla viva sola.** El radar absorbe la cookie
 rotada igual (no molesta), pero eso no compra tiempo.
 
-Lo que sí funciona, dado el límite:
+### La solución: el radar se loguea solo
 
-1. **`/cookie` desde Telegram.** Pegás el header y queda viva al instante, sin tocar Vercel ni
-   redeployar. Diez segundos.
-2. **Recordatorio a las 23:45.** El radar te avisa 16 minutos antes de la liberación, diciéndote
-   si la sesión está viva o si hay que sembrarla. Sembrada a las 23:45, llega viva a las 00:01.
+Como la sesión siempre va a morir, la única forma de que esto sea autónomo es **re-loguearse**.
+Cargá tus credenciales y olvidate:
 
-La liberación de las 00:01 es el único momento que realmente importa: ahí sale el inventario del
-día siguiente. Cubrir esa ventana es cubrir el 90% del valor.
+```
+AYCF_EMAIL=vos@ejemplo.com
+AYCF_PASSWORD=…
+```
 
-> Automatizar el login (Keycloak) sería el arreglo de fondo, pero implica guardar usuario y
-> contraseña. Queda a criterio de cada uno.
+Cuando el barrido se topa con la sesión caída, se reloguea y reintenta **una** vez (una sola: con
+credenciales mal, reintentar en loop es pedir un bloqueo de cuenta).
+
+El flujo es el auth code estándar de Keycloak, realm `ja`, client `cvo-laravel`:
+
+```
+GET  /es-ar/ja/subscriptions/auth/login          → 302 a Keycloak
+GET  /auth/realms/ja/…/openid-connect/auth       → HTML con el form kc-form-login
+POST /auth/realms/ja/login-actions/authenticate  → 302 con ?code=…
+GET  redirect_uri                                → Laravel canjea el code y setea laravel_session
+```
+
+`src/login.js` lo hace con un cookie jar y redirects manuales. Manda `rememberMe=on` para pedir la
+sesión SSO más larga que dé el realm. Las credenciales solo viajan a Keycloak: no se loguean, no se
+persisten, no se mandan a ningún otro lado.
+
+> **Si preferís no guardar la contraseña**, el radar funciona igual con `AYCF_COOKIE` como semilla
+> más `/cookie` desde Telegram para renovarla, y un recordatorio a las 23:45 avisándote antes de la
+> liberación. Es la opción manual: hay que sembrarla todos los días.
 
 > Por eso hace falta almacenamiento persistente. En Vercel el filesystem es efímero: sin Redis, la
 > cookie renovada se pierde entre invocaciones y volvés al problema de origen.

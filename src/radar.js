@@ -2,6 +2,7 @@
 
 import { createStore } from './store.js';
 import { Session, SessionExpiredError } from './session.js';
+import { tieneCredenciales } from './login.js';
 import { search } from './jetsmart.js';
 import { appliesTo, matchFlight, watchLabel } from './watches.js';
 import { resolveWatches } from './config.js';
@@ -109,7 +110,17 @@ export async function runRadar({ date, watchesRaw } = {}) {
     const watches = await resolveWatches(store, watchesRaw);
     session = await new Session(store).load();
     const target = date || tomorrowInAR();
-    return await runSweep({ date: target, watches, store, session });
+
+    try {
+      return await runSweep({ date: target, watches, store, session });
+    } catch (err) {
+      // La sesión se murió a mitad del barrido: nos relogueamos y reintentamos
+      // UNA vez. Sin límite, credenciales malas serían un loop de logins.
+      if (!(err instanceof SessionExpiredError) || !tieneCredenciales()) throw err;
+      console.log('sesión caída, relogueando…');
+      await session.relogin();
+      return await runSweep({ date: target, watches, store, session });
+    }
   } catch (err) {
     if (err instanceof SessionExpiredError) {
       // Si no la borramos, la sesión muerta le gana a AYCF_COOKIE en el próximo
@@ -118,7 +129,9 @@ export async function runRadar({ date, watchesRaw } = {}) {
       if (session) await session.invalidate();
       await notifyError(
         `Sesión de JetSmart caída: ${err.detalle}\n\n` +
-        'Copiá el header `cookie` entero del portal y actualizá `AYCF_COOKIE`.'
+        (tieneCredenciales()
+          ? 'El re-login automático también falló. Revisá `AYCF_EMAIL` / `AYCF_PASSWORD`.'
+          : 'Cargá `AYCF_EMAIL` y `AYCF_PASSWORD` para que me loguee solo, o mandame un `/cookie`.')
       );
       return { ok: false, error: 'session-expired', detalle: err.detalle };
     }

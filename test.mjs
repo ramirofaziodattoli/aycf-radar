@@ -293,4 +293,57 @@ const memStore = () => {
   delete process.env.WATCHES;
 }
 
+// --- login automatico: el unico camino a que esto sea autonomo ---
+{
+  const { login, LoginError, tieneCredenciales } = await import('./src/login.js');
+  const orig = globalThis.fetch;
+  const limpio = { ...process.env };
+
+  delete process.env.AYCF_EMAIL; delete process.env.AYCF_PASSWORD;
+  assert.equal(tieneCredenciales(), false);
+  await assert.rejects(() => login(), /faltan AYCF_EMAIL/, 'sin credenciales, error claro');
+
+  process.env.AYCF_EMAIL = 'yo@ejemplo.com';
+  process.env.AYCF_PASSWORD = 'secreto';
+  assert.equal(tieneCredenciales(), true);
+
+  const FORM = '<form id="kc-form-login" action="https://go.jetsmart.com/auth/realms/ja/' +
+    'login-actions/authenticate?session_code=abc&amp;execution=xyz">' +
+    '<input name="username"><input name="password"></form>';
+
+  // Camino feliz: form -> POST -> redirect -> laravel_session.
+  let posteado = null;
+  globalThis.fetch = async (url, opt = {}) => {
+    const u = String(url);
+    if (opt.method === 'POST') {
+      posteado = opt.body?.toString();
+      return {
+        status: 302, headers: {
+          get: (h) => (h === 'location' ? 'https://go.jetsmart.com/es-ar/ja/ok' : null),
+          getSetCookie: () => ['laravel_session=NUEVA; path=/; httponly'],
+        }, text: async () => '',
+      };
+    }
+    if (u.includes('/ok')) {
+      return { status: 200, headers: { get: () => null, getSetCookie: () => [] }, text: async () => 'listo' };
+    }
+    return { status: 200, headers: { get: () => null, getSetCookie: () => [] }, text: async () => FORM };
+  };
+
+  const cookies = await login();
+  assert.equal(cookies.laravel_session, 'NUEVA', 'devuelve la sesion autenticada');
+  assert.match(posteado, /username=yo%40ejemplo\.com/, 'manda el usuario');
+  assert.match(posteado, /rememberMe=on/, 'pide la sesion SSO mas larga');
+
+  // Credenciales malas: Keycloak devuelve el mismo form. No puede pasar por exito.
+  globalThis.fetch = async () => ({
+    status: 200, headers: { get: () => null, getSetCookie: () => [] },
+    text: async () => FORM + '<span class="kc-feedback-text">Usuario o contraseña inválidos</span>',
+  });
+  await assert.rejects(() => login(), /rechaz/i, 'credenciales malas => LoginError, no exito mudo');
+
+  globalThis.fetch = orig;
+  process.env = limpio;
+}
+
 console.log('✅ todo ok');

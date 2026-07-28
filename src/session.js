@@ -1,12 +1,16 @@
 // Sesión viva contra Caravelo.
 //
-// `laravel_session` vence a los 30 min de INACTIVIDAD (max-age=1800), pero Laravel
-// devuelve una cookie nueva en cada respuesta autenticada. O sea: es una ventana
-// deslizante. Si pegamos más seguido que cada 30 min y guardamos la cookie rotada,
-// la sesión no vence nunca. Ese es todo el truco del keep-alive.
+// La cookie dice `max-age=1800` y Laravel la rota en cada respuesta, lo que hace
+// pensar en una ventana deslizante. NO LO ES: medido en producción, la sesión
+// muere ~40 min después del login pase lo que pase (éxito 03:00, muerta 03:15,
+// con el cron pegándole cada 15). Es un tope absoluto, casi seguro el token de
+// Keycloak de atrás.
 //
-// El seed inicial (AYCF_COOKIE) sí es manual: el login va por Keycloak y no lo
-// automatizamos, porque implicaría guardar usuario y contraseña.
+// Por eso el único camino a que esto sea autónomo es re-loguearse: ver login.js.
+// La cookie manual (AYCF_COOKIE) queda como semilla opcional para arrancar sin
+// guardar credenciales.
+
+import { login, tieneCredenciales, LoginError } from './login.js';
 
 const KEY = 'session:cookies';
 
@@ -51,15 +55,41 @@ export class Session {
     this.jar = null;
   }
 
-  /** Carga del store; si está vacío, siembra desde AYCF_COOKIE. */
+  /**
+   * Store → semilla AYCF_COOKIE → login automático.
+   * El login va último porque es el más caro, pero es el que hace que esto
+   * funcione sin que nadie lo toque.
+   */
   async load() {
     this.jar = await this.store.get(KEY);
-    if (!this.jar || !this.jar.laravel_session) {
-      const seed = parseCookieHeader(process.env.AYCF_COOKIE);
-      if (!seed.laravel_session) throw new SessionExpiredError();
+    if (this.jar?.laravel_session) return this;
+
+    const seed = parseCookieHeader(process.env.AYCF_COOKIE);
+    if (seed.laravel_session) {
       this.jar = seed;
       await this.persist();
+      return this;
     }
+
+    if (tieneCredenciales()) return this.relogin();
+    throw new SessionExpiredError('no hay cookie sembrada ni credenciales para loguearme');
+  }
+
+  /**
+   * Descarta lo que haya y se loguea de cero. Es la salida de la trampa: la
+   * sesión vence por tiempo absoluto, así que tarde o temprano SIEMPRE hay que
+   * volver a loguearse.
+   */
+  async relogin() {
+    if (!tieneCredenciales()) {
+      throw new SessionExpiredError('sin AYCF_EMAIL / AYCF_PASSWORD no puedo re-loguearme');
+    }
+    const cookies = await login();
+    this.jar = Object.fromEntries(
+      Object.entries(cookies).filter(([n]) => RELEVANTES.test(n))
+    );
+    if (!this.jar.laravel_session) throw new LoginError('el login no devolvió laravel_session');
+    await this.persist();
     return this;
   }
 
