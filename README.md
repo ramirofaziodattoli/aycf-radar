@@ -32,9 +32,14 @@ D+2 devuelve vacío siempre. El barrido diario *es* el universo canjeable comple
 
 ### La sesión se renueva sola
 
-`laravel_session` vence a los **30 minutos de inactividad**, pero Caravelo devuelve una cookie
-nueva en cada respuesta autenticada: es una ventana deslizante. El radar guarda esa cookie rotada,
-así que **mientras corra más seguido que cada 30 min, la sesión no vence nunca**.
+`laravel_session` vence a los **30 minutos de inactividad** (`max-age=1800`) y además **el ID rota
+en cada respuesta autenticada** — verificado: tras la primera corrida, la cookie en el store ya no
+es la semilla. El radar absorbe cada rotación, así que **mientras corra más seguido que cada
+30 min, la sesión no vence nunca**.
+
+> Corolario: **una vez sembrada, no sigas usando el portal con esa sesión.** Cada request del
+> navegador la mueve adelante y deja al radar atrás, que se entera con un `500` +
+> `error.token.mismatch`. Sembrá y dejá que el radar sea el único dueño.
 
 Solo la primera semilla es manual (el login va por Keycloak y no lo automatizamos: implicaría
 guardarte usuario y contraseña). Si el radar estuvo caído más de 30 min, te avisa por Telegram
