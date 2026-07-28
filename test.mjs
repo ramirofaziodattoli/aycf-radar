@@ -145,4 +145,24 @@ const memStore = () => {
   assert.equal(dos.hits.length, 0, 'segunda pasada: ya lo vio, no repite');
 }
 
+// --- un WATCHES roto tiene que avisar, no morir mudo ---
+{
+  const { runRadar } = await import('./src/radar.js');
+  const orig = globalThis.fetch;
+  const avisos = [];
+  globalThis.fetch = async (url, opt) => {
+    if (String(url).includes('api.telegram.org')) avisos.push(JSON.parse(opt.body).text);
+    return { ok: true, status: 200, text: async () => '{}', headers: { getSetCookie: () => [] } };
+  };
+  process.env.TELEGRAM_TOKEN = 'x'; process.env.TELEGRAM_CHAT_ID = 'y';
+  process.env.STATE_FILE = '/tmp/aycf-test-state.json';
+
+  const out = await runRadar({ watchesRaw: '{ esto no es json' });
+  assert.equal(out.ok, false, 'no explota: devuelve el error');
+  assert.ok(avisos.some((a) => /Error inesperado/.test(a)),
+    'un WATCHES roto tiene que llegar por Telegram, no ser un 500 mudo');
+
+  globalThis.fetch = orig;
+}
+
 console.log('✅ todo ok');

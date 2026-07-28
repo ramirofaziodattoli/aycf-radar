@@ -73,26 +73,29 @@ export async function runSweep({ date, watches, store, session, notify = true, _
 /** Punto de entrada compartido por el cron y el runner local. */
 export async function runRadar({ date, watchesRaw } = {}) {
   const store = createStore();
-  const watches = loadWatches(watchesRaw ?? process.env.WATCHES ?? '[]');
-  const session = await new Session(store).load();
-  const target = date || tomorrowInAR();
+  let session;
 
+  // TODO lo que pueda fallar va adentro del try. Antes, un WATCHES mal formado o
+  // una sesión sin sembrar tiraban un 500 mudo: sin Telegram, sin log útil, y
+  // desde afuera indistinguible de "no hay vuelos".
   try {
+    const watches = loadWatches(watchesRaw ?? process.env.WATCHES ?? '[]');
+    session = await new Session(store).load();
+    const target = date || tomorrowInAR();
     return await runSweep({ date: target, watches, store, session });
   } catch (err) {
     if (err instanceof SessionExpiredError) {
-      // Clave: si no la borramos, la sesión muerta le gana a AYCF_COOKIE en el
-      // próximo load() y re-sembrar la semilla no arregla nada.
-      await session.invalidate();
+      // Si no la borramos, la sesión muerta le gana a AYCF_COOKIE en el próximo
+      // load() y re-sembrar la semilla no arregla nada. `session` puede no existir
+      // todavía si el load() fue justo lo que falló.
+      if (session) await session.invalidate();
       await notifyError(
-        'Sesión de JetSmart vencida.\n\n' +
-        'Entrá al portal, copiá la cookie nueva y actualizá `AYCF_COOKIE`.\n' +
-        '_(El keep-alive la renueva sola mientras el cron corra cada <30 min; ' +
-        'si llegaste acá es que estuvo caído más que eso.)_'
+        `Sesión de JetSmart caída: ${err.detalle}\n\n` +
+        'Copiá el header `cookie` entero del portal y actualizá `AYCF_COOKIE`.'
       );
-      return { ok: false, error: 'session-expired' };
+      return { ok: false, error: 'session-expired', detalle: err.detalle };
     }
     await notifyError(`Error inesperado: ${err.message}`);
-    throw err;
+    return { ok: false, error: err.message };
   }
 }
