@@ -81,6 +81,9 @@ export async function runRadar({ date, watchesRaw } = {}) {
     return await runSweep({ date: target, watches, store, session });
   } catch (err) {
     if (err instanceof SessionExpiredError) {
+      // Clave: si no la borramos, la sesión muerta le gana a AYCF_COOKIE en el
+      // próximo load() y re-sembrar la semilla no arregla nada.
+      await session.invalidate();
       await notifyError(
         'Sesión de JetSmart vencida.\n\n' +
         'Entrá al portal, copiá la cookie nueva y actualizá `AYCF_COOKIE`.\n' +

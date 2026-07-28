@@ -82,6 +82,16 @@ export class Session {
     return cambio;
   }
 
+  /**
+   * Borra la sesión guardada para que la próxima corrida re-siembre desde AYCF_COOKIE.
+   * Sin esto, una sesión muerta en el store gana sobre la env var y actualizar la
+   * semilla no sirve de nada: quedás en un 401 permanente.
+   */
+  async invalidate() {
+    this.jar = null;
+    await this.store.set(KEY, null, 1);
+  }
+
   async persist() {
     // TTL holgado contra los 30 min de Laravel: si el proceso estuvo caído más
     // que eso la sesión ya murió igual, pero no queremos perder el registro antes.

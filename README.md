@@ -107,12 +107,21 @@ curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"id":[-0-9]*
 > Los bots traen *privacy mode*: en grupos solo ven mensajes que empiezan con `/`. Si `getUpdates`
 > vuelve vacío, mandá `/start`. Si el token se te escapó alguna vez, rotalo con `/revoke`.
 
-**3. Probalo.**
+**3. Sembrá la sesión y probala.**
+
+`laravel_session` vive **30 minutos**. Copiala de DevTools y corré, sin escalas:
 
 ```bash
+npm run seed             # lee del portapapeles, valida y guarda en .env
 npm run dev              # los vuelos de mañana
 npm run dev 2026-08-13   # una fecha puntual
 ```
+
+`seed` acepta el header `cookie` entero o los valores sueltos de *Application → Cookies*,
+uno por línea y en cualquier orden: prueba las combinaciones y se queda con la que autentica.
+
+> `laravel_session` es **httpOnly**: `document.cookie` en la consola no te la muestra. Sacala de
+> *Application → Cookies* o del header `cookie` en *Network*.
 
 ## Deploy
 
@@ -152,6 +161,10 @@ que la sesión no se muera.
 |---|---|
 | `GET /api/cron` | Barrido completo. Acepta `?date=YYYY-MM-DD` |
 | `GET /api/keepalive` | Un solo request, solo para mantener viva la sesión |
+
+Si el radar estuvo caído más de 30 min, la sesión muere y el store se limpia solo, para que la
+próxima corrida re-siembre desde `AYCF_COOKIE`. Sin eso, la sesión muerta le ganaría a la env var
+y quedarías en un 401 permanente por más que actualices la semilla.
 
 Ambos exigen `Authorization: Bearer $CRON_SECRET` si la env var está definida.
 
