@@ -52,7 +52,7 @@ export async function runSweep({ date, watches, store, session, notify = true, _
   let scanned = 0;
 
   for (const ruta of rutas) {
-    const flights = await _search(session, { from: ruta.from, to: ruta.to, date });
+    const flights = await _search(session, { from: ruta.from, to: ruta.to, date }, store);
     scanned++;
 
     for (const watch of ruta.watches) {

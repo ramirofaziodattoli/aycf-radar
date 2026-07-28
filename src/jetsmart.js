@@ -8,6 +8,7 @@
 // Consultar D+2 devuelve vacío siempre.
 
 import { SessionExpiredError, TOKEN_MISMATCH } from './session.js';
+import { saveCatalog } from './airports.js';
 
 const BASE = process.env.AYCF_BASE_URL || 'https://go.jetsmart.com/es-ar/ja/subscriptions';
 
@@ -41,7 +42,7 @@ export function parseAmount(s) {
   return Number.isFinite(n) ? n : null;
 }
 
-export async function search(session, { from, to, date }) {
+export async function search(session, { from, to, date }, store = null) {
   const res = await fetch(`${BASE}/availability/${process.env.AYCF_PASS_ID}`, {
     method: 'POST',
     headers: {
@@ -91,6 +92,12 @@ export async function search(session, { from, to, date }) {
 
   // Solo acá renovamos: la respuesta vino autenticada.
   await session.absorb(res);
+
+  // La respuesta trae la red entera; la cacheamos para resolver nombres de ciudad
+  // y para saber qué rutas existen sin hardcodear nada.
+  if (store && payload.content?.routes?.length) {
+    await saveCatalog(store, payload.content.routes).catch(() => {});
+  }
 
   return (payload.content?.flights?.flightsOutbound ?? []).map(normalize);
 }

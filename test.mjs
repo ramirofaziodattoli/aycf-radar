@@ -226,4 +226,71 @@ const memStore = () => {
   delete process.env.WATCHES;
 }
 
+// --- catalogo de aeropuertos: sale de la propia API, no hardcodeado ---
+{
+  const { parseCatalog, resolveAirport, routeExists, destinationsFrom, normalize } =
+    await import('./src/airports.js');
+
+  const CRUDO_RUTAS = [
+    { departureStation: { id: 'AEP', name: 'Buenos Aires, Aeroparque' },
+      arrivalStations: [{ id: 'SLA', name: 'Salta' }, { id: 'COR', name: 'Córdoba' }] },
+    { departureStation: { id: 'BRC', name: 'Bariloche' },
+      arrivalStations: [{ id: 'EZE', name: 'Buenos Aires, Ezeiza' }] },
+  ];
+  const cat = parseCatalog(CRUDO_RUTAS);
+  assert.equal(Object.keys(cat.aeropuertos).length, 5);
+  assert.equal(cat.aeropuertos.SLA, 'Salta');
+  assert.ok(cat.rutas.includes('AEP-SLA'));
+
+  // Acentos y mayusculas no pueden importar.
+  assert.equal(normalize('Córdoba'), 'cordoba');
+  assert.equal(resolveAirport('BRC', cat.aeropuertos).iata, 'BRC');
+  assert.equal(resolveAirport('brc', cat.aeropuertos).iata, 'BRC');
+  assert.equal(resolveAirport('bariloche', cat.aeropuertos).iata, 'BRC');
+  assert.equal(resolveAirport('Bariloche', cat.aeropuertos).iata, 'BRC');
+  assert.equal(resolveAirport('cordoba', cat.aeropuertos).iata, 'COR');
+  assert.equal(resolveAirport('Córdoba', cat.aeropuertos).iata, 'COR');
+  assert.equal(resolveAirport('salta', cat.aeropuertos).iata, 'SLA');
+
+  // "buenos aires" matchea dos aeropuertos: hay que preguntar, no adivinar.
+  const amb = resolveAirport('buenos aires', cat.aeropuertos);
+  assert.ok(!amb.iata && amb.opciones?.length === 2, 'ambiguo => opciones');
+  assert.ok(amb.opciones.some((o) => o.includes('AEP')));
+  assert.deepEqual(resolveAirport('tokio', cat.aeropuertos), {});
+
+  // Rutas que no existen: Cordoba-Salta no esta en la red y por eso el viaje
+  // a Salta tuvo que triangular por Buenos Aires.
+  assert.equal(routeExists('AEP', 'SLA', cat.rutas), true);
+  assert.equal(routeExists('COR', 'SLA', cat.rutas), false);
+  assert.equal(routeExists('AEP', 'SLA', []), true, 'sin catalogo no bloqueamos');
+  assert.equal(destinationsFrom('AEP', cat.rutas, cat.aeropuertos).length, 2);
+}
+
+// --- el bot con nombres de ciudad ---
+{
+  const { handleCommand } = await import('./src/commands.js');
+  const { saveCatalog } = await import('./src/airports.js');
+  const store = memStore();
+  store.name = 'memory';
+  process.env.WATCHES = JSON.stringify([{ from: 'AEP', to: 'SLA' }]);
+  await saveCatalog(store, [
+    { departureStation: { id: 'AEP', name: 'Buenos Aires, Aeroparque' },
+      arrivalStations: [{ id: 'SLA', name: 'Salta' }] },
+    { departureStation: { id: 'BRC', name: 'Bariloche' },
+      arrivalStations: [{ id: 'EZE', name: 'Buenos Aires, Ezeiza' }] },
+  ]);
+
+  const ok = await handleCommand('/vigilar bariloche ezeiza', { store });
+  assert.match(ok, /Bariloche → Buenos Aires, Ezeiza/, 'resuelve nombres y etiqueta lindo');
+
+  // Vigilar algo que no existe en la red te deja esperando para siempre.
+  const noExiste = await handleCommand('/vigilar salta bariloche', { store });
+  assert.match(noExiste, /no existe como directo/, 'avisa en vez de aceptar');
+
+  assert.match(await handleCommand('/vigilar tokio salta', { store }), /No encontré/);
+  assert.match(await handleCommand('/aeropuertos', { store }), /Bariloche/);
+  assert.match(await handleCommand('/aeropuertos AEP', { store }), /Directos desde/);
+  delete process.env.WATCHES;
+}
+
 console.log('✅ todo ok');
