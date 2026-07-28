@@ -346,4 +346,47 @@ const memStore = () => {
   process.env = limpio;
 }
 
+// --- withSession: una sesion muerta se reloguea y reintenta, sin rebotar ---
+{
+  const { withSession } = await import('./src/session.js');
+  const { SessionExpiredError } = await import('./src/session.js');
+  const limpio = { ...process.env };
+  const orig = globalThis.fetch;
+
+  process.env.AYCF_EMAIL = 'yo@ejemplo.com';
+  process.env.AYCF_PASSWORD = 'secreto';
+  process.env.AYCF_COOKIE = 'laravel_session=MUERTA';
+
+  const FORM = '<form id="kc-form-login" action="https://x/auth"></form>';
+  globalThis.fetch = async (url, opt = {}) => {
+    if (opt.method === 'POST') return {
+      status: 302,
+      headers: { get: (h) => (h === 'location' ? 'https://go.jetsmart.com/ok' : null),
+                 getSetCookie: () => ['laravel_session=FRESCA'] },
+      text: async () => '',
+    };
+    return { status: 200, headers: { get: () => null, getSetCookie: () => [] }, text: async () => FORM };
+  };
+
+  const store = memStore();
+  let intentos = 0;
+  const out = await withSession(store, (s) => {
+    intentos++;
+    if (intentos === 1) throw new SessionExpiredError('vencida');
+    return s.header();
+  });
+  assert.equal(intentos, 2, 'reintenta una vez');
+  assert.match(out, /laravel_session=FRESCA/, 'reintenta con la sesion nueva');
+
+  // Si vuelve a fallar, NO reintenta de nuevo: seria loop de logins.
+  let n = 0;
+  await assert.rejects(
+    () => withSession(store, () => { n++; throw new SessionExpiredError('vencida'); }),
+    /inutilizable/, 'no reintenta infinito');
+  assert.equal(n, 2, 'un solo reintento');
+
+  globalThis.fetch = orig;
+  process.env = limpio;
+}
+
 console.log('✅ todo ok');

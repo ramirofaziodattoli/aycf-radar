@@ -49,6 +49,24 @@ function parseCookieHeader(str) {
   );
 }
 
+/**
+ * Carga la sesión, corre `fn`, y si la sesión estaba muerta se reloguea y
+ * reintenta UNA vez. Vive acá para que el cron y el bot compartan exactamente
+ * el mismo comportamiento: tenerlo duplicado ya causó que el bot rebotara
+ * mientras el cron se recuperaba solo.
+ */
+export async function withSession(store, fn) {
+  const session = await new Session(store).load();
+  try {
+    return await fn(session);
+  } catch (err) {
+    if (!(err instanceof SessionExpiredError) || !tieneCredenciales()) throw err;
+    console.log('sesión caída, relogueando…');
+    await session.relogin();
+    return await fn(session);
+  }
+}
+
 export class Session {
   constructor(store) {
     this.store = store;

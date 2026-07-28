@@ -1,7 +1,7 @@
 // Orquestación: barrer los watches activos, deduplicar y notificar.
 
 import { createStore } from './store.js';
-import { Session, SessionExpiredError } from './session.js';
+import { withSession, SessionExpiredError } from './session.js';
 import { tieneCredenciales } from './login.js';
 import { search } from './jetsmart.js';
 import { appliesTo, matchFlight, watchLabel } from './watches.js';
@@ -108,19 +108,11 @@ export async function runRadar({ date, watchesRaw } = {}) {
   // desde afuera indistinguible de "no hay vuelos".
   try {
     const watches = await resolveWatches(store, watchesRaw);
-    session = await new Session(store).load();
     const target = date || tomorrowInAR();
-
-    try {
-      return await runSweep({ date: target, watches, store, session });
-    } catch (err) {
-      // La sesión se murió a mitad del barrido: nos relogueamos y reintentamos
-      // UNA vez. Sin límite, credenciales malas serían un loop de logins.
-      if (!(err instanceof SessionExpiredError) || !tieneCredenciales()) throw err;
-      console.log('sesión caída, relogueando…');
-      await session.relogin();
-      return await runSweep({ date: target, watches, store, session });
-    }
+    return await withSession(store, (s) => {
+      session = s;
+      return runSweep({ date: target, watches, store, session: s });
+    });
   } catch (err) {
     if (err instanceof SessionExpiredError) {
       // Si no la borramos, la sesión muerta le gana a AYCF_COOKIE en el próximo

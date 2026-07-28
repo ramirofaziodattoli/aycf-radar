@@ -7,7 +7,7 @@
 //      podría consultar tu cuenta de JetSmart.
 
 import { createStore } from '../src/store.js';
-import { Session, SessionExpiredError } from '../src/session.js';
+import { withSession, SessionExpiredError } from '../src/session.js';
 import { handleCommand } from '../src/commands.js';
 import { reply } from '../src/notify.js';
 
@@ -31,20 +31,13 @@ export default async function handler(req, res) {
 
   try {
     const store = createStore();
-    // La sesión se carga perezosamente: /rutas y /borrar no necesitan JetSmart.
-    let session = null;
-    const lazySession = {
-      get header() {
-        return session?.header.bind(session);
-      },
-    };
-    const necesitaSesion = /^\/(buscar|estado)/i.test(texto.trim());
-    if (necesitaSesion) session = await new Session(store).load();
 
-    const respuesta = await handleCommand(texto, {
-      store,
-      session: session ?? lazySession,
-    });
+    // Solo /buscar y /estado tocan JetSmart; el resto no necesita sesión.
+    // withSession se encarga de reloguear y reintentar si estaba vencida.
+    const necesitaSesion = /^\/(buscar|estado)\b/i.test(texto.trim());
+    const respuesta = necesitaSesion
+      ? await withSession(store, (session) => handleCommand(texto, { store, session }))
+      : await handleCommand(texto, { store, session: null });
     await reply(respuesta);
     return res.status(200).json({ ok: true });
   } catch (err) {
