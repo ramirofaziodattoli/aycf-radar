@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --env-file=.env run-local.mjs",
     "seed": "node --env-file=.env seed.mjs",
-    "test": "node test.mjs"
+    "test": "node test.mjs",
+    "setup-bot": "node --env-file=.env setup-bot.mjs"
   },
   "description": "Radar de disponibilidad para el pase All You Can Fly de JetSMART. Te avisa por Telegram apenas hay cupo en las rutas que te interesan.",
   "license": "MIT",
