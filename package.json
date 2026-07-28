@@ -1,0 +1,11 @@
+{
+  "name": "aycf-radar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs",
+    "check": "node check-env.mjs",
+    "radar": "node --env-file=.env run-local.mjs"
+  }
+}
