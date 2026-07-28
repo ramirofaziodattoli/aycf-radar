@@ -1,5 +1,5 @@
 import { runRadar } from '../src/radar.js';
-import { readWatches } from '../src/config.js';
+
 
 export default async function handler(req, res) {
   // Vercel manda Authorization: Bearer $CRON_SECRET cuando la env var existe.
@@ -10,10 +10,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const out = await runRadar({
-      date: req.query?.date,
-      watchesRaw: await readWatches(),
-    });
+    const out = await runRadar({ date: req.query?.date });
     // Si devolvemos 200 en un fallo, Vercel marca el cron como exitoso y el
     // problema queda invisible en el dashboard.
     return res.status(out.ok === false ? 500 : 200).json({ ok: true, ...out });

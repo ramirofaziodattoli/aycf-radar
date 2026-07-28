@@ -3,14 +3,28 @@
 import { createStore } from './store.js';
 import { Session, SessionExpiredError } from './session.js';
 import { search } from './jetsmart.js';
-import { appliesTo, matchFlight, loadWatches, watchLabel } from './watches.js';
-import { notifyHits, notifyError } from './notify.js';
+import { appliesTo, matchFlight, watchLabel } from './watches.js';
+import { resolveWatches } from './config.js';
+import { notifyHits, notifyEmpty, notifyError } from './notify.js';
 
 /** D+1 en hora argentina. Argentina es UTC-3 fijo, sin DST desde 2009. */
 export function tomorrowInAR(now = new Date()) {
   const ar = new Date(now.getTime() - 3 * 3600 * 1000);
   ar.setUTCDate(ar.getUTCDate() + 1);
   return ar.toISOString().slice(0, 10);
+}
+
+/**
+ * ¿Es la corrida de la liberación? A las 00:01 ART sale el inventario del día
+ * siguiente y es EL momento del día: ahí se avisa siempre, aunque no haya nada,
+ * porque un "no hay cupo" a esa hora es lo que dispara el plan B.
+ *
+ * La ventana arranca en :01 a propósito: el cron de cada 15 minutos pega a las
+ * 00:00, un minuto antes de que se libere, y esa corrida no confirma nada.
+ */
+export function isReleaseRun(now = new Date()) {
+  const ar = new Date(now.getTime() - 3 * 3600 * 1000);
+  return ar.getUTCHours() === 0 && ar.getUTCMinutes() >= 1 && ar.getUTCMinutes() <= 5;
 }
 
 export function dedupeKey(date, watch, flight) {
@@ -58,12 +72,18 @@ export async function runSweep({ date, watches, store, session, notify = true, _
     }
   }
 
+  // En la corrida de la liberación se avisa siempre, con o sin cupo.
+  const release = isReleaseRun();
+  const avisar = hits.length > 0 || release || process.env.NOTIFY_EMPTY === 'true';
+
   // Encontrar vuelos y no poder avisar es una falla, no un éxito: si el token de
   // Telegram murió, el radar seguiría reportando ok con el dashboard en verde.
   let notified = null;
-  if (notify && hits.length) {
-    notified = await notifyHits(hits, date);
-    if (!notified) console.error('¡Había cupo y no se pudo notificar por ningún canal!');
+  if (notify && avisar) {
+    notified = hits.length
+      ? await notifyHits(hits, date, release)
+      : await notifyEmpty(date, rutas.length, release);
+    if (!notified) console.error('¡No se pudo notificar por ningún canal!');
   }
 
   return {
@@ -86,7 +106,7 @@ export async function runRadar({ date, watchesRaw } = {}) {
   // una sesión sin sembrar tiraban un 500 mudo: sin Telegram, sin log útil, y
   // desde afuera indistinguible de "no hay vuelos".
   try {
-    const watches = loadWatches(watchesRaw ?? process.env.WATCHES ?? '[]');
+    const watches = await resolveWatches(store, watchesRaw);
     session = await new Session(store).load();
     const target = date || tomorrowInAR();
     return await runSweep({ date: target, watches, store, session });

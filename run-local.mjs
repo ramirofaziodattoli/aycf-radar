@@ -6,7 +6,7 @@
 // El estado (sesión + dedupe) va a .state.json salvo que configures Redis.
 
 import { runRadar } from './src/radar.js';
-import { readWatches } from './src/config.js';
+
 
 const date = process.argv[2];
 
@@ -20,7 +20,7 @@ if (!process.env.TELEGRAM_TOKEN) {
 }
 
 try {
-  const out = await runRadar({ date, watchesRaw: await readWatches() });
+  const out = await runRadar({ date });
   console.log(JSON.stringify(out, null, 2));
   if (out.hits?.length === 0) {
     console.log('\nSin novedades. Ojo: lo ya notificado no se repite (dedupe).');

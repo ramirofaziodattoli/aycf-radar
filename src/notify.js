@@ -15,7 +15,7 @@ export function formatFlight(f) {
   ].filter(Boolean).join(' · ');
 }
 
-export function formatReport(hits, date) {
+export function formatReport(hits, date, release = false) {
   const cuerpo = hits
     .map(({ watch, flights }) => {
       const lineas = [...flights]
@@ -26,7 +26,21 @@ export function formatReport(hits, date) {
     })
     .join('\n\n');
   const total = hits.reduce((n, h) => n + h.flights.length, 0);
-  return `🛫 *AYCF* — ${total} vuelo(s) con cupo para el *${date}*\n\n${cuerpo}`;
+  const cabecera = release
+    ? `🌙 *LIBERACIÓN 00:01* — ${total} vuelo(s) para el *${date}*`
+    : `🛫 *AYCF* — ${total} vuelo(s) con cupo para el *${date}*`;
+  return `${cabecera}\n\n${cuerpo}${release ? '\n\n⚡ Es el mejor momento del día: los cupos recién salieron.' : ''}`;
+}
+
+/** El "no hay nada" de las 00:01 es información, no ruido: dispara el plan B. */
+export async function notifyEmpty(date, rutas, release = false) {
+  const texto = release
+    ? `🌙 *LIBERACIÓN 00:01* — sin cupo para el *${date}*\n\n` +
+      `Se revisaron ${rutas} ruta(s) apenas salió el inventario. No hay nada.\n\n` +
+      '_Si este vuelo era necesario, es momento del plan B._'
+    : `🛫 *AYCF* — sin cupo para el *${date}* (${rutas} rutas).`;
+  const [a, b] = await Promise.all([telegram(texto, false), webhook({ date, hits: [], release })]);
+  return a || b;
 }
 
 // Ningún canal puede tumbar el barrido: que Telegram esté caído no es razón
@@ -45,6 +59,11 @@ async function post(nombre, url, body) {
     console.error(`${nombre}: ${err.message}`);
     return false;
   }
+}
+
+/** Respuesta directa del bot, sin pasar por el formato de reporte. */
+export async function reply(text, withButton = false) {
+  return telegram(text, withButton);
 }
 
 async function telegram(text, withButton) {
@@ -68,8 +87,8 @@ async function webhook(payload) {
   return post('webhook', url, payload);
 }
 
-export async function notifyHits(hits, date) {
-  const text = formatReport(hits, date);
+export async function notifyHits(hits, date, release = false) {
+  const text = formatReport(hits, date, release);
   const payload = {
     date,
     hits: hits.map(({ watch, flights }) => ({ watch: watchLabel(watch), flights })),

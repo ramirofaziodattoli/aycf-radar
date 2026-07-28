@@ -185,4 +185,45 @@ const memStore = () => {
   globalThis.fetch = orig;
 }
 
+// --- la corrida de las 00:01 avisa siempre, con o sin cupo ---
+{
+  const { isReleaseRun } = await import('./src/radar.js');
+  assert.equal(isReleaseRun(new Date('2026-07-29T03:01:00Z')), true, '00:01 ART');
+  assert.equal(isReleaseRun(new Date('2026-07-29T03:00:00Z')), false,
+    '00:00 ART NO: el inventario sale un minuto despues');
+  assert.equal(isReleaseRun(new Date('2026-07-29T03:05:00Z')), true);
+  assert.equal(isReleaseRun(new Date('2026-07-29T03:06:00Z')), false);
+  assert.equal(isReleaseRun(new Date('2026-07-29T15:01:00Z')), false, 'mediodia no');
+}
+
+// --- comandos del bot ---
+{
+  const { handleCommand } = await import('./src/commands.js');
+  const store = memStore();
+  store.name = 'memory';
+  process.env.WATCHES = JSON.stringify([{ from: 'AEP', to: 'SLA' }]);
+
+  const rutas = await handleCommand('/rutas', { store });
+  assert.match(rutas, /AEP→SLA/);
+  assert.match(rutas, /1 ruta/);
+
+  await handleCommand('/vigilar BRC EZE 2', { store });
+  const conNueva = await handleCommand('/rutas', { store });
+  assert.match(conNueva, /BRC→EZE/, 'la ruta nueva persiste en el store');
+  assert.match(conNueva, /≥2 asientos/);
+
+  // Lo guardado tiene que ganarle a la env var, si no el cron ignoraria /vigilar.
+  const { resolveWatches } = await import('./src/config.js');
+  assert.equal((await resolveWatches(store)).length, 2, 'el store manda sobre WATCHES');
+
+  assert.match(await handleCommand('/vigilar BRC EZE 2', { store }), /Ya estaba/);
+  assert.match(await handleCommand('/vigilar AEP', { store }), /IATA/, 'falta destino');
+  assert.match(await handleCommand('/borrar 99', { store }), /del 1 al 2/);
+  assert.match(await handleCommand('/borrar 2', { store }), /BRC→EZE/);
+  assert.equal((await resolveWatches(store)).length, 1);
+  assert.match(await handleCommand('/comandoinventado', { store }), /No conozco/);
+  assert.match(await handleCommand('/ayuda', { store }), /\/buscar/);
+  delete process.env.WATCHES;
+}
+
 console.log('✅ todo ok');
