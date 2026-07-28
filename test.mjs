@@ -98,6 +98,34 @@ const memStore = () => {
   assert.equal(await s.absorb(res), false, 'misma cookie, sin reescritura');
 }
 
+// --- un 5xx NO puede leerse como "no hay cupo": es el peor modo de falla ---
+{
+  const { search } = await import('./src/jetsmart.js');
+  const sess = { header: () => 'x', absorb: async () => false };
+  const orig = globalThis.fetch;
+
+  const responder = (status, body) => {
+    globalThis.fetch = async () => ({
+      status, ok: status >= 200 && status < 300,
+      text: async () => JSON.stringify(body),
+      headers: { getSetCookie: () => [] },
+    });
+  };
+
+  responder(500, { content: { exceptionMessage: 'error.token.mismatch' } });
+  await assert.rejects(() => search(sess, { from: 'AEP', to: 'COR', date: '2026-07-29' }),
+    /superada/i, 'token.mismatch => sesion superada, con la explicacion correcta');
+
+  responder(500, { content: {} });
+  await assert.rejects(() => search(sess, { from: 'AEP', to: 'COR', date: '2026-07-29' }),
+    /500/, 'un 500 cualquiera tiene que explotar, no devolver []');
+
+  responder(200, { content: { flights: { flightsOutbound: [CRUDO] } } });
+  assert.equal((await search(sess, { from: 'AEP', to: 'COR', date: '2026-07-29' })).length, 1);
+
+  globalThis.fetch = orig;
+}
+
 // --- dedupe: correr cada 15 min no puede spamear el mismo vuelo ---
 {
   const store = memStore();

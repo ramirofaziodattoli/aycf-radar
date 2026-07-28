@@ -7,7 +7,7 @@
 // antes de la salida, y el inventario se libera a las 00:01 por día calendario.
 // Consultar D+2 devuelve vacío siempre.
 
-import { SessionExpiredError } from './session.js';
+import { SessionExpiredError, TOKEN_MISMATCH } from './session.js';
 
 const BASE = process.env.AYCF_BASE_URL || 'https://go.jetsmart.com/es-ar/ja/subscriptions';
 
@@ -72,6 +72,22 @@ export async function search(session, { from, to, date }) {
 
   // Caravelo también expulsa con 200 + redirectUri al login.
   if (payload.redirectUri) throw new SessionExpiredError();
+
+  // Los errores vienen en un envelope anidado: content.exceptionMessage.
+  const motivo = payload.content?.exceptionMessage ?? payload.exceptionMessage;
+  if (motivo === TOKEN_MISMATCH) {
+    throw new SessionExpiredError(
+      'la cookie quedó superada. El ID de sesión rota en cada request: si seguiste ' +
+      'navegando el portal después de copiarla, la tuya ya no vale. Copiala y no ' +
+      'vuelvas a tocar el portal.'
+    );
+  }
+
+  // CRÍTICO: sin esto un 500 se lee como "no hay cupo" y el radar te miente
+  // diciendo que no hay lugar cuando en realidad el request falló.
+  if (!res.ok) {
+    throw new Error(`Caravelo respondió ${res.status}${motivo ? ` (${motivo})` : ''}`);
+  }
 
   // Solo acá renovamos: la respuesta vino autenticada.
   await session.absorb(res);

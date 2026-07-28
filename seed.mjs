@@ -74,6 +74,9 @@ async function probe(cookie) {
     return { ok: false, why: `respuesta no-JSON (${r.status})` };
   }
   if (j.redirectUri) return { ok: false, why: 'redirige al login' };
+  const motivo = j.content?.exceptionMessage ?? j.exceptionMessage;
+  if (motivo === 'error.token.mismatch') return { ok: false, why: 'SUPERADA', mismatch: true };
+  if (!r.ok) return { ok: false, why: `${r.status}${motivo ? ` ${motivo}` : ''}` };
   return { ok: true, flights: j.content?.flights?.flightsOutbound?.length ?? 0 };
 }
 
@@ -83,11 +86,13 @@ if (opciones.length === 0) {
   process.exit(1);
 }
 
+const fallos = [];
 for (const [i, cookie] of opciones.entries()) {
   process.stdout.write(`Probando ${i + 1}/${opciones.length}… `);
   const res = await probe(cookie);
   if (!res.ok) {
     console.log(`no (${res.why})`);
+    fallos.push(res);
     continue;
   }
   console.log('✅');
@@ -110,6 +115,17 @@ for (const [i, cookie] of opciones.entries()) {
   process.exit(0);
 }
 
-console.error('\n❌ Ninguna sirvió: la sesión ya venció.');
-console.error('   Volvé al portal, hacé una búsqueda y copiá de nuevo. Tenés 30 minutos.');
+if (fallos.some((f) => f.mismatch)) {
+  console.error('\n❌ La cookie quedó SUPERADA (error.token.mismatch).');
+  console.error('   El ID de sesión rota en cada request. Si seguiste navegando el portal');
+  console.error('   después de copiarla, la que tenés ya no vale.');
+  console.error('\n   Hacelo así:');
+  console.error('     1. En el portal, hacé UNA búsqueda');
+  console.error('     2. Application → Cookies → copiá laravel_session Y XSRF-TOKEN');
+  console.error('     3. CERRÁ la pestaña — no toques más el portal');
+  console.error('     4. npm run seed');
+} else {
+  console.error('\n❌ Ninguna sirvió: la sesión venció (30 min de inactividad).');
+  console.error('   Volvé al portal, hacé una búsqueda y copiá de nuevo.');
+}
 process.exit(1);

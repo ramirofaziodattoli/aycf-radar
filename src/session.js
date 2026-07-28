@@ -15,11 +15,21 @@ const KEY = 'session:cookies';
 const RELEVANTES = /^(laravel_session|XSRF-TOKEN|KEYCLOAK_|cart_cookie|smuuid)/i;
 
 export class SessionExpiredError extends Error {
-  constructor() {
-    super('sesión de JetSmart vencida: hay que re-sembrar AYCF_COOKIE');
+  constructor(detalle = 'venció por inactividad (30 min)') {
+    super(`sesión de JetSmart inutilizable: ${detalle}`);
     this.name = 'SessionExpiredError';
+    this.detalle = detalle;
   }
 }
+
+/**
+ * El ID de sesión rota. Si seguís usando el portal en el navegador después de
+ * copiar la cookie, la que copiaste queda superada: Caravelo responde 500 con
+ * `error.token.mismatch` en vez de un 401 limpio. Se detecta aparte porque la
+ * solución es distinta — no alcanza con copiar de nuevo, hay que copiar y
+ * NO volver a tocar el portal.
+ */
+export const TOKEN_MISMATCH = 'error.token.mismatch';
 
 function parseCookieHeader(str) {
   return Object.fromEntries(
