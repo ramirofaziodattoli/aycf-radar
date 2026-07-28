@@ -35,8 +35,31 @@ Cookie: <sesión>
  "arrival":null,"intervalSubtype":null,"outboundKey":null}
 ```
 
-Respuesta ~34KB. Lo único que importa: `content.flights.flightsOutbound` (vacío = sin cupo).
+Respuesta ~34KB. Lo que importa: `content.flights.flightsOutbound` (vacío = sin cupo).
 Trae además `content.routes` (las 51 rutas de la red) y `content.blackoutDates`.
+
+Cada vuelo (shape confirmado el 28/7):
+
+```jsonc
+{
+  "flightCode": "JA3100",
+  "departureDateTimeIso": "2026-07-29 06:00:00",
+  "arrivalDateTimeIso":   "2026-07-29 07:28:00",
+  "duration": "01h 28m",
+  "stops": "Directo",
+  "availableSeats": 6,          // ← cupo AYCF real de ESE vuelo
+  "fare": "0.00",               // lo cubre el pase
+  "taxes": "15,103.85",         // ← lo que pagás de verdad
+  "currency": "ARS",
+  "key": "...", "fareSellKey": "..."   // claves de canje
+}
+```
+
+`availableSeats` es el dato central: dice cuántos asientos quedan en ese vuelo, sin estimar nada.
+Con `MIN_SEATS=2` el radar ignora los vuelos donde no entran los dos.
+
+Auth: cookies de Laravel (`laravel_session` + `XSRF-TOKEN`); el login va por Keycloak en otro
+dominio. Alcanza con mandar esas dos, el resto de las 54 cookies son analytics.
 
 Backend: Caravelo (`Changeyourflight S.L.`), el mismo que procesa la suscripción. Auth por cookie
 de sesión, sin `Authorization`. Un POST por ruta, sin paginado ni batch.
@@ -113,6 +136,7 @@ del minuto exacto**, que es justo lo único que importa acá. Ojo con cuál de l
 | `TELEGRAM_TOKEN` | Del BotFather |
 | `TELEGRAM_CHAT_ID` | Del chat privado o del grupo |
 | `NOTIFY_EMPTY` | Opcional. `true` para que avise también cuando no hay cupo |
+| `MIN_SEATS` | Opcional, default `1`. Poné `2` para que solo avise si entran los dos |
 | `CRON_SECRET` | Inventalo. Vercel lo manda solo como Bearer y sin esto **cualquiera puede disparar el endpoint y usar tu cookie** |
 
 ### 5. Probar antes de que importe
@@ -124,13 +148,15 @@ Barre las 10 rutas de `ROUTES`. Si aparecen vuelos, revisá que el mensaje se ve
 
 ## Pendiente de calibrar
 
-1. **La forma del objeto vuelo.** Las capturas del HAR vinieron todas vacías, así que
-   `describeFlight()` prueba los nombres de campo más probables y, si no reconoce ninguno, manda el
-   JSON crudo recortado. La primera corrida con cupo revela la forma real y ahí se ajusta.
-2. **Cuánto vive la cookie.** Es el único riesgo serio. Si dura días, esto queda 100% automático.
-   Si dura una hora, hay que recargarla antes de dormir las noches clave.
-3. **El botón "Ir a canjear"** apunta a la página de canje, sin prellenar la búsqueda. Si la SPA
-   acepta query params, se puede hacer un link directo al vuelo.
+1. **Cuánto vive `laravel_session`.** El único riesgo real. Miralo en DevTools → Application →
+   Cookies → `go.jetsmart.com` → columna *Expires*. Si es larga, esto queda 100% automático.
+   Si Laravel la rota en cada request, hay que persistir el `Set-Cookie` de la respuesta y eso
+   necesita estado (Vercel KV o similar).
+2. **Deep link al vuelo.** Cada vuelo trae `key` y `fareSellKey`. Si la SPA acepta prellenar el
+   canje por query param, el botón puede ir directo al vuelo en vez de a la home del canje.
+3. **`intervalDatesOw` / `intervalSubtype`.** El payload manda `intervalSubtype: null` y la
+   respuesta trae `intervalDatesOw: []`. Huele a un modo calendario multi-fecha. Si existe, el
+   horizonte deja de estar capado en D+1.
 
 ## Tests
 ```bash

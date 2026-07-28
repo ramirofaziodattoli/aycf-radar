@@ -41,29 +41,40 @@ export function sessionDead(res, payload) {
   return res.status === 401 || res.status === 403 || Boolean(payload?.redirectUri);
 }
 
-/**
- * La forma del objeto vuelo sigue sin confirmarse: las 3 capturas del HAR vinieron con
- * flightsOutbound vacío y el chunk de la SPA de canje es lazy + privado. Probamos los
- * campos más probables y si ninguno matchea escupimos el crudo, para que la primera
- * respuesta con cupo revele el shape en vez de romper el formato en silencio.
- */
+/** Shape confirmado contra la API el 28/7. `availableSeats` es el dato que manda. */
 export function describeFlight(f) {
-  const time = f.departureDate ?? f.departure ?? f.std ?? f.departureTime;
-  const num = f.flightNumber ?? f.number ?? f.identifier ?? f.flightCode;
-  if (!time && !num) return `⚠️ shape desconocido: ${JSON.stringify(f).slice(0, 300)}`;
-  const hora = typeof time === 'string' ? time.replace('T', ' ').slice(0, 16) : time;
-  return [num, hora].filter(Boolean).join(' · ');
+  if (!f.flightCode && !f.departure) return `⚠️ shape inesperado: ${JSON.stringify(f).slice(0, 300)}`;
+  const hhmm = (f.departureDateTimeIso ?? '').slice(11, 16) || f.departure;
+  const llega = (f.arrivalDateTimeIso ?? '').slice(11, 16) || f.arrival;
+  const asientos = f.availableSeats;
+  const tasas = f.taxes ? `${f.currency ?? ''} ${f.taxes}`.trim() : null;
+  return [
+    `${f.flightCode} · ${hhmm}→${llega}`,
+    f.duration,
+    asientos != null ? `${asientos} asiento${asientos === 1 ? '' : 's'}` : null,
+    tasas,
+  ].filter(Boolean).join(' · ');
 }
 
-export function buildMessage(hits, date, totalRutas) {
+/** Con dos pasajeros, un vuelo de 1 asiento no sirve para viajar juntos. */
+export function enoughSeats(flight, minSeats) {
+  return (flight.availableSeats ?? 1) >= minSeats;
+}
+
+export function buildMessage(hits, date, totalRutas, minSeats = 1) {
   const cuerpo = hits
     .map((r) => {
-      const vuelos = r.seats.map((f) => `   • ${describeFlight(f)}`).join('\n');
-      return `✅ *${r.from}→${r.to}* — ${r.seats.length} vuelo(s)\n${vuelos}`;
+      const vuelos = [...r.seats]
+        .sort((a, b) => String(a.departureDateTimeIso).localeCompare(String(b.departureDateTimeIso)))
+        .map((f) => `   • ${describeFlight(f)}`)
+        .join('\n');
+      const total = r.seats.reduce((n, f) => n + (f.availableSeats ?? 0), 0);
+      return `✅ *${r.from}→${r.to}* — ${r.seats.length} vuelo(s), ${total} asiento(s)\n${vuelos}`;
     })
     .join('\n\n');
+  const filtro = minSeats > 1 ? ` · filtrando ≥${minSeats} asientos` : '';
   return `🛫 *AYCF* — cupo para el *${date}*\n\n${cuerpo}\n\n` +
-    `_${hits.length}/${totalRutas} rutas con disponibilidad. Se van en minutos._`;
+    `_${hits.length}/${totalRutas} rutas${filtro}. Se van en minutos._`;
 }
 
 /**
@@ -126,6 +137,8 @@ export default async function handler(req, response) {
   }
 
   const date = req.query?.date || tomorrowInAR();
+  // Viajando de a dos, un vuelo con 1 asiento no sirve. MIN_SEATS=2 los filtra.
+  const minSeats = Number(req.query?.minSeats ?? process.env.MIN_SEATS ?? 1);
   const results = [];
 
   for (const route of ROUTES) {
@@ -139,15 +152,15 @@ export default async function handler(req, response) {
       await telegram('🔴 *AYCF Radar*: sesión caída.\n\nRefrescá `AYCF_COOKIE` en Vercel.');
       return response.status(200).json({ ok: false, error: 'session-dead' });
     }
-    results.push({ ...route, seats: seatsIn(payload) });
+    results.push({ ...route, seats: seatsIn(payload).filter((f) => enoughSeats(f, minSeats)) });
   }
 
   const hits = results.filter((r) => r.seats.length > 0);
 
   if (shouldNotify(hits, process.env.NOTIFY_EMPTY === 'true')) {
     const texto = hits.length
-      ? buildMessage(hits, date, ROUTES.length)
-      : `🛫 *AYCF* — sin cupo en ninguna de las ${ROUTES.length} rutas para el *${date}*.`;
+      ? buildMessage(hits, date, ROUTES.length, minSeats)
+      : `🛫 *AYCF* — sin cupo${minSeats > 1 ? ` de ≥${minSeats} asientos` : ''} en las ${ROUTES.length} rutas para el *${date}*.`;
     await telegram(texto, hits.length ? [[{ text: '🎟️ Canjear', url: CANJE }]] : []);
   }
 

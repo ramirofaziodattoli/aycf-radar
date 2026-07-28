@@ -19,7 +19,13 @@ if (faltan.length) {
 }
 
 // Imitamos lo que Vercel le pasa al handler: un request y un response.
-const req = { headers: {}, query: date ? { date } : {} };
+// Incluido el Bearer con CRON_SECRET, que en prod lo inyecta Vercel solo.
+const req = {
+  headers: process.env.CRON_SECRET
+    ? { authorization: `Bearer ${process.env.CRON_SECRET}` }
+    : {},
+  query: date ? { date } : {},
+};
 const res = {
   status(code) {
     this.code = code;
