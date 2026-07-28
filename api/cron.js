@@ -14,7 +14,9 @@ export default async function handler(req, res) {
       date: req.query?.date,
       watchesRaw: await readWatches(),
     });
-    return res.status(200).json({ ok: true, ...out });
+    // Si devolvemos 200 en un fallo, Vercel marca el cron como exitoso y el
+    // problema queda invisible en el dashboard.
+    return res.status(out.ok === false ? 500 : 200).json({ ok: true, ...out });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }

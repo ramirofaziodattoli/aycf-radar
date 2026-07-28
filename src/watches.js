@@ -25,7 +25,18 @@ export function validateWatch(w, i) {
 }
 
 export function loadWatches(raw) {
-  const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  if (typeof raw === 'string' && raw.trim() === '') {
+    throw new Error(
+      'WATCHES está vacía. Cargá el JSON de watches en la env var ' +
+      '(en Vercel: Settings → Environment Variables) o creá watches.json.'
+    );
+  }
+  let list;
+  try {
+    list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  } catch (err) {
+    throw new Error(`WATCHES no es JSON válido: ${err.message}`);
+  }
   if (!Array.isArray(list)) throw new Error('watches debe ser un array');
   if (list.length === 0) throw new Error('no hay watches configurados');
   return list.map(validateWatch);
