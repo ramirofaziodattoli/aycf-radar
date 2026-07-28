@@ -30,20 +30,36 @@ filtra por tus criterios, y notifica **solo lo que no te avisó antes**.
 y 120 min antes de la salida, y el inventario se libera por día calendario a medianoche. Consultar
 D+2 devuelve vacío siempre. El barrido diario *es* el universo canjeable completo.
 
-### La sesión se renueva sola
+### La sesión vence por tiempo absoluto — no hay keep-alive posible
 
-`laravel_session` vence a los **30 minutos de inactividad** (`max-age=1800`) y además **el ID rota
-en cada respuesta autenticada** — verificado: tras la primera corrida, la cookie en el store ya no
-es la semilla. El radar absorbe cada rotación, así que **mientras corra más seguido que cada
-30 min, la sesión no vence nunca**.
+**Medido en producción, no supuesto.** El cron corrió puntual cada 15 minutos:
 
-> Corolario: **una vez sembrada, no sigas usando el portal con esa sesión.** Cada request del
-> navegador la mueve adelante y deja al radar atrás, que se entera con un `500` +
-> `error.token.mismatch`. Sembrá y dejá que el radar sea el único dueño.
+```
+02:30 → 200 OK
+02:45 → 200 OK
+03:00 → 200 OK      ← última exitosa
+03:15 → 500 session-expired
+```
 
-Solo la primera semilla es manual (el login va por Keycloak y no lo automatizamos: implicaría
-guardarte usuario y contraseña). Si el radar estuvo caído más de 30 min, te avisa por Telegram
-que hay que re-sembrarla.
+Quince minutos entre un éxito y la muerte, con la mitad del `max-age=1800` sin consumir. Si fuera
+inactividad, pegarle cada 15 min la sostendría para siempre. **No es inactividad: es un tope
+absoluto de ~40 minutos**, probablemente el token de Keycloak que hay detrás.
+
+Consecuencia de diseño: **no existe forma de mantenerla viva sola.** El radar absorbe la cookie
+rotada igual (no molesta), pero eso no compra tiempo.
+
+Lo que sí funciona, dado el límite:
+
+1. **`/cookie` desde Telegram.** Pegás el header y queda viva al instante, sin tocar Vercel ni
+   redeployar. Diez segundos.
+2. **Recordatorio a las 23:45.** El radar te avisa 16 minutos antes de la liberación, diciéndote
+   si la sesión está viva o si hay que sembrarla. Sembrada a las 23:45, llega viva a las 00:01.
+
+La liberación de las 00:01 es el único momento que realmente importa: ahí sale el inventario del
+día siguiente. Cubrir esa ventana es cubrir el 90% del valor.
+
+> Automatizar el login (Keycloak) sería el arreglo de fondo, pero implica guardar usuario y
+> contraseña. Queda a criterio de cada uno.
 
 > Por eso hace falta almacenamiento persistente. En Vercel el filesystem es efímero: sin Redis, la
 > cookie renovada se pierde entre invocaciones y volvés al problema de origen.

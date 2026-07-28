@@ -6,6 +6,7 @@ import { validateWatch, watchLabel, matchFlight } from './watches.js';
 import { resolveWatches, saveWatches } from './config.js';
 import { formatFlight } from './notify.js';
 import { getCatalog, resolveAirport, airportName, routeExists, destinationsFrom } from './airports.js';
+import { Session } from './session.js';
 
 const AYUDA = `🛩️ *AYCF Radar*
 
@@ -14,6 +15,7 @@ const AYUDA = `🛩️ *AYCF Radar*
 /vigilar \`ORIGEN DESTINO [asientos]\` — sumo una ruta
 /borrar \`N\` — saco la ruta N de la lista
 /aeropuertos \`[ORIGEN]\` — la red de JetSMART, o los destinos desde un origen
+/cookie — pegame una sesión nueva (queda viva al instante)
 /estado — cómo viene todo
 
 Podés escribir el nombre de la ciudad en vez del código:
@@ -154,6 +156,60 @@ async function cmdBorrar(store, args) {
   return `🗑️ Saqué *${watchLabel(fuera)}*. Quedan ${watches.length}.`;
 }
 
+/**
+ * Re-sembrar la sesión desde el chat. Es el camino rápido: no hay que tocar
+ * Vercel ni redeployar, queda en el store y la próxima corrida ya la usa.
+ *
+ * La sesión de Caravelo tiene vencimiento ABSOLUTO (~40 min), no por inactividad,
+ * así que esto hay que hacerlo seguido. Lo importante es tenerla fresca antes
+ * de las 00:01, que es cuando se libera el inventario.
+ */
+async function cmdCookie(store, args) {
+  const crudo = args.join(' ').trim();
+  if (!crudo) {
+    return '🍪 Pegame la sesión así:\n\n' +
+      '`/cookie ` + el header `cookie` del portal\n\n' +
+      'DevTools → Network → el request `availability/...` → Request Headers → `cookie`.\n' +
+      'También sirven los valores sueltos de `laravel_session` y `XSRF-TOKEN`.';
+  }
+
+  const candidatos = crudo.includes('laravel_session=')
+    ? [crudo.replace(/\s*\n\s*/g, ' ')]
+    : (() => {
+        const vals = crudo.split(/[\s\n]+/).filter((v) => v.length > 40);
+        if (vals.length < 2) return vals.length === 1 ? [`laravel_session=${vals[0]}`] : [];
+        return [
+          `laravel_session=${vals[0]}; XSRF-TOKEN=${vals[1]}`,
+          `laravel_session=${vals[1]}; XSRF-TOKEN=${vals[0]}`,
+        ];
+      })();
+
+  if (!candidatos.length) return '⚠️ No reconocí ninguna cookie ahí.';
+
+  for (const cookie of candidatos) {
+    const probe = new Session(store);
+    probe.jar = Object.fromEntries(
+      cookie.split(';').map((c) => {
+        const i = c.indexOf('=');
+        return [c.slice(0, i).trim(), c.slice(i + 1).trim()];
+      }).filter(([n]) => n)
+    );
+    try {
+      const date = tomorrowInAR();
+      const watches = await resolveWatches(store);
+      await search(probe, { from: watches[0].from, to: watches[0].to, date }, store);
+      await probe.persist();
+      return '✅ *Sesión nueva, funcionando.*\n\n' +
+        'Ya quedó guardada: la próxima corrida la usa sin redeployar nada.\n' +
+        '_Ojo que vence en ~40 min (es absoluto, no por inactividad)._';
+    } catch {
+      // probamos el siguiente orden
+    }
+  }
+  return '❌ No sirvió: puede estar vencida o mal copiada.\n\n' +
+    'Hacé UNA búsqueda en el portal, copiá el header `cookie` completo y mandámelo de nuevo.';
+}
+
 async function cmdEstado(store, session) {
   const watches = await resolveWatches(store);
   const date = tomorrowInAR();
@@ -193,6 +249,9 @@ async function dispatch(cmd, args, { store, session }) {
       return cmdVigilar(store, args);
     case '/borrar':
       return cmdBorrar(store, args);
+    case '/cookie':
+    case '/sesion':
+      return cmdCookie(store, args);
     case '/aeropuertos':
     case '/red':
       return cmdAeropuertos(store, args);
