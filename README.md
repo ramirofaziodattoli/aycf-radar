@@ -117,11 +117,15 @@ npm run dev              # los vuelos de mañana
 npm run dev 2026-08-13   # una fecha puntual
 ```
 
-`seed` acepta el header `cookie` entero o los valores sueltos de *Application → Cookies*,
-uno por línea y en cualquier orden: prueba las combinaciones y se queda con la que autentica.
+**Copiá el header `cookie` entero**: DevTools → Network → el request `availability/…` → Request
+Headers → `cookie`. Un solo copy-paste.
 
-> `laravel_session` es **httpOnly**: `document.cookie` en la consola no te la muestra. Sacala de
-> *Application → Cookies* o del header `cookie` en *Network*.
+> **No alcanza con `laravel_session`.** Laravel valida CSRF cruzándola con `XSRF-TOKEN`, y si no
+> son de la misma sesión responde `500` con `content.exceptionMessage: "error.token.mismatch"`.
+> El header entero te garantiza el par emparejado sin tener que pensarlo.
+
+> `laravel_session` es **httpOnly**: `document.cookie` en la consola no te la muestra. Tiene que
+> salir de *Network* o de *Application → Cookies*.
 
 ## Deploy
 

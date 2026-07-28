@@ -5,10 +5,13 @@
 // laravel_session vive 30 minutos. Copiar de DevTools, pegar en algún lado y
 // probar a mano suele tardar más que eso. Esto lo reduce a un comando.
 //
-// Acepta cualquiera de estas formas:
-//   - el header `cookie` completo (Network > Request Headers)
-//   - los valores sueltos de Application > Cookies, uno por línea, en cualquier
-//     orden: prueba cuál es laravel_session y cuál XSRF-TOKEN por descarte.
+// LO MÁS FÁCIL: pegá el header `cookie` ENTERO (DevTools > Network > el request
+// `availability/...` > Request Headers > cookie). Trae laravel_session y su
+// XSRF-TOKEN emparejados, que es lo único que importa: Laravel valida CSRF
+// cruzando los dos, y si no son de la misma sesión responde 500 token.mismatch.
+//
+// También acepta valores sueltos de Application > Cookies, pero ahí tenés que
+// copiar laravel_session Y XSRF-TOKEN, del mismo momento.
 
 import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -43,7 +46,12 @@ function candidates(input) {
 
   const vals = input.split(/[\s\n]+/).map((v) => v.trim()).filter((v) => v.length > 40);
   if (vals.length === 0) return [];
-  if (vals.length === 1) return [`laravel_session=${vals[0]}`];
+  if (vals.length === 1) {
+    console.warn('⚠️  Pegaste un solo valor. laravel_session sola casi nunca alcanza:');
+    console.warn('   Laravel valida CSRF contra XSRF-TOKEN y responde 500 token.mismatch.');
+    console.warn('   Si falla, copiá el header `cookie` entero desde Network.\n');
+    return [`laravel_session=${vals[0]}`];
+  }
   // Sin saber cuál es cuál, probamos ambos órdenes.
   return [
     `laravel_session=${vals[0]}; XSRF-TOKEN=${vals[1]}`,
@@ -119,11 +127,13 @@ if (fallos.some((f) => f.mismatch)) {
   console.error('\n❌ La cookie quedó SUPERADA (error.token.mismatch).');
   console.error('   El ID de sesión rota en cada request. Si seguiste navegando el portal');
   console.error('   después de copiarla, la que tenés ya no vale.');
-  console.error('\n   Hacelo así:');
-  console.error('     1. En el portal, hacé UNA búsqueda');
-  console.error('     2. Application → Cookies → copiá laravel_session Y XSRF-TOKEN');
-  console.error('     3. CERRÁ la pestaña — no toques más el portal');
+  console.error('\n   Lo más simple es copiar el header entero:');
+  console.error('     1. En el portal, hacé una búsqueda');
+  console.error('     2. DevTools → Network → click en el request `availability/...`');
+  console.error('     3. Request Headers → copiá el valor de `cookie` COMPLETO');
   console.error('     4. npm run seed');
+  console.error('\n   (laravel_session y XSRF-TOKEN tienen que ser de la misma sesión.');
+  console.error('    El header entero te lo garantiza sin pensarlo.)');
 } else {
   console.error('\n❌ Ninguna sirvió: la sesión venció (30 min de inactividad).');
   console.error('   Volvé al portal, hacé una búsqueda y copiá de nuevo.');
