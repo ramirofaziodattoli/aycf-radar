@@ -365,6 +365,10 @@ const memStore = () => {
                  getSetCookie: () => ['laravel_session=FRESCA'] },
       text: async () => '',
     };
+    // Ojo: la pagina POST-redirect NO puede traer el form, o login() cree que fallo.
+    if (String(url).includes('/ok')) {
+      return { status: 200, headers: { get: () => null, getSetCookie: () => [] }, text: async () => 'listo' };
+    }
     return { status: 200, headers: { get: () => null, getSetCookie: () => [] }, text: async () => FORM };
   };
 
