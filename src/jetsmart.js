@@ -1,0 +1,80 @@
+// Cliente de la API de disponibilidad AYCF (backend Caravelo, Laravel).
+//
+//   POST /es-ar/ja/subscriptions/availability/{passId}
+//   Accept: application/vnd.cvo.subs.frontend+json
+//
+// Horizonte: D+1 y nada más. Los T&C fijan la ventana de canje entre 24h y 120min
+// antes de la salida, y el inventario se libera a las 00:01 por día calendario.
+// Consultar D+2 devuelve vacío siempre.
+
+import { SessionExpiredError } from './session.js';
+
+const BASE = process.env.AYCF_BASE_URL || 'https://go.jetsmart.com/es-ar/ja/subscriptions';
+
+export const REDEMPTION_URL = `${BASE}/spa/private-page/redemption`;
+
+/** Normaliza el vuelo crudo a lo que nos importa. */
+export function normalize(f) {
+  return {
+    code: f.flightCode,
+    from: f.departureStationCode ?? f.departureStation,
+    to: f.arrivalStationCode ?? f.arrivalStation,
+    departsAt: f.departureDateTimeIso,
+    arrivesAt: f.arrivalDateTimeIso,
+    departsHHMM: (f.departureDateTimeIso ?? '').slice(11, 16) || f.departure,
+    arrivesHHMM: (f.arrivalDateTimeIso ?? '').slice(11, 16) || f.arrival,
+    duration: f.duration,
+    stops: f.stops,
+    seats: f.availableSeats ?? 0,
+    taxes: parseAmount(f.taxes),
+    taxesText: f.taxes,
+    currency: f.currency,
+    key: f.key,
+    fareSellKey: f.fareSellKey,
+  };
+}
+
+/** "15,103.85" -> 15103.85. Caravelo formatea con coma de miles y punto decimal. */
+export function parseAmount(s) {
+  if (typeof s !== 'string') return null;
+  const n = Number(s.replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+export async function search(session, { from, to, date }) {
+  const res = await fetch(`${BASE}/availability/${process.env.AYCF_PASS_ID}`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/vnd.cvo.subs.frontend+json',
+      'content-type': 'application/json',
+      cookie: session.header(),
+    },
+    body: JSON.stringify({
+      flightType: 'OW',
+      origin: from,
+      destination: to,
+      departure: date,
+      arrival: null,
+      intervalSubtype: null,
+      outboundKey: null,
+    }),
+  });
+
+  if (res.status === 401 || res.status === 403) throw new SessionExpiredError();
+
+  const text = await res.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`respuesta no-JSON de Caravelo (${res.status}): ${text.slice(0, 200)}`);
+  }
+
+  // Caravelo también expulsa con 200 + redirectUri al login.
+  if (payload.redirectUri) throw new SessionExpiredError();
+
+  // Solo acá renovamos: la respuesta vino autenticada.
+  await session.absorb(res);
+
+  return (payload.content?.flights?.flightsOutbound ?? []).map(normalize);
+}

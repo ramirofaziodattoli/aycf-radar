@@ -1,0 +1,29 @@
+[
+  {
+    "label": "Bariloche → Buenos Aires",
+    "from": "BRC",
+    "to": "AEP"
+  },
+  {
+    "label": "Escapada de finde a Salta (los dos juntos)",
+    "from": "AEP",
+    "to": "SLA",
+    "minSeats": 2,
+    "weekdays": ["thu", "fri"],
+    "departAfter": "15:00"
+  },
+  {
+    "label": "Vuelta de Salta, solo en agosto y barata",
+    "from": "SLA",
+    "to": "AEP",
+    "dateFrom": "2026-08-01",
+    "dateTo": "2026-08-31",
+    "maxTaxes": 25000
+  },
+  {
+    "label": "Córdoba → Buenos Aires (pausado)",
+    "from": "COR",
+    "to": "AEP",
+    "enabled": false
+  }
+]

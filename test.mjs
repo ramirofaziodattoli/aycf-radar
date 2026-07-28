@@ -1,67 +1,120 @@
 import assert from 'node:assert/strict';
-import {
-  ROUTES, tomorrowInAR, seatsIn, sessionDead, describeFlight, buildMessage, shouldNotify, enoughSeats,
-} from './api/radar.js';
+import { normalize, parseAmount } from './src/jetsmart.js';
+import { validateWatch, loadWatches, appliesTo, matchFlight } from './src/watches.js';
+import { tomorrowInAR, dedupeKey, groupByRoute, runSweep } from './src/radar.js';
+import { formatFlight, formatReport } from './src/notify.js';
+import { Session } from './src/session.js';
 
-// El cron dispara 03:01 UTC = 00:01 ART, justo cuando se libera D+1.
+// --- fechas: el cron corre 03:01 UTC = 00:01 ART, cuando se libera D+1 ---
 assert.equal(tomorrowInAR(new Date('2026-08-12T03:01:00Z')), '2026-08-13');
-// Antes de medianoche ART el target todavía no rota.
-assert.equal(tomorrowInAR(new Date('2026-08-12T02:00:00Z')), '2026-08-12');
-// Cruce de mes y de año.
-assert.equal(tomorrowInAR(new Date('2026-08-31T03:01:00Z')), '2026-09-01');
-assert.equal(tomorrowInAR(new Date('2026-12-31T03:01:00Z')), '2027-01-01');
+assert.equal(tomorrowInAR(new Date('2026-08-12T02:00:00Z')), '2026-08-12', 'antes de medianoche ART no rota');
+assert.equal(tomorrowInAR(new Date('2026-08-31T03:01:00Z')), '2026-09-01', 'cruce de mes');
+assert.equal(tomorrowInAR(new Date('2026-12-31T03:01:00Z')), '2027-01-01', 'cruce de año');
 
-// Rutas direccionales: si está la ida tiene que estar la vuelta.
-for (const { from, to } of ROUTES) {
-  assert.ok(ROUTES.some((r) => r.from === to && r.to === from),
-    `falta la inversa de ${from}→${to}`);
+// --- parseo de la respuesta real de Caravelo ---
+const CRUDO = {
+  flightCode: 'JA3100', departure: '6:00 am', arrival: '7:28 am',
+  departureStationCode: 'AEP', arrivalStationCode: 'COR',
+  departureDateTimeIso: '2026-07-29 06:00:00', arrivalDateTimeIso: '2026-07-29 07:28:00',
+  duration: '01h 28m', stops: 'Directo', availableSeats: 6,
+  taxes: '15,103.85', currency: 'ARS', key: 'k', fareSellKey: 'fk',
+};
+const V = normalize(CRUDO);
+assert.equal(V.code, 'JA3100');
+assert.equal(V.seats, 6);
+assert.equal(V.departsHHMM, '06:00');
+assert.equal(V.taxes, 15103.85, 'coma de miles + punto decimal');
+assert.equal(parseAmount('1,234,567.89'), 1234567.89);
+assert.equal(parseAmount(undefined), null);
+
+// --- validación de watches: que explote temprano y claro, no en producción ---
+assert.throws(() => validateWatch({ from: 'AEP', to: 'AEP' }, 0), /iguales/);
+assert.throws(() => validateWatch({ to: 'SLA' }, 0), /IATA/, 'falta "from"');
+assert.throws(() => validateWatch({ from: 'BUENOS', to: 'SLA' }, 0), /IATA/, 'más de 3 letras');
+assert.throws(() => validateWatch({ from: 'aep', to: 'SLA' }, 0), /IATA/, 'minúsculas no');
+assert.throws(() => validateWatch({ from: 'AEP', to: 'SLA', weekdays: ['lunes'] }, 0), /inválido/);
+assert.throws(() => validateWatch({ from: 'AEP', to: 'SLA', dateFrom: '13/08/2026' }, 0), /YYYY-MM-DD/);
+assert.throws(() => validateWatch({ from: 'AEP', to: 'SLA', minSeats: 0 }, 0), /minSeats/);
+assert.throws(() => loadWatches('[]'), /no hay watches/);
+assert.doesNotThrow(() => validateWatch({ from: 'AEP', to: 'SLA', weekdays: ['fri'], minSeats: 2 }, 0));
+
+// --- ventanas: los filtros silencian, no amplían el horizonte ---
+const W = { from: 'AEP', to: 'SLA' };
+assert.equal(appliesTo(W, '2026-08-13'), true, 'sin filtros, todos los días');
+assert.equal(appliesTo({ ...W, enabled: false }, '2026-08-13'), false);
+assert.equal(appliesTo({ ...W, dateFrom: '2026-08-01', dateTo: '2026-08-31' }, '2026-08-13'), true);
+assert.equal(appliesTo({ ...W, dateTo: '2026-08-10' }, '2026-08-13'), false);
+// 2026-08-13 es jueves.
+assert.equal(appliesTo({ ...W, weekdays: ['thu'] }, '2026-08-13'), true);
+assert.equal(appliesTo({ ...W, weekdays: ['fri', 'sat'] }, '2026-08-13'), false);
+
+// --- filtros de vuelo ---
+assert.equal(matchFlight({ minSeats: 2 }, V), true, '6 asientos pasan un mínimo de 2');
+assert.equal(matchFlight({ minSeats: 2 }, { ...V, seats: 1 }), false, 'de a dos, 1 asiento no sirve');
+assert.equal(matchFlight({ maxTaxes: 10000 }, V), false, 'tasas por encima del tope');
+assert.equal(matchFlight({ maxTaxes: 20000 }, V), true);
+assert.equal(matchFlight({ departAfter: '15:00' }, V), false, 'sale 06:00');
+assert.equal(matchFlight({ departBefore: '15:00' }, V), true);
+
+// --- agrupado: dos watches sobre la misma ruta = un solo request ---
+const rutas = groupByRoute([
+  { from: 'AEP', to: 'SLA', minSeats: 1 },
+  { from: 'AEP', to: 'SLA', minSeats: 2 },
+  { from: 'BRC', to: 'AEP' },
+]);
+assert.equal(rutas.length, 2, 'AEP→SLA se consulta una vez sola');
+assert.equal(rutas[0].watches.length, 2);
+
+// --- formato ---
+assert.equal(formatFlight(V), 'JA3100 · 06:00→07:28 · 01h 28m · 6 asientos · ARS 15,103.85');
+assert.match(formatFlight({ ...V, seats: 1 }), /1 asiento(?!s)/, 'singular');
+const reporte = formatReport([{ watch: { label: 'Ida a Salta' }, flights: [V] }], '2026-07-29');
+assert.match(reporte, /Ida a Salta/);
+assert.match(reporte, /JA3100/);
+assert.match(reporte, /1 vuelo\(s\)/);
+
+// --- sesión: rota la cookie, ignora analytics, no pisa con valores vacíos ---
+const memStore = () => {
+  const m = new Map();
+  return { get: async (k) => m.get(k) ?? null, set: async (k, v) => void m.set(k, v) };
+};
+{
+  process.env.AYCF_COOKIE = 'laravel_session=ORIGINAL; _ga=basura; XSRF-TOKEN=tok';
+  const s = await new Session(memStore()).load();
+  assert.match(s.header(), /laravel_session=ORIGINAL/);
+  assert.doesNotMatch(s.header(), /_ga/, 'las de analytics no se guardan');
+
+  const res = {
+    headers: {
+      getSetCookie: () => [
+        'laravel_session=ROTADA; path=/; max-age=1800; httponly',
+        '_gid=ruido; path=/',
+      ],
+    },
+  };
+  assert.equal(await s.absorb(res), true, 'detecta que cambió');
+  assert.match(s.header(), /laravel_session=ROTADA/, 'la sesión se renovó sola');
+  assert.doesNotMatch(s.header(), /_gid/);
+  assert.equal(await s.absorb(res), false, 'misma cookie, sin reescritura');
 }
 
-// flightsOutbound vacío = sin cupo, y no puede explotar si falta el nodo.
-assert.deepEqual(seatsIn({ content: { flights: { flightsOutbound: [] } } }), []);
-assert.deepEqual(seatsIn({}), []);
-assert.equal(seatsIn({ content: { flights: { flightsOutbound: [{ a: 1 }] } } }).length, 1);
+// --- dedupe: correr cada 15 min no puede spamear el mismo vuelo ---
+{
+  const store = memStore();
+  const session = { header: () => 'x' };
+  const watches = [{ from: 'AEP', to: 'COR', minSeats: 1 }];
+  const fake = async () => [V];
 
-// Caravelo redirige al login con 200 + redirectUri, no con 401.
-assert.equal(sessionDead({ status: 401 }, {}), true);
-assert.equal(sessionDead({ status: 200 }, { redirectUri: '/login' }), true);
-assert.equal(sessionDead({ status: 200 }, { redirectUri: null }), false);
+  // Inyectamos el search vía runSweep para no pegarle a la red en los tests.
+  const sweep = (s) => runSweep({
+    date: '2026-07-29', watches, store, session, notify: false, _search: s,
+  });
+  assert.equal(dedupeKey('2026-07-29', watches[0], V), 'seen:2026-07-29|AEP-COR|JA3100');
 
-// Shape inesperado → crudo, no silencio.
-assert.match(describeFlight({ campoRaro: 'x' }), /shape inesperado/);
-
-// Shape real, capturado de la API el 28/7.
-const VUELO = {
-  flightCode: 'JA3100', departure: '6:00 am', arrival: '7:28 am',
-  departureDateTimeIso: '2026-07-29 06:00:00', arrivalDateTimeIso: '2026-07-29 07:28:00',
-  duration: '01h 28m', availableSeats: 6, taxes: '15,103.85', currency: 'ARS',
-};
-assert.equal(describeFlight(VUELO), 'JA3100 · 06:00→07:28 · 01h 28m · 6 asientos · ARS 15,103.85');
-assert.match(describeFlight({ ...VUELO, availableSeats: 1 }), /1 asiento(?!s)/, 'singular');
-
-// availableSeats es lo que decide si podemos viajar los dos.
-assert.equal(enoughSeats({ availableSeats: 6 }, 2), true);
-assert.equal(enoughSeats({ availableSeats: 1 }, 2), false);
-assert.equal(enoughSeats({ availableSeats: 1 }, 1), true);
-assert.equal(enoughSeats({}, 2), false, 'sin el campo, asumir 1 y no prometer de más');
-
-// Barrido diario: sin hits no se notifica (si no, spam todas las noches).
-assert.equal(shouldNotify([], false), false);
-assert.equal(shouldNotify([{}], false), true);
-assert.equal(shouldNotify([], true), true, 'NOTIFY_EMPTY fuerza el aviso de "no hay nada"');
-
-const msg = buildMessage([{ from: 'AEP', to: 'COR', seats: [VUELO] }], '2026-07-29', 10);
-assert.match(msg, /✅ \*AEP→COR\*/);
-assert.match(msg, /JA3100/);
-assert.match(msg, /1 vuelo\(s\), 6 asiento\(s\)/);
-assert.match(msg, /1\/10 rutas/);
-assert.match(buildMessage([{ from: 'AEP', to: 'COR', seats: [VUELO] }], '2026-07-29', 10, 2), /≥2 asientos/);
-
-// Los vuelos se listan por hora de salida, no en el orden que vino la API.
-const dos = buildMessage([{ from: 'AEP', to: 'COR', seats: [
-  { ...VUELO, flightCode: 'TARDE', departureDateTimeIso: '2026-07-29 19:00:00' },
-  { ...VUELO, flightCode: 'TEMPRANO', departureDateTimeIso: '2026-07-29 06:00:00' },
-]}], '2026-07-29', 10);
-assert.ok(dos.indexOf('TEMPRANO') < dos.indexOf('TARDE'), 'ordenado por salida');
+  const uno = await sweep(fake);
+  assert.equal(uno.hits.length, 1, 'primera pasada: avisa');
+  const dos = await sweep(fake);
+  assert.equal(dos.hits.length, 0, 'segunda pasada: ya lo vio, no repite');
+}
 
 console.log('✅ todo ok');

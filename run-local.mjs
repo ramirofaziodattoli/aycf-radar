@@ -1,43 +1,32 @@
-// Corre el radar en tu compu, sin deployar nada. Sirve para ver que funciona
-// y para descubrir la forma real de un vuelo antes de que importe de verdad.
+// Corre un barrido en tu máquina, sin deployar.
 //
-//   node --env-file=.env run-local.mjs              → busca los vuelos de mañana
-//   node --env-file=.env run-local.mjs 2026-07-29   → busca una fecha puntual
+//   node --env-file=.env run-local.mjs              → los vuelos de mañana
+//   node --env-file=.env run-local.mjs 2026-08-13   → una fecha puntual
 //
-// (Node trae --env-file nativo desde la v20, no hace falta instalar nada.)
+// El estado (sesión + dedupe) va a .state.json salvo que configures Redis.
 
-import handler from './api/radar.js';
+import { runRadar } from './src/radar.js';
+import { readWatches } from './src/config.js';
 
 const date = process.argv[2];
 
-const faltan = ['AYCF_COOKIE', 'AYCF_PASS_ID', 'TELEGRAM_TOKEN', 'TELEGRAM_CHAT_ID']
-  .filter((k) => !process.env[k]);
+const faltan = ['AYCF_COOKIE', 'AYCF_PASS_ID'].filter((k) => !process.env[k]);
 if (faltan.length) {
-  console.error(`❌ Faltan variables en .env: ${faltan.join(', ')}`);
-  console.error('   Copiá .env.example a .env y completalo.');
+  console.error(`❌ Faltan en .env: ${faltan.join(', ')}. Mirá .env.example`);
   process.exit(1);
 }
+if (!process.env.TELEGRAM_TOKEN) {
+  console.warn('⚠️  Sin TELEGRAM_TOKEN: no se notifica, solo se imprime acá.\n');
+}
 
-// Imitamos lo que Vercel le pasa al handler: un request y un response.
-// Incluido el Bearer con CRON_SECRET, que en prod lo inyecta Vercel solo.
-const req = {
-  headers: process.env.CRON_SECRET
-    ? { authorization: `Bearer ${process.env.CRON_SECRET}` }
-    : {},
-  query: date ? { date } : {},
-};
-const res = {
-  status(code) {
-    this.code = code;
-    return this;
-  },
-  json(body) {
-    console.log(`\n[${this.code}]`, JSON.stringify(body, null, 2));
-    if (body.results?.every((r) => r.cupo === 0)) {
-      console.log('\nSin cupo en ninguna ruta. El mensaje igual se mandó a Telegram.');
-    }
-  },
-};
-
-console.log(`Consultando ${date ? `el ${date}` : 'los vuelos de mañana'}...`);
-await handler(req, res);
+try {
+  const out = await runRadar({ date, watchesRaw: await readWatches() });
+  console.log(JSON.stringify(out, null, 2));
+  if (out.hits?.length === 0) {
+    console.log('\nSin novedades. Ojo: lo ya notificado no se repite (dedupe).');
+    console.log('Para volver a verlo todo: rm .state.json');
+  }
+} catch (err) {
+  console.error(`\n❌ ${err.message}`);
+  process.exit(1);
+}
