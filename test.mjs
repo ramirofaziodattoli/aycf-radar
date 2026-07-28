@@ -165,4 +165,24 @@ const memStore = () => {
   globalThis.fetch = orig;
 }
 
+// --- encontrar cupo y no poder avisar NO es un exito ---
+{
+  const store = memStore();
+  const session = { header: () => 'x' };
+  const watches = [{ from: 'AEP', to: 'COR', minSeats: 1 }];
+  const orig = globalThis.fetch;
+
+  // Telegram caido (token revocado): el fetch falla.
+  globalThis.fetch = async () => { throw new Error('401 Unauthorized'); };
+  process.env.TELEGRAM_TOKEN = 'muerto'; process.env.TELEGRAM_CHAT_ID = 'y';
+
+  const out = await runSweep({
+    date: '2026-07-29', watches, store, session, _search: async () => [V],
+  });
+  assert.equal(out.ok, false, 'hubo cupo pero no se pudo avisar => NO es ok');
+  assert.equal(out.error, 'notify-failed');
+
+  globalThis.fetch = orig;
+}
+
 console.log('✅ todo ok');

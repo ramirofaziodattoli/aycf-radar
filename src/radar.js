@@ -58,11 +58,18 @@ export async function runSweep({ date, watches, store, session, notify = true, _
     }
   }
 
-  if (notify && hits.length) await notifyHits(hits, date);
+  // Encontrar vuelos y no poder avisar es una falla, no un éxito: si el token de
+  // Telegram murió, el radar seguiría reportando ok con el dashboard en verde.
+  let notified = null;
+  if (notify && hits.length) {
+    notified = await notifyHits(hits, date);
+    if (!notified) console.error('¡Había cupo y no se pudo notificar por ningún canal!');
+  }
 
   return {
     date,
     scanned,
+    ...(notified === false ? { ok: false, error: 'notify-failed' } : {}),
     hits: hits.map(({ watch, flights }) => ({
       watch: watchLabel(watch),
       flights: flights.map((f) => ({ code: f.code, at: f.departsHHMM, seats: f.seats })),
