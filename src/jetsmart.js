@@ -57,13 +57,26 @@ export class SinPaseError extends Error {
  * guardarlo, así que un UUID equivocado no queda pegado.
  */
 export async function discoverPassId(session) {
-  const res = await fetch(REDEMPTION_URL, {
-    headers: { cookie: session.header(), accept: 'text/html', 'user-agent': UA },
-    signal: AbortSignal.timeout(20_000),
-  });
-  const html = await res.text().catch(() => '');
-  const uuids = [...html.matchAll(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi)];
-  return uuids.map((m) => m[0]);
+  const encontrados = new Set();
+  // Dos páginas porque no sabemos en cuál lo embebe el SPA; el que sirve lo
+  // decide la verificación, no nosotros.
+  for (const url of [REDEMPTION_URL, `${BASE}/spa/private-page`, BASE]) {
+    try {
+      const res = await fetch(url, {
+        headers: { cookie: session.header(), accept: 'text/html', 'user-agent': UA },
+        signal: AbortSignal.timeout(20_000),
+      });
+      const html = await res.text();
+      for (const m of html.matchAll(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi)) {
+        encontrados.add(m[0].toLowerCase());
+      }
+    } catch {
+      // una página que no responde no invalida a las otras
+    }
+    if (encontrados.size) break;
+  }
+  // Cada candidato cuesta un request de verificación: no probamos veinte.
+  return [...encontrados].slice(0, 6);
 }
 
 export async function search(session, { from, to, date }, store = null) {
