@@ -454,4 +454,38 @@ const memStore = () => {
   assert.equal(estaConectado({ email: 'a@b.com', passId: 'x' }), true);
 }
 
+// --- sin comandos ni codigos: la gente escribe cualquier cosa ---
+{
+  const { comandoDe, handleCallback } = await import('./src/commands.js');
+  const conectado = { chatId: '1', email: 'a@b.com', passId: 'x' };
+
+  assert.equal(comandoDe('/rutas', conectado).cmd, '/rutas');
+  assert.equal(comandoDe('/Buscar@mibot AEP SLA', conectado).cmd, '/buscar', 'mayusculas y @bot');
+  assert.equal(comandoDe('mia@mail.com miclave', null).cmd, '/conectar', 'mail + pass = alta');
+  assert.deepEqual(comandoDe('mia@mail.com miclave', null).args, ['mia@mail.com', 'miclave']);
+  assert.equal(comandoDe('bariloche salta', conectado).cmd, '/buscar', 'texto suelto busca');
+  assert.equal(comandoDe('hola', null).cmd, '/start', 'sin cuenta, todo lleva al alta');
+
+  // Los botones tienen que caber en los 64 bytes de callback_data de Telegram.
+  const store = memStore();
+  store.name = 'memory';
+  await store.set('catalog:routes', {
+    aeropuertos: { BRC: 'Bariloche', AEP: 'Aeroparque', SLA: 'Salta' },
+    rutas: ['BRC-AEP', 'AEP-SLA'],
+  });
+  const menu = await handleCallback('menu', { store, user: conectado, chatId: '1' });
+  const datos = menu.buttons.flat().map((b) => b.data);
+  assert.ok(datos.includes('o:BRC'), 'un boton por aeropuerto');
+  assert.ok(datos.every((d) => Buffer.byteLength(d) <= 64), 'callback_data entra en 64 bytes');
+
+  const destinos = await handleCallback('o:BRC', { store, user: conectado, chatId: '1' });
+  assert.match(destinos.text, /Bariloche/);
+  assert.ok(destinos.buttons.flat().some((b) => b.data === 'a:BRC:AEP'));
+
+  const agregada = await handleCallback('a:BRC:AEP', { store, user: conectado, chatId: '1' });
+  assert.match(agregada.text, /Agregada/);
+  assert.ok(agregada.buttons.flat().length, 'no deja al usuario en un callejon');
+  assert.equal((await store.get('watches')).length, 1, 'el boton guarda de verdad');
+}
+
 console.log('✅ todo ok');

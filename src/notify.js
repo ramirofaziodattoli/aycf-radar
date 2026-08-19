@@ -61,25 +61,62 @@ async function post(nombre, url, body) {
   }
 }
 
-/** Respuesta directa del bot, sin pasar por el formato de reporte. */
-export async function reply(text, chatId, withButton = false) {
-  return telegram(text, withButton, chatId);
+/**
+ * Respuesta directa del bot. `opts.buttons` es una grilla de [{text, data}] que
+ * Telegram muestra como botones: para el que usa el bot, tocar es más fácil que
+ * acordarse de un comando y un código IATA.
+ */
+export async function reply(text, chatId, opts = {}) {
+  return telegram(text, opts.withButton ?? false, chatId, opts.buttons);
+}
+
+const teclado = (buttons) => ({
+  inline_keyboard: buttons.map((fila) =>
+    fila.map((b) => (b.url ? { text: b.text, url: b.url } : { text: b.text, callback_data: b.data }))
+  ),
+});
+
+/** Reemplaza el mensaje anterior en vez de apilar uno nuevo por cada toque. */
+export async function editMessage(chatId, messageId, text, buttons) {
+  const token = process.env.TELEGRAM_TOKEN;
+  if (!token) return false;
+  return post('telegram-edit', `https://api.telegram.org/bot${token}/editMessageText`, {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: 'Markdown',
+    link_preview_options: { is_disabled: true },
+    ...(buttons?.length ? { reply_markup: teclado(buttons) } : {}),
+  });
+}
+
+/** Telegram deja el botón "cargando" hasta que se contesta el callback. */
+export async function answerCallback(id, text) {
+  const token = process.env.TELEGRAM_TOKEN;
+  if (!token) return false;
+  return post('telegram-answer', `https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+    callback_query_id: id,
+    ...(text ? { text } : {}),
+  });
 }
 
 // `chatId` es de quién es el mensaje. Sin él cae al chat del dueño del deploy,
 // que es lo correcto para el modo de un solo usuario.
-async function telegram(text, withButton, chatId) {
+async function telegram(text, withButton, chatId, buttons) {
   const token = process.env.TELEGRAM_TOKEN;
   const chat = chatId || process.env.TELEGRAM_CHAT_ID;
   if (!token || !chat) return false;
+  const markup = buttons?.length
+    ? teclado(buttons)
+    : withButton
+      ? { inline_keyboard: [[{ text: '🎟️ Canjear ahora', url: REDEMPTION_URL }]] }
+      : null;
   return post('telegram', `https://api.telegram.org/bot${token}/sendMessage`, {
     chat_id: chat,
     text,
     parse_mode: 'Markdown',
     link_preview_options: { is_disabled: true },
-    ...(withButton
-      ? { reply_markup: { inline_keyboard: [[{ text: '🎟️ Canjear ahora', url: REDEMPTION_URL }]] } }
-      : {}),
+    ...(markup ? { reply_markup: markup } : {}),
   });
 }
 

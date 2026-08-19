@@ -10,12 +10,24 @@ import { Session } from './session.js';
 import { saveUser, deleteUser, estaConectado, usaSemilla } from './users.js';
 import { haySecreto } from './crypto.js';
 
+const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
+
+El pase de JetSMART libera los asientos a las 00:01 y son pocos. Yo miro por vos
+cada 15 minutos y te escribo apenas aparece uno en tus rutas.
+
+*Para empezar, mandame tu mail y tu contraseña de go.jetsmart.com en un mensaje:*
+
+\`tu@mail.com tucontraseña\`
+
+_Son las mismas con las que entrás al portal del pase. Se guardan cifradas, solo
+se usan para consultar TU disponibilidad, y borro ese mensaje del chat apenas lo
+recibo. Cuando quieras te vas con /desconectar._`;
+
 const AYUDA = `🛩️ *AYCF Radar*
 
-/conectar \`mail contraseña\` — conecto TU cuenta de JetSMART
+/vigilar — sumo una ruta (te muestro botones)
 /rutas — las rutas que estoy vigilando
-/buscar \`ORIGEN DESTINO\` — busco ahora mismo
-/vigilar \`ORIGEN DESTINO [asientos]\` — sumo una ruta
+/buscar — busco ahora mismo
 /borrar \`N\` — saco la ruta N de la lista
 /aeropuertos \`[ORIGEN]\` — la red de JetSMART, o los destinos desde un origen
 /cookie — pegame una sesión nueva (queda viva al instante)
@@ -23,8 +35,8 @@ const AYUDA = `🛩️ *AYCF Radar*
 /desconectar — borro tus credenciales y tus rutas
 /estado — cómo viene todo
 
-Podés escribir el nombre de la ciudad en vez del código:
-\`/buscar bariloche salta\` es lo mismo que \`/buscar BRC SLA\`.
+También podés escribirme suelto *bariloche salta* y busco esa ruta, sin comando
+ni códigos.
 
 _Solo se puede consultar el día siguiente: el pase libera los cupos a las 00:01
 y no existe inventario más allá de eso._`;
@@ -111,7 +123,17 @@ async function cmdRutas(store, user) {
   return `📋 *Vigilando ${watches.length} ruta(s)*\n\n${lineas.join('\n')}`;
 }
 
-async function cmdBuscar(store, session, args) {
+async function cmdBuscar(store, session, user, args) {
+  if (!args.length) {
+    const watches = await resolveWatches(store, undefined, { seed: usaSemilla(user) });
+    if (watches.length) {
+      return {
+        text: '¿Cuál busco ahora?',
+        buttons: filas(watches.map((w) => ({ text: watchLabel(w), data: `s:${w.from}:${w.to}` })), 1),
+      };
+    }
+    return (await botonesOrigen(store, '¿Desde dónde volás?')) ?? 'Decime la ruta: `/buscar bariloche salta`';
+  }
   const { from, to, cat } = await parseRuta(args, store);
   const nombre = rutaLegible(from, to, cat);
   if (cat && !routeExists(from, to, cat.rutas)) {
@@ -129,6 +151,10 @@ async function cmdBuscar(store, session, args) {
 }
 
 async function cmdVigilar(store, user, args) {
+  if (!args.length) {
+    return (await botonesOrigen(store, '¿Desde dónde volás?')) ??
+      'Decime la ruta: `/vigilar bariloche salta`';
+  }
   // El último argumento puede ser el mínimo de asientos.
   const ultimo = args[args.length - 1];
   const minSeats = /^\d+$/.test(ultimo ?? '') ? Number(ultimo) : 1;
@@ -219,6 +245,71 @@ async function cmdCookie(store, user, args) {
 }
 
 
+// --- Botones -----------------------------------------------------------------
+// Tocar es más fácil que acordarse de un código IATA. Los callbacks son cortos
+// porque Telegram los corta a 64 bytes: `o:AEP` (origen), `a:AEP:SLA` (agregar),
+// `s:AEP:SLA` (buscar), `menu`.
+
+const filas = (items, porFila = 3) =>
+  items.reduce((acc, it, i) => {
+    if (i % porFila === 0) acc.push([]);
+    acc[acc.length - 1].push(it);
+    return acc;
+  }, []);
+
+async function botonesOrigen(store, titulo) {
+  const cat = await getCatalog(store);
+  if (!cat) return null;
+  const items = Object.entries(cat.aeropuertos)
+    .sort((a, b) => a[1].localeCompare(b[1]))
+    .map(([iata, nombre]) => ({ text: nombre, data: `o:${iata}` }));
+  return { text: titulo, buttons: filas(items, 2) };
+}
+
+async function botonesDestino(store, from, accion = 'a') {
+  const cat = await getCatalog(store);
+  if (!cat) return null;
+  const items = cat.rutas
+    .filter((r) => r.startsWith(`${from}-`))
+    .map((r) => r.split('-')[1])
+    .sort((x, y) => airportName(x, cat.aeropuertos).localeCompare(airportName(y, cat.aeropuertos)))
+    .map((to) => ({ text: airportName(to, cat.aeropuertos), data: `${accion}:${from}:${to}` }));
+  if (!items.length) return { text: `Desde ${airportName(from, cat.aeropuertos)} no hay vuelos directos.`, buttons: [] };
+  return {
+    text: `Desde *${airportName(from, cat.aeropuertos)}*, ¿a dónde?`,
+    buttons: [...filas(items, 2), [{ text: '⬅️ Otro origen', data: 'menu' }]],
+  };
+}
+
+/** Un toque de botón. Devuelve { text, buttons } para reemplazar el mensaje. */
+export async function handleCallback(data, { store, session, user, chatId }) {
+  const perfil = user ?? (chatId ? { chatId: String(chatId) } : null);
+  const [accion, from, to] = String(data).split(':');
+  try {
+    if (accion === 'menu') {
+      return (await botonesOrigen(store, '¿Desde dónde volás?')) ??
+        { text: 'Todavía no tengo el mapa de la red. Probá `/vigilar bariloche salta`.' };
+    }
+    if (accion === 'o') return await botonesDestino(store, from);
+    if (accion === 'a') {
+      // Confirmar y dejar el camino abierto: sin botones acá el flujo termina
+      // en un callejón y hay que volver a acordarse de un comando.
+      return {
+        text: await cmdVigilar(store, perfil, [from, to]),
+        buttons: [[
+          { text: '➕ Sumar otra', data: 'menu' },
+          { text: '🔍 Buscar ahora', data: `s:${from}:${to}` },
+        ]],
+      };
+    }
+    if (accion === 's') return { text: await cmdBuscar(store, session, [from, to]) };
+    return { text: 'Ese botón ya no vale, mandá /rutas.' };
+  } catch (err) {
+    if (err.name === 'SessionExpiredError') throw err;
+    return { text: `⚠️ ${err.message}` };
+  }
+}
+
 const NO_CONECTADO =
   '🔌 Todavía no conectaste tu cuenta.\n\n' +
   'Mandame `/conectar tu@mail.com tucontraseña` y me encargo del resto.\n' +
@@ -267,22 +358,28 @@ async function cmdConectar(store, chatId, user, args) {
   await saveUser(store.raw ?? store, chatId, { email, password, ...(passId ? { passId } : {}) });
   await session.persist();
 
-  return passId
-    ? '✅ *Cuenta conectada.*\n\n' +
-      'Ya puedo buscar por vos y me reloguéo solo cuando la sesión vence.\n' +
-      'Sumá rutas con `/vigilar bariloche salta` y te aviso apenas haya cupo.\n\n' +
-      '_Borrá el mensaje con tu contraseña._'
-    : '🔓 *Login OK, pero no encontré tu pase AYCF.*\n\n' +
-      'Entrá a go.jetsmart.com, hacé una búsqueda, y en DevTools → Network buscá el ' +
-      'request `availability/...`: el UUID del final es tu pase.\n' +
-      'Mandámelo con `/pase <uuid>`.\n\n_Borrá el mensaje con tu contraseña._';
+  if (!passId) {
+    return '🔓 *Entré a tu cuenta, pero no encontré tu pase AYCF.*\n\n' +
+      'Puede que no tengas un pase activo. Si lo tenés: entrá a go.jetsmart.com, ' +
+      'abrí la sección del pase, y pegame acá el link de la barra de direcciones ' +
+      'con `/pase ` adelante. Yo saco el código solo.';
+  }
+  return (await botonesOrigen(store, '✅ *Listo, ya estás conectado.*\n\n¿Desde dónde volás?')) ?? {
+    text: '✅ *Listo, ya estás conectado.*\n\nSumá tu primera ruta: `/vigilar bariloche salta`',
+  };
 }
 
+const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
 async function cmdPase(store, chatId, user, args) {
-  const uuid = (args[0] || '').trim().toLowerCase();
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) {
-    return 'Pegame el UUID del pase: `/pase 1a2b3c4d-....`\n\n' +
-      'Está al final de la URL del request `availability/...` en DevTools → Network.';
+  // Acepta el UUID pelado o cualquier cosa que lo contenga (una URL del portal
+  // pegada de la barra de direcciones, por ejemplo). Pedirle a alguien que
+  // extraiga un UUID a mano es pedirle que se equivoque.
+  const uuid = (args.join(' ').match(UUID)?.[0] || '').toLowerCase();
+  if (!uuid) {
+    return 'Pegame el link del portal o el código del pase.\n\n' +
+      'Sirve cualquier URL de go.jetsmart.com que tenga el código adentro, ' +
+      'o el código solo: `/pase 1a2b3c4d-....`';
   }
   // Verificar antes de guardar: un pase equivocado da 4xx en cada barrido.
   const session = new Session(store, { ...user, chatId: String(chatId), passId: uuid });
@@ -310,9 +407,24 @@ async function cmdEstado(store, session) {
     `Store: ${store.name}\n\n_Barrido cada 15 min + uno dedicado a las 00:01._`;
 }
 
+/**
+ * Qué quiso decir el usuario. Escribir comandos es una barrera: si manda
+ * "mail contraseña" es un alta, y si manda "bariloche salta" es una búsqueda.
+ */
+export function comandoDe(text, user) {
+  const tokens = String(text).trim().split(/\s+/);
+  if (tokens[0].startsWith('/')) {
+    return { cmd: tokens[0].toLowerCase().replace(/@.*$/, ''), args: tokens.slice(1) };
+  }
+  if (tokens.length >= 2 && tokens[0].includes('@') && tokens[0].includes('.')) {
+    return { cmd: '/conectar', args: tokens };
+  }
+  if (estaConectado(user)) return { cmd: '/buscar', args: tokens };
+  return { cmd: '/start', args: [] };
+}
+
 export async function handleCommand(text, { store, session, user, chatId }) {
-  const [raw, ...args] = text.trim().split(/\s+/);
-  const cmd = raw.toLowerCase().replace(/@.*$/, '');
+  const { cmd, args } = comandoDe(text, user);
 
   // Un chat sin cuenta conectada igual es un chat: sin el chatId, `usaSemilla`
   // lo confundiría con el dueño del deploy y le sembraría las rutas ajenas.
@@ -336,9 +448,12 @@ export const NECESITA_SESION = ['/buscar', '/estado', '/pase'];
 async function dispatch(cmd, args, { store, session, user, chatId }) {
   switch (cmd) {
     case '/start':
+      return estaConectado(user)
+        ? (await botonesOrigen(store, '👋 Ya estás conectado. ¿Desde dónde volás?')) ?? AYUDA
+        : BIENVENIDA;
     case '/ayuda':
     case '/help':
-      return estaConectado(user) ? AYUDA : `${AYUDA}\n\n${NO_CONECTADO}`;
+      return estaConectado(user) ? AYUDA : `${AYUDA}\n\n${BIENVENIDA}`;
     case '/conectar':
       return cmdConectar(store, chatId, user, args);
     case '/pase':
@@ -349,7 +464,7 @@ async function dispatch(cmd, args, { store, session, user, chatId }) {
     case '/rutas':
       return cmdRutas(store, user);
     case '/buscar':
-      return cmdBuscar(store, session, args);
+      return cmdBuscar(store, session, user, args);
     case '/vigilar':
       return cmdVigilar(store, user, args);
     case '/borrar':

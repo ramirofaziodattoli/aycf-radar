@@ -84,22 +84,24 @@ persisten, no se mandan a ningún otro lado.
 
 ## Usarlo entre varios
 
-El bot atiende a cualquiera que le escriba, con la cuenta de JetSMART de cada uno:
+El bot atiende a cualquiera que le escriba, con la cuenta de JetSMART de cada uno. **No hay que
+saber ningún comando:**
 
-```
-/conectar tu@mail.com tucontraseña
-```
+1. `/start` → te explica en tres líneas y te pide el mail y la contraseña del portal.
+2. Le mandás `tu@mail.com tucontraseña` en un mensaje suelto. Prueba el login en el momento,
+   detecta tu pase AYCF solo, y **borra ese mensaje del chat**.
+3. Te muestra los aeropuertos de la red como botones: tocás origen, tocás destino, ruta agregada.
 
-Se prueba el login en el momento, se detecta tu pase AYCF (si no sale, te lo pide con `/pase`),
-y a partir de ahí el bot barre TUS rutas y te avisa a VOS. Nadie ve ni usa el pase de otro: cada
-chat vive en su propio namespace del store, con su sesión y sus watches.
+Después alcanza con escribirle *bariloche salta* para buscar esa ruta ahí mismo. Los comandos
+siguen estando para el que los prefiera. Nadie ve ni usa el pase de otro: cada chat vive en su
+propio namespace del store, con su sesión y sus watches.
 
 | Comando | Qué hace |
 |---|---|
 | `/conectar mail contraseña` | Conecta tu cuenta. El bot borra ese mensaje si puede |
-| `/pase <uuid>` | Cargar el pase a mano si no lo pudo detectar |
+| `/pase <link o código>` | Cargar el pase a mano si no lo pudo detectar (sirve pegar la URL) |
 | `/desconectar` | Borra tus credenciales, tu sesión y tus rutas |
-| `/vigilar bariloche salta` | Sumar una ruta (acepta nombres de ciudad) |
+| `/vigilar` | Sumar una ruta: botones de origen y destino. Con texto también: `/vigilar bariloche salta` |
 | `/rutas`, `/borrar N` | Ver y sacar rutas |
 | `/buscar AEP SLA` | Buscar ahora mismo |
 | `/estado` | Si la sesión y la cuenta están bien |

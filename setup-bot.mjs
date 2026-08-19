@@ -16,10 +16,10 @@ if (!TOKEN) {
 }
 
 const COMANDOS = [
-  { command: 'conectar', description: 'Conectar tu cuenta — /conectar mail contraseña' },
+  { command: 'conectar', description: 'Conectar tu cuenta de JetSMART' },
   { command: 'rutas', description: 'Las rutas que estoy vigilando' },
-  { command: 'buscar', description: 'Buscar ahora — /buscar AEP SLA' },
-  { command: 'vigilar', description: 'Sumar una ruta — /vigilar BRC EZE 2' },
+  { command: 'buscar', description: 'Buscar cupo ahora mismo' },
+  { command: 'vigilar', description: 'Sumar una ruta (te muestro botones)' },
   { command: 'borrar', description: 'Sacar una ruta — /borrar 3' },
   { command: 'estado', description: 'Ver si está todo funcionando' },
   { command: 'pase', description: 'Cargar tu pase AYCF a mano — /pase <uuid>' },
@@ -71,7 +71,7 @@ if (base) {
   await api('setWebhook', {
     url: `${base}/api/telegram`,
     secret_token: SECRET,
-    allowed_updates: ['message'],
+    allowed_updates: ['message', 'callback_query'],
   });
   const info = await api('getWebhookInfo', {});
   console.log(`✅ webhook → ${info.url}`);
