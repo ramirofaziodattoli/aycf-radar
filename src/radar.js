@@ -3,6 +3,7 @@
 import { createStore } from './store.js';
 import { withSession, SessionExpiredError } from './session.js';
 import { tieneCredenciales } from './login.js';
+import { scoped, listUsers, envUser, usaSemilla } from './users.js';
 import { search } from './jetsmart.js';
 import { appliesTo, matchFlight, watchLabel } from './watches.js';
 import { resolveWatches } from './config.js';
@@ -44,7 +45,7 @@ export function groupByRoute(watches) {
 }
 
 // `_search` es una costura para testear sin pegarle a la red.
-export async function runSweep({ date, watches, store, session, notify = true, _search = search }) {
+export async function runSweep({ date, watches, store, session, chatId, notify = true, _search = search }) {
   const activos = watches.filter((w) => appliesTo(w, date));
   if (activos.length === 0) return { date, scanned: 0, hits: [], skipped: watches.length };
 
@@ -82,8 +83,8 @@ export async function runSweep({ date, watches, store, session, notify = true, _
   let notified = null;
   if (notify && avisar) {
     notified = hits.length
-      ? await notifyHits(hits, date, release)
-      : await notifyEmpty(date, rutas.length, release);
+      ? await notifyHits(hits, date, release, chatId)
+      : await notifyEmpty(date, rutas.length, release, chatId);
     if (!notified) console.error('¡No se pudo notificar por ningún canal!');
   }
 
@@ -98,21 +99,28 @@ export async function runSweep({ date, watches, store, session, notify = true, _
   };
 }
 
-/** Punto de entrada compartido por el cron y el runner local. */
-export async function runRadar({ date, watchesRaw } = {}) {
-  const store = createStore();
+/**
+ * Un barrido para UN usuario. El store viene ya acotado a su namespace, la sesión
+ * usa sus credenciales y los avisos van a su chat.
+ */
+export async function runRadar({ date, watchesRaw, user = envUser() ?? { env: true } } = {}) {
+  const base = createStore();
+  const store = user.chatId ? scoped(base, user.chatId) : base;
+  const chatId = user.env ? undefined : user.chatId; // el dueño usa el chat de env
   let session;
 
   // TODO lo que pueda fallar va adentro del try. Antes, un WATCHES mal formado o
   // una sesión sin sembrar tiraban un 500 mudo: sin Telegram, sin log útil, y
   // desde afuera indistinguible de "no hay vuelos".
   try {
-    const watches = await resolveWatches(store, watchesRaw);
+    const watches = await resolveWatches(store, watchesRaw, { seed: usaSemilla(user) });
+    if (!watches.length) return { ok: true, chatId: user.chatId, skipped: 'sin rutas' };
+
     const target = date || tomorrowInAR();
     return await withSession(store, (s) => {
       session = s;
-      return runSweep({ date: target, watches, store, session: s });
-    });
+      return runSweep({ date: target, watches, store, session: s, chatId });
+    }, user);
   } catch (err) {
     if (err instanceof SessionExpiredError) {
       // Si no la borramos, la sesión muerta le gana a AYCF_COOKIE en el próximo
@@ -121,13 +129,34 @@ export async function runRadar({ date, watchesRaw } = {}) {
       if (session) await session.invalidate();
       await notifyError(
         `Sesión de JetSmart caída: ${err.detalle}\n\n` +
-        (tieneCredenciales()
-          ? 'El re-login automático también falló. Revisá `AYCF_EMAIL` / `AYCF_PASSWORD`.'
-          : 'Cargá `AYCF_EMAIL` y `AYCF_PASSWORD` para que me loguee solo, o mandame un `/cookie`.')
+        (tieneCredenciales(user)
+          ? 'El re-login automático también falló. Revisá tu mail y contraseña con `/conectar`.'
+          : 'Conectá tu cuenta con `/conectar` para que me loguee solo, o mandame un `/cookie`.'),
+        chatId
       );
-      return { ok: false, error: 'session-expired', detalle: err.detalle };
+      return { ok: false, chatId: user.chatId, error: 'session-expired', detalle: err.detalle };
     }
-    await notifyError(`Error inesperado: ${err.message}`);
-    return { ok: false, error: err.message };
+    await notifyError(`Error inesperado: ${err.message}`, chatId);
+    return { ok: false, chatId: user.chatId, error: err.message };
   }
+}
+
+/** Punto de entrada del cron: todos los usuarios conectados, uno por uno. */
+export async function runAllRadars({ date } = {}) {
+  const users = await listUsers(createStore());
+  if (!users.length) return [await runRadar({ date })];
+
+  const out = [];
+  // En serie a propósito: Caravelo es la API de un tercero y no hace falta
+  // martillarla con N usuarios en paralelo para un barrido que tiene 15 minutos.
+  for (const user of users) {
+    try {
+      out.push({ chatId: user.chatId, ...(await runRadar({ date, user })) });
+    } catch (err) {
+      // El fallo de un usuario no puede dejar sin barrido a los demás.
+      console.error(`usuario ${user.chatId}: ${err.message}`);
+      out.push({ chatId: user.chatId, ok: false, error: err.message });
+    }
+  }
+  return out;
 }

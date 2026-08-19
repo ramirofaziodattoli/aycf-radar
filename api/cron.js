@@ -1,4 +1,4 @@
-import { runRadar } from '../src/radar.js';
+import { runAllRadars } from '../src/radar.js';
 
 
 export default async function handler(req, res) {
@@ -10,10 +10,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    const out = await runRadar({ date: req.query?.date });
+    const out = await runAllRadars({ date: req.query?.date });
     // Si devolvemos 200 en un fallo, Vercel marca el cron como exitoso y el
-    // problema queda invisible en el dashboard.
-    return res.status(out.ok === false ? 500 : 200).json({ ok: true, ...out });
+    // problema queda invisible en el dashboard. Con varios usuarios alcanza con
+    // que UNO falle: el resto igual ya corrió y notificó.
+    const fallo = out.some((r) => r.ok === false);
+    return res.status(fallo ? 500 : 200).json({ ok: !fallo, users: out.length, out });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }

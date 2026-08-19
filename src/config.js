@@ -24,10 +24,17 @@ export async function readSeed() {
   }
 }
 
-/** Devuelve los watches vigentes, sembrando el store la primera vez. */
-export async function resolveWatches(store, raw) {
+/**
+ * Devuelve los watches vigentes, sembrando el store la primera vez.
+ *
+ * `seed: false` para los usuarios del bot: la semilla de env es la lista de rutas
+ * del dueño del deploy, y arrancar a todo el mundo vigilando las rutas de otro
+ * sería spam. Ellos arrancan vacíos y suman con /vigilar.
+ */
+export async function resolveWatches(store, raw, { seed = true } = {}) {
   const guardados = await store.get(WATCHES_KEY);
-  if (Array.isArray(guardados) && guardados.length) return loadWatches(guardados);
+  if (Array.isArray(guardados)) return guardados.length ? loadWatches(guardados) : [];
+  if (!seed) return [];
 
   const semilla = loadWatches(raw ?? (await readSeed()));
   await store.set(WATCHES_KEY, semilla);
@@ -35,7 +42,8 @@ export async function resolveWatches(store, raw) {
 }
 
 export async function saveWatches(store, list) {
-  const validos = loadWatches(list);
+  // Vaciar la lista es una operación válida desde el bot; loadWatches no la acepta.
+  const validos = Array.isArray(list) && list.length === 0 ? [] : loadWatches(list);
   await store.set(WATCHES_KEY, validos);
   return validos;
 }

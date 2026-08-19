@@ -55,12 +55,12 @@ function parseCookieHeader(str) {
  * el mismo comportamiento: tenerlo duplicado ya causó que el bot rebotara
  * mientras el cron se recuperaba solo.
  */
-export async function withSession(store, fn) {
-  const session = await new Session(store).load();
+export async function withSession(store, fn, creds = {}) {
+  const session = await new Session(store, creds).load();
   try {
     return await fn(session);
   } catch (err) {
-    if (!(err instanceof SessionExpiredError) || !tieneCredenciales()) throw err;
+    if (!(err instanceof SessionExpiredError) || !tieneCredenciales(creds)) throw err;
     console.log('sesión caída, relogueando…');
     await session.relogin();
     return await fn(session);
@@ -68,9 +68,23 @@ export async function withSession(store, fn) {
 }
 
 export class Session {
-  constructor(store) {
+  /** `creds` = { email, password, passId, env } del usuario dueño de esta sesión. */
+  constructor(store, creds = {}) {
     this.store = store;
+    this.creds = creds;
     this.jar = null;
+  }
+
+  /**
+   * ¿Esta sesión es la del dueño del deploy? Solo esa hereda lo que hay en env
+   * (pase y cookie sembrada). Cualquier usuario registrado trae lo suyo.
+   */
+  get esEnv() {
+    return Boolean(this.creds.env) || !this.creds.chatId;
+  }
+
+  get passId() {
+    return this.creds.passId || (this.esEnv ? process.env.AYCF_PASS_ID : null);
   }
 
   /**
@@ -82,14 +96,16 @@ export class Session {
     this.jar = await this.store.get(KEY);
     if (this.jar?.laravel_session) return this;
 
-    const seed = parseCookieHeader(process.env.AYCF_COOKIE);
+    // La semilla de env es del dueño del deploy: sembrarle esa cookie a otro
+    // usuario sería darle acceso a una cuenta ajena.
+    const seed = this.esEnv ? parseCookieHeader(process.env.AYCF_COOKIE) : {};
     if (seed.laravel_session) {
       this.jar = seed;
       await this.persist();
       return this;
     }
 
-    if (tieneCredenciales()) return this.relogin();
+    if (tieneCredenciales(this.creds)) return this.relogin();
     throw new SessionExpiredError('no hay cookie sembrada ni credenciales para loguearme');
   }
 
@@ -99,10 +115,10 @@ export class Session {
    * volver a loguearse.
    */
   async relogin() {
-    if (!tieneCredenciales()) {
-      throw new SessionExpiredError('sin AYCF_EMAIL / AYCF_PASSWORD no puedo re-loguearme');
+    if (!tieneCredenciales(this.creds)) {
+      throw new SessionExpiredError('no tengo credenciales para re-loguearme (mandá /conectar)');
     }
-    const cookies = await login();
+    const cookies = await login(this.creds);
     this.jar = Object.fromEntries(
       Object.entries(cookies).filter(([n]) => RELEVANTES.test(n))
     );

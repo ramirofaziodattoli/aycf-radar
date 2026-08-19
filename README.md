@@ -6,7 +6,8 @@ El pase libera los asientos a las 00:01 del día anterior, en cantidades mínima
 menos de un asiento por vuelo— y el portal es lento justo en ese minuto. Este radar consulta solo,
 cada 15 minutos, y te manda un Telegram con los vuelos que aparecieron.
 
-Cero dependencias. Corre en Vercel, en una VPS o en tu máquina.
+Cero dependencias. Corre en Vercel, en una VPS o en tu máquina. **Multi-usuario:** cada persona
+conecta su propia cuenta desde Telegram con `/conectar` y tiene sus rutas, su sesión y sus avisos.
 
 ```
 🛫 AYCF — 3 vuelo(s) con cupo para el 2026-07-29
@@ -80,6 +81,39 @@ persisten, no se mandan a ningún otro lado.
 
 > Por eso hace falta almacenamiento persistente. En Vercel el filesystem es efímero: sin Redis, la
 > cookie renovada se pierde entre invocaciones y volvés al problema de origen.
+
+## Usarlo entre varios
+
+El bot atiende a cualquiera que le escriba, con la cuenta de JetSMART de cada uno:
+
+```
+/conectar tu@mail.com tucontraseña
+```
+
+Se prueba el login en el momento, se detecta tu pase AYCF (si no sale, te lo pide con `/pase`),
+y a partir de ahí el bot barre TUS rutas y te avisa a VOS. Nadie ve ni usa el pase de otro: cada
+chat vive en su propio namespace del store, con su sesión y sus watches.
+
+| Comando | Qué hace |
+|---|---|
+| `/conectar mail contraseña` | Conecta tu cuenta. El bot borra ese mensaje si puede |
+| `/pase <uuid>` | Cargar el pase a mano si no lo pudo detectar |
+| `/desconectar` | Borra tus credenciales, tu sesión y tus rutas |
+| `/vigilar bariloche salta` | Sumar una ruta (acepta nombres de ciudad) |
+| `/rutas`, `/borrar N` | Ver y sacar rutas |
+| `/buscar AEP SLA` | Buscar ahora mismo |
+| `/estado` | Si la sesión y la cuenta están bien |
+
+**Las contraseñas se guardan cifradas** (AES-256-GCM, clave derivada de `SECRET_KEY`). Sin
+`SECRET_KEY` el bot se niega a guardarlas. No rotes esa clave: si cambia, lo guardado deja de
+poder descifrarse y todos tienen que reconectar.
+
+**Para que sea privado**, poné los chats permitidos en `TELEGRAM_ALLOWED_CHATS` (separados por
+coma). Vacío = abierto.
+
+**El dueño del deploy** es el chat de `TELEGRAM_CHAT_ID`: es el único que hereda `AYCF_EMAIL`,
+`AYCF_PASSWORD`, `AYCF_PASS_ID`, `AYCF_COOKIE` y la lista `WATCHES` de las env vars. Los demás
+arrancan vacíos, como corresponde.
 
 ## Configurar los watches
 
@@ -172,8 +206,8 @@ Headers → `cookie`. Un solo copy-paste.
 vercel --prod
 ```
 
-Env vars: `AYCF_PASS_ID`, `AYCF_COOKIE`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `WATCHES`,
-`CRON_SECRET`, más las de Redis.
+Env vars: `AYCF_PASS_ID`, `AYCF_EMAIL`, `AYCF_PASSWORD`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`,
+`TELEGRAM_WEBHOOK_SECRET`, `SECRET_KEY`, `WATCHES`, `CRON_SECRET`, más las de Redis.
 
 - **Plan Pro:** en Hobby los crons corren una vez por día y sin garantía del minuto exacto — con
   eso la sesión se muere y te perdés el momento de la liberación.
@@ -194,21 +228,23 @@ Sin Redis el estado va a `.state.json`. Un cron del sistema cada 15 min:
 Cada corrida hace **un request por ruta distinta**. Con 10 rutas cada 15 min son ~960 requests
 diarios contra JetSMART. Es tu propia cuenta y tu propio cupo, pero no hay motivo para apretar más:
 el inventario cambia en la liberación de medianoche y cuando alguien cancela. Si tenés muchas
-rutas, alargá el intervalo. Si lo alargás más de 30 min, agregá un cron a `/api/keepalive` para
-que la sesión no se muera.
+rutas, alargá el intervalo. Con varios usuarios conectados esto se multiplica: el barrido los
+recorre en serie, no en paralelo, justamente para no martillar.
 
 ## Endpoints
 
 | Ruta | Para qué |
 |---|---|
-| `GET /api/cron` | Barrido completo. Acepta `?date=YYYY-MM-DD` |
-| `GET /api/keepalive` | Un solo request, solo para mantener viva la sesión |
+| `GET /api/cron` | Barrido de todos los usuarios conectados. Acepta `?date=YYYY-MM-DD` |
+| `GET /api/reminder` | Chequeo de las 23:45: avisa si tu cuenta no está entrando |
+| `POST /api/telegram` | Webhook del bot |
 
 Si el radar estuvo caído más de 30 min, la sesión muere y el store se limpia solo, para que la
 próxima corrida re-siembre desde `AYCF_COOKIE`. Sin eso, la sesión muerta le ganaría a la env var
 y quedarías en un 401 permanente por más que actualices la semilla.
 
-Ambos exigen `Authorization: Bearer $CRON_SECRET` si la env var está definida.
+Los dos crons exigen `Authorization: Bearer $CRON_SECRET` si la env var está definida; el webhook
+valida el header `x-telegram-bot-api-secret-token` contra `TELEGRAM_WEBHOOK_SECRET`.
 
 ## Tests
 

@@ -8,6 +8,7 @@
 // Consultar D+2 devuelve vacío siempre.
 
 import { SessionExpiredError, TOKEN_MISMATCH } from './session.js';
+import { UA } from './login.js';
 import { saveCatalog } from './airports.js';
 
 const BASE = process.env.AYCF_BASE_URL || 'https://go.jetsmart.com/es-ar/ja/subscriptions';
@@ -42,8 +43,34 @@ export function parseAmount(s) {
   return Number.isFinite(n) ? n : null;
 }
 
+export class SinPaseError extends Error {
+  constructor() {
+    super('no sé cuál es tu pase AYCF. Mandame `/pase <uuid>` y lo guardo.');
+    this.name = 'SinPaseError';
+  }
+}
+
+/**
+ * El pase es por persona. Está en la URL del request `availability/...` del portal,
+ * pero pedírselo al usuario es fricción: primero probamos sacarlo del HTML de la
+ * página privada. Lo que devuelve se VERIFICA con una búsqueda real antes de
+ * guardarlo, así que un UUID equivocado no queda pegado.
+ */
+export async function discoverPassId(session) {
+  const res = await fetch(REDEMPTION_URL, {
+    headers: { cookie: session.header(), accept: 'text/html', 'user-agent': UA },
+    signal: AbortSignal.timeout(20_000),
+  });
+  const html = await res.text().catch(() => '');
+  const uuids = [...html.matchAll(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi)];
+  return uuids.map((m) => m[0]);
+}
+
 export async function search(session, { from, to, date }, store = null) {
-  const res = await fetch(`${BASE}/availability/${process.env.AYCF_PASS_ID}`, {
+  const passId = session.passId;
+  if (!passId) throw new SinPaseError();
+
+  const res = await fetch(`${BASE}/availability/${passId}`, {
     method: 'POST',
     headers: {
       accept: 'application/vnd.cvo.subs.frontend+json',

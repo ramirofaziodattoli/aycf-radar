@@ -1,15 +1,25 @@
 // Webhook del bot. Telegram postea acá cada mensaje.
 //
-// La URL es pública, así que hay DOS candados y los dos son necesarios:
+// El bot es multi-usuario: cada chat trae SU cuenta de JetSmart (`/conectar`) y
+// vive en su propio namespace del store. Lo que protege esto:
 //   1. El secreto del webhook, que Telegram manda en un header. Sin esto
 //      cualquiera que adivine la URL le habla al bot.
-//   2. El chat autorizado. Sin esto, alguien que sume el bot a otro grupo
-//      podría consultar tu cuenta de JetSmart.
+//   2. El namespace por chat: nadie puede consultar el pase de otro, porque la
+//      sesión y las credenciales se resuelven a partir del chat que escribe.
+//   3. TELEGRAM_ALLOWED_CHATS (opcional): si querés que sea un bot privado, poné
+//      ahí los chats permitidos separados por coma.
 
 import { createStore } from '../src/store.js';
 import { withSession, SessionExpiredError } from '../src/session.js';
-import { handleCommand } from '../src/commands.js';
-import { reply } from '../src/notify.js';
+import { handleCommand, NECESITA_SESION, NO_CONECTADO } from '../src/commands.js';
+import { reply, deleteMessage } from '../src/notify.js';
+import { scoped, getUser, estaConectado } from '../src/users.js';
+
+const permitido = (chatId) => {
+  const lista = (process.env.TELEGRAM_ALLOWED_CHATS || '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  return lista.length === 0 || lista.includes(String(chatId));
+};
 
 export default async function handler(req, res) {
   const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
@@ -24,27 +34,38 @@ export default async function handler(req, res) {
   // Siempre 200: si devolvemos error, Telegram reintenta el mismo update en loop.
   if (!texto) return res.status(200).json({ ok: true, skipped: 'sin texto' });
 
-  if (chatId !== String(process.env.TELEGRAM_CHAT_ID)) {
+  if (!permitido(chatId)) {
     console.warn(`chat no autorizado: ${chatId}`);
     return res.status(200).json({ ok: true, skipped: 'chat no autorizado' });
   }
 
   try {
-    const store = createStore();
+    const base = createStore();
+    const store = scoped(base, chatId);
+    const user = await getUser(base, chatId);
 
-    // Solo /buscar y /estado tocan JetSmart; el resto no necesita sesión.
-    // withSession se encarga de reloguear y reintentar si estaba vencida.
-    const necesitaSesion = /^\/(buscar|estado)\b/i.test(texto.trim());
-    const respuesta = necesitaSesion
-      ? await withSession(store, (session) => handleCommand(texto, { store, session }))
-      : await handleCommand(texto, { store, session: null });
-    await reply(respuesta);
+    const cmd = texto.trim().split(/\s+/)[0].toLowerCase().replace(/@.*$/, '');
+
+    // La contraseña no se queda en el historial del chat si podemos evitarlo.
+    if (cmd === '/conectar') await deleteMessage(chatId, msg.message_id).catch(() => {});
+    if (NECESITA_SESION.includes(cmd) && !estaConectado(user)) {
+      await reply(NO_CONECTADO, chatId);
+      return res.status(200).json({ ok: true, skipped: 'sin cuenta' });
+    }
+
+    // Solo los comandos que tocan JetSmart necesitan sesión. withSession se
+    // encarga de reloguear y reintentar si la que había estaba vencida.
+    const ctx = { store, user, chatId };
+    const respuesta = NECESITA_SESION.includes(cmd)
+      ? await withSession(store, (session) => handleCommand(texto, { ...ctx, session }), user)
+      : await handleCommand(texto, { ...ctx, session: null });
+    await reply(respuesta, chatId);
     return res.status(200).json({ ok: true });
   } catch (err) {
     const detalle = err instanceof SessionExpiredError
-      ? `Sesión de JetSmart caída: ${err.detalle}\n\nActualizá \`AYCF_COOKIE\`.`
+      ? `Sesión de JetSmart caída: ${err.detalle}\n\nReconectá con \`/conectar\`.`
       : `Error: ${err.message}`;
-    await reply(`🔴 ${detalle}`).catch(() => {});
+    await reply(`🔴 ${detalle}`, chatId).catch(() => {});
     return res.status(200).json({ ok: false, error: err.message });
   }
 }

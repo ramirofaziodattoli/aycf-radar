@@ -10,9 +10,12 @@ import { runRadar } from './src/radar.js';
 
 const date = process.argv[2];
 
-const faltan = ['AYCF_COOKIE', 'AYCF_PASS_ID'].filter((k) => !process.env[k]);
-if (faltan.length) {
-  console.error(`❌ Faltan en .env: ${faltan.join(', ')}. Mirá .env.example`);
+if (!process.env.AYCF_PASS_ID) {
+  console.error('❌ Falta AYCF_PASS_ID en .env. Mirá .env.example');
+  process.exit(1);
+}
+if (!process.env.AYCF_EMAIL && !process.env.AYCF_COOKIE) {
+  console.error('❌ Falta AYCF_EMAIL/AYCF_PASSWORD (o una AYCF_COOKIE para arrancar).');
   process.exit(1);
 }
 if (!process.env.TELEGRAM_TOKEN) {

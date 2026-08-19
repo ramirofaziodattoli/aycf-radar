@@ -101,7 +101,7 @@ const memStore = () => {
 // --- un 5xx NO puede leerse como "no hay cupo": es el peor modo de falla ---
 {
   const { search } = await import('./src/jetsmart.js');
-  const sess = { header: () => 'x', absorb: async () => false };
+  const sess = { header: () => 'x', absorb: async () => false, passId: 'pase-de-prueba' };
   const orig = globalThis.fetch;
 
   const responder = (status, body) => {
@@ -129,7 +129,7 @@ const memStore = () => {
 // --- dedupe: correr cada 15 min no puede spamear el mismo vuelo ---
 {
   const store = memStore();
-  const session = { header: () => 'x' };
+  const session = { header: () => 'x', passId: 'pase-de-prueba' };
   const watches = [{ from: 'AEP', to: 'COR', minSeats: 1 }];
   const fake = async () => [V];
 
@@ -168,7 +168,7 @@ const memStore = () => {
 // --- encontrar cupo y no poder avisar NO es un exito ---
 {
   const store = memStore();
-  const session = { header: () => 'x' };
+  const session = { header: () => 'x', passId: 'pase-de-prueba' };
   const watches = [{ from: 'AEP', to: 'COR', minSeats: 1 }];
   const orig = globalThis.fetch;
 
@@ -301,7 +301,7 @@ const memStore = () => {
 
   delete process.env.AYCF_EMAIL; delete process.env.AYCF_PASSWORD;
   assert.equal(tieneCredenciales(), false);
-  await assert.rejects(() => login(), /faltan AYCF_EMAIL/, 'sin credenciales, error claro');
+  await assert.rejects(() => login(), /credenciales/, 'sin credenciales, error claro');
 
   process.env.AYCF_EMAIL = 'yo@ejemplo.com';
   process.env.AYCF_PASSWORD = 'secreto';
@@ -391,6 +391,67 @@ const memStore = () => {
 
   globalThis.fetch = orig;
   process.env = limpio;
+}
+
+// --- multiusuario: cada chat con SU cuenta, sin pisarse ---
+{
+  const limpio = { ...process.env };
+  process.env.SECRET_KEY = 'clave-de-prueba-larga';
+  process.env.TELEGRAM_CHAT_ID = '111';
+  const { encrypt, decrypt } = await import('./src/crypto.js');
+  assert.equal(decrypt(encrypt('secreto con ñ y espacios')), 'secreto con ñ y espacios');
+  assert.ok(!encrypt('hola').includes('hola'), 'la contraseña no queda en claro');
+
+  const { scoped, saveUser, getUser, deleteUser, listUsers, usaSemilla, estaConectado } =
+    await import('./src/users.js');
+  const base = memStore();
+
+  await saveUser(base, '222', { email: 'a@b.com', password: 'pw', passId: 'p-222' });
+  await saveUser(base, '333', { email: 'c@d.com', password: 'pw2', passId: 'p-333' });
+
+  const u222 = await getUser(base, '222');
+  assert.equal(u222.password, 'pw', 'se descifra al leerla');
+  assert.equal(u222.passId, 'p-222');
+  assert.equal(estaConectado(u222), true);
+  assert.equal((await getUser(base, '999')), null, 'un chat desconocido no es usuario');
+
+  // Aislamiento: las claves de uno no las ve el otro, pero el catalogo es comun.
+  const a = scoped(base, '222');
+  const b = scoped(base, '333');
+  await a.set('watches', [{ from: 'AEP', to: 'SLA' }]);
+  await b.set('watches', [{ from: 'BRC', to: 'EZE' }]);
+  assert.equal((await a.get('watches'))[0].to, 'SLA');
+  assert.equal((await b.get('watches'))[0].to, 'EZE', 'no se pisan');
+  await a.set('catalog:routes', { aeropuertos: { AEP: 'Aeroparque' }, rutas: [] });
+  assert.ok(await b.get('catalog:routes'), 'el catalogo de la red es compartido');
+
+  // La semilla WATCHES es del dueño del deploy, no de todos.
+  assert.equal(usaSemilla({ chatId: '111' }), true, 'el dueño hereda WATCHES');
+  assert.equal(usaSemilla({ chatId: '222' }), false, 'un usuario cualquiera NO');
+  const { resolveWatches } = await import('./src/config.js');
+  process.env.WATCHES = JSON.stringify([{ from: 'AEP', to: 'SLA' }]);
+  assert.deepEqual(await resolveWatches(memStore(), undefined, { seed: false }), [],
+    'usuario nuevo arranca sin rutas ajenas');
+  delete process.env.WATCHES;
+
+  // Baja: se va la cuenta y tambien la sesion guardada.
+  await a.set('session:cookies', { laravel_session: 'x' });
+  await deleteUser(base, '222');
+  assert.equal(await getUser(base, '222'), null);
+  assert.equal(await a.get('session:cookies'), null, 'la sesion no sobrevive a la baja');
+  assert.equal((await listUsers(base)).length, 1, 'queda solo el otro');
+
+  process.env = limpio;
+}
+
+// --- un usuario sin cuenta no puede consultar el pase de nadie ---
+{
+  const { NECESITA_SESION } = await import('./src/commands.js');
+  const { estaConectado } = await import('./src/users.js');
+  assert.ok(NECESITA_SESION.includes('/buscar'), '/buscar necesita cuenta');
+  assert.equal(estaConectado(null), false);
+  assert.equal(estaConectado({ email: 'a@b.com' }), false, 'sin pase no alcanza');
+  assert.equal(estaConectado({ email: 'a@b.com', passId: 'x' }), true);
 }
 
 console.log('✅ todo ok');

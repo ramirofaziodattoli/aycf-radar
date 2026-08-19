@@ -16,11 +16,14 @@ if (!TOKEN) {
 }
 
 const COMANDOS = [
+  { command: 'conectar', description: 'Conectar tu cuenta — /conectar mail contraseña' },
   { command: 'rutas', description: 'Las rutas que estoy vigilando' },
   { command: 'buscar', description: 'Buscar ahora — /buscar AEP SLA' },
   { command: 'vigilar', description: 'Sumar una ruta — /vigilar BRC EZE 2' },
   { command: 'borrar', description: 'Sacar una ruta — /borrar 3' },
   { command: 'estado', description: 'Ver si está todo funcionando' },
+  { command: 'pase', description: 'Cargar tu pase AYCF a mano — /pase <uuid>' },
+  { command: 'desconectar', description: 'Borrar tus credenciales y tus rutas' },
   { command: 'ayuda', description: 'Cómo se usa' },
 ];
 
@@ -54,9 +57,9 @@ await api('setMyShortDescription', {
 });
 await api('setMyDescription', {
   description:
-    'Radar del pase All You Can Fly de JetSMART. Reviso tus rutas cada 15 minutos y ' +
-    'te aviso apenas aparece cupo, con aviso garantizado a las 00:01 cuando se libera ' +
-    'el día siguiente. Escribí /ayuda para empezar.',
+    'Radar del pase All You Can Fly de JetSMART. Conectá tu cuenta con /conectar, ' +
+    'elegí tus rutas, y reviso cada 15 minutos: te aviso apenas aparece cupo, con ' +
+    'aviso garantizado a las 00:01 cuando se libera el día siguiente.',
 });
 console.log('✅ descripciones');
 

@@ -1,21 +1,26 @@
 // Comandos del bot. Cada handler devuelve el texto a responder.
 
-import { search } from './jetsmart.js';
+import { search, discoverPassId, SinPaseError } from './jetsmart.js';
 import { tomorrowInAR } from './radar.js';
-import { validateWatch, watchLabel, matchFlight } from './watches.js';
+import { validateWatch, watchLabel } from './watches.js';
 import { resolveWatches, saveWatches } from './config.js';
 import { formatFlight } from './notify.js';
 import { getCatalog, resolveAirport, airportName, routeExists, destinationsFrom } from './airports.js';
 import { Session } from './session.js';
+import { saveUser, deleteUser, estaConectado, usaSemilla } from './users.js';
+import { haySecreto } from './crypto.js';
 
 const AYUDA = `🛩️ *AYCF Radar*
 
+/conectar \`mail contraseña\` — conecto TU cuenta de JetSMART
 /rutas — las rutas que estoy vigilando
 /buscar \`ORIGEN DESTINO\` — busco ahora mismo
 /vigilar \`ORIGEN DESTINO [asientos]\` — sumo una ruta
 /borrar \`N\` — saco la ruta N de la lista
 /aeropuertos \`[ORIGEN]\` — la red de JetSMART, o los destinos desde un origen
 /cookie — pegame una sesión nueva (queda viva al instante)
+/pase \`uuid\` — si no pude detectar tu pase solo
+/desconectar — borro tus credenciales y tus rutas
 /estado — cómo viene todo
 
 Podés escribir el nombre de la ciudad en vez del código:
@@ -89,8 +94,11 @@ async function cmdAeropuertos(store, args) {
     '_Podés escribir el nombre en vez del código._';
 }
 
-async function cmdRutas(store) {
-  const watches = await resolveWatches(store);
+async function cmdRutas(store, user) {
+  const watches = await resolveWatches(store, undefined, { seed: usaSemilla(user) });
+  if (!watches.length) {
+    return '📋 Todavía no vigilás ninguna ruta.\n\nSumá una: `/vigilar bariloche salta`';
+  }
   const lineas = watches.map((w, i) => {
     const extras = [
       w.minSeats > 1 ? `≥${w.minSeats} asientos` : null,
@@ -120,7 +128,7 @@ async function cmdBuscar(store, session, args) {
   return `✅ *${nombre}* — ${flights.length} vuelo(s) el ${date}\n${lineas}`;
 }
 
-async function cmdVigilar(store, args) {
+async function cmdVigilar(store, user, args) {
   // El último argumento puede ser el mínimo de asientos.
   const ultimo = args[args.length - 1];
   const minSeats = /^\d+$/.test(ultimo ?? '') ? Number(ultimo) : 1;
@@ -136,7 +144,7 @@ async function cmdVigilar(store, args) {
   }
   const nuevo = validateWatch({ from, to, ...(minSeats > 1 ? { minSeats } : {}) }, 0);
 
-  const watches = await resolveWatches(store);
+  const watches = await resolveWatches(store, undefined, { seed: usaSemilla(user) });
   if (watches.some((w) => w.from === from && w.to === to && (w.minSeats ?? 1) === minSeats)) {
     return `Ya estaba vigilando *${nombre}*.`;
   }
@@ -145,9 +153,9 @@ async function cmdVigilar(store, args) {
     `Ahora vigilo ${actualizado.length} rutas.`;
 }
 
-async function cmdBorrar(store, args) {
+async function cmdBorrar(store, user, args) {
   const n = Number(args[0]);
-  const watches = await resolveWatches(store);
+  const watches = await resolveWatches(store, undefined, { seed: usaSemilla(user) });
   if (!Number.isInteger(n) || n < 1 || n > watches.length) {
     return `Decime un número del 1 al ${watches.length}. Mirá /rutas.`;
   }
@@ -164,7 +172,7 @@ async function cmdBorrar(store, args) {
  * así que esto hay que hacerlo seguido. Lo importante es tenerla fresca antes
  * de las 00:01, que es cuando se libera el inventario.
  */
-async function cmdCookie(store, args) {
+async function cmdCookie(store, user, args) {
   const crudo = args.join(' ').trim();
   if (!crudo) {
     return '🍪 Pegame la sesión así:\n\n' +
@@ -187,7 +195,7 @@ async function cmdCookie(store, args) {
   if (!candidatos.length) return '⚠️ No reconocí ninguna cookie ahí.';
 
   for (const cookie of candidatos) {
-    const probe = new Session(store);
+    const probe = new Session(store, user ?? {});
     probe.jar = Object.fromEntries(
       cookie.split(';').map((c) => {
         const i = c.indexOf('=');
@@ -196,8 +204,8 @@ async function cmdCookie(store, args) {
     );
     try {
       const date = tomorrowInAR();
-      const watches = await resolveWatches(store);
-      await search(probe, { from: watches[0].from, to: watches[0].to, date }, store);
+      const [w] = await resolveWatches(store, undefined, { seed: false });
+      await search(probe, { from: w?.from ?? 'AEP', to: w?.to ?? 'COR', date }, store);
       await probe.persist();
       return '✅ *Sesión nueva, funcionando.*\n\n' +
         'Ya quedó guardada: la próxima corrida la usa sin redeployar nada.\n' +
@@ -208,6 +216,87 @@ async function cmdCookie(store, args) {
   }
   return '❌ No sirvió: puede estar vencida o mal copiada.\n\n' +
     'Hacé UNA búsqueda en el portal, copiá el header `cookie` completo y mandámelo de nuevo.';
+}
+
+
+const NO_CONECTADO =
+  '🔌 Todavía no conectaste tu cuenta.\n\n' +
+  'Mandame `/conectar tu@mail.com tucontraseña` y me encargo del resto.\n' +
+  '_Son tus credenciales de go.jetsmart.com. Se guardan cifradas y solo se usan ' +
+  'para consultar TU disponibilidad._';
+
+/**
+ * Alta de un usuario. El login se prueba en el momento: guardar credenciales que
+ * no funcionan es garantizar que el aviso de las 00:01 no salga.
+ *
+ * El pase se intenta detectar solo y se verifica con una búsqueda real; si no sale,
+ * se lo pedimos con /pase en vez de guardar un UUID cualquiera.
+ */
+async function cmdConectar(store, chatId, user, args) {
+  const [email, ...resto] = args;
+  const password = resto.join(' ');
+  if (!email || !password) {
+    return '🔑 Así: `/conectar tu@mail.com tucontraseña`\n\n' +
+      'Son las de go.jetsmart.com (el portal del pase).\n' +
+      '_Borrá el mensaje después de mandarlo: Telegram lo deja en el historial._';
+  }
+  if (!email.includes('@')) return '⚠️ Eso no parece un mail. `/conectar tu@mail.com tucontraseña`';
+  if (!haySecreto()) {
+    return '🔴 Este bot no tiene `SECRET_KEY` configurada, así que no puedo guardar ' +
+      'contraseñas cifradas. Avisale a quien lo hostea.';
+  }
+
+  const creds = { chatId: String(chatId), email, password };
+  const session = new Session(store, creds);
+  await session.relogin(); // tira LoginError con el motivo real si Keycloak rechaza
+
+  // Pase: el que ya tenía guardado, o el que podamos detectar en la página privada.
+  const candidatos = [...(user?.passId ? [user.passId] : []), ...(await discoverPassId(session))];
+  let passId = null;
+  for (const c of candidatos) {
+    session.creds.passId = c;
+    try {
+      await search(session, { from: 'AEP', to: 'COR', date: tomorrowInAR() }, store);
+      passId = c;
+      break;
+    } catch {
+      session.creds.passId = null;
+    }
+  }
+
+  await saveUser(store.raw ?? store, chatId, { email, password, ...(passId ? { passId } : {}) });
+  await session.persist();
+
+  return passId
+    ? '✅ *Cuenta conectada.*\n\n' +
+      'Ya puedo buscar por vos y me reloguéo solo cuando la sesión vence.\n' +
+      'Sumá rutas con `/vigilar bariloche salta` y te aviso apenas haya cupo.\n\n' +
+      '_Borrá el mensaje con tu contraseña._'
+    : '🔓 *Login OK, pero no encontré tu pase AYCF.*\n\n' +
+      'Entrá a go.jetsmart.com, hacé una búsqueda, y en DevTools → Network buscá el ' +
+      'request `availability/...`: el UUID del final es tu pase.\n' +
+      'Mandámelo con `/pase <uuid>`.\n\n_Borrá el mensaje con tu contraseña._';
+}
+
+async function cmdPase(store, chatId, user, args) {
+  const uuid = (args[0] || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) {
+    return 'Pegame el UUID del pase: `/pase 1a2b3c4d-....`\n\n' +
+      'Está al final de la URL del request `availability/...` en DevTools → Network.';
+  }
+  // Verificar antes de guardar: un pase equivocado da 4xx en cada barrido.
+  const session = new Session(store, { ...user, chatId: String(chatId), passId: uuid });
+  await session.load();
+  await search(session, { from: 'AEP', to: 'COR', date: tomorrowInAR() }, store);
+  await saveUser(store.raw ?? store, chatId, { passId: uuid });
+  return '✅ Pase guardado y verificado.';
+}
+
+async function cmdDesconectar(store, chatId) {
+  await deleteUser(store.raw ?? store, chatId);
+  await saveWatches(store, []);
+  return '👋 Listo: borré tus credenciales, tu sesión y tus rutas. ' +
+    'Cuando quieras volver, `/conectar`.';
 }
 
 async function cmdEstado(store, session) {
@@ -221,43 +310,61 @@ async function cmdEstado(store, session) {
     `Store: ${store.name}\n\n_Barrido cada 15 min + uno dedicado a las 00:01._`;
 }
 
-export async function handleCommand(text, { store, session }) {
+export async function handleCommand(text, { store, session, user, chatId }) {
   const [raw, ...args] = text.trim().split(/\s+/);
   const cmd = raw.toLowerCase().replace(/@.*$/, '');
 
+  // Un chat sin cuenta conectada igual es un chat: sin el chatId, `usaSemilla`
+  // lo confundiría con el dueño del deploy y le sembraría las rutas ajenas.
+  const perfil = user ?? (chatId ? { chatId: String(chatId) } : null);
+
   try {
-    return await dispatch(cmd, args, { store, session });
+    return await dispatch(cmd, args, { store, session, user: perfil, chatId });
   } catch (err) {
     // Un error de tipeo se contesta; los de sesión suben para que el webhook
-    // dé la instrucción concreta de re-sembrar la cookie.
+    // dé la instrucción concreta de reconectar.
     if (err.name === 'SessionExpiredError') throw err;
+    if (err.name === 'LoginError') return `🔴 ${err.message}`;
+    if (err instanceof SinPaseError) return `⚠️ ${err.message}`;
     return `⚠️ ${err.message}`;
   }
 }
 
-async function dispatch(cmd, args, { store, session }) {
+/** Los que le pegan a JetSmart: sin cuenta conectada no hay nada que consultar. */
+export const NECESITA_SESION = ['/buscar', '/estado', '/pase'];
+
+async function dispatch(cmd, args, { store, session, user, chatId }) {
   switch (cmd) {
     case '/start':
     case '/ayuda':
     case '/help':
-      return AYUDA;
+      return estaConectado(user) ? AYUDA : `${AYUDA}\n\n${NO_CONECTADO}`;
+    case '/conectar':
+      return cmdConectar(store, chatId, user, args);
+    case '/pase':
+      return cmdPase(store, chatId, user, args);
+    case '/desconectar':
+    case '/borrarcuenta':
+      return cmdDesconectar(store, chatId);
     case '/rutas':
-      return cmdRutas(store);
+      return cmdRutas(store, user);
     case '/buscar':
       return cmdBuscar(store, session, args);
     case '/vigilar':
-      return cmdVigilar(store, args);
+      return cmdVigilar(store, user, args);
     case '/borrar':
-      return cmdBorrar(store, args);
+      return cmdBorrar(store, user, args);
     case '/cookie':
     case '/sesion':
-      return cmdCookie(store, args);
+      return cmdCookie(store, user, args);
     case '/aeropuertos':
     case '/red':
       return cmdAeropuertos(store, args);
     case '/estado':
-      return cmdEstado(store, session);
+      return cmdEstado(store, session, user);
     default:
       return `No conozco \`${cmd}\`.\n\n${AYUDA}`;
   }
 }
+
+export { NO_CONECTADO };

@@ -10,10 +10,11 @@
 //   3. POST al action del form con username/password → 302 con ?code=…
 //   4. Seguir el redirect: Laravel canjea el code y setea laravel_session
 //
-// Las credenciales salen de env vars que carga el dueño del deploy. Este módulo
-// nunca las loguea ni las persiste: solo las manda a Keycloak.
+// Las credenciales llegan por parámetro: las del dueño del deploy salen de env
+// vars, las de cada usuario del bot salen del store cifradas. Este módulo nunca
+// las loguea ni las persiste: solo las manda a Keycloak.
 
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+export const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
 
 const LOGIN_ENTRY = process.env.AYCF_LOGIN_URL ||
@@ -101,13 +102,11 @@ function extraerError(html) {
  * Se loguea y devuelve las cookies de la sesión autenticada.
  * Tira LoginError si faltan credenciales o si Keycloak las rechaza.
  */
-export async function login() {
-  const username = process.env.AYCF_EMAIL;
-  const password = process.env.AYCF_PASSWORD;
+export async function login(creds = {}) {
+  const { email, password } = credenciales(creds);
+  const username = email;
   if (!username || !password) {
-    throw new LoginError(
-      'faltan AYCF_EMAIL / AYCF_PASSWORD: sin eso no puedo re-loguearme solo'
-    );
+    throw new LoginError('no tengo tus credenciales de JetSmart: conectá tu cuenta con /conectar');
   }
 
   const jar = new Jar();
@@ -158,5 +157,18 @@ export async function login() {
   return jar.toObject();
 }
 
-export const tieneCredenciales = () =>
-  Boolean(process.env.AYCF_EMAIL && process.env.AYCF_PASSWORD);
+/**
+ * Las de env son del dueño del deploy y SOLO valen para él: mezclar el mail de un
+ * usuario con la contraseña de env sería intentar entrar a la cuenta equivocada.
+ */
+export function credenciales(creds = {}) {
+  const esEnv = Boolean(creds.env) || !creds.chatId;
+  return esEnv
+    ? { email: creds.email || process.env.AYCF_EMAIL, password: creds.password || process.env.AYCF_PASSWORD }
+    : { email: creds.email, password: creds.password };
+}
+
+export const tieneCredenciales = (creds = {}) => {
+  const { email, password } = credenciales(creds);
+  return Boolean(email && password);
+};
