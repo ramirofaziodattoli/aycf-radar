@@ -245,6 +245,20 @@ async function cmdCookie(store, user, args) {
 }
 
 
+/**
+ * Un TypeError de JS no le dice nada a nadie: "Cannot read properties of
+ * undefined" llegó a salir por Telegram como si fuera un aviso. Los errores que
+ * escribimos nosotros SÍ son útiles (dicen qué ruta no existe, qué falta), así
+ * que solo tapamos los que tienen pinta de bug y los dejamos en el log.
+ */
+function mensajeDeError(err) {
+  const bug = err instanceof TypeError || err instanceof RangeError ||
+    /is not a function|Cannot read propert|undefined is not/i.test(err.message);
+  if (!bug) return `⚠️ ${err.message}`;
+  console.error(err);
+  return '⚠️ Se me rompió algo acá adentro. Probá de nuevo, y si sigue igual avisá.';
+}
+
 // --- Botones -----------------------------------------------------------------
 // Tocar es más fácil que acordarse de un código IATA. Los callbacks son cortos
 // porque Telegram los corta a 64 bytes: `o:AEP` (origen), `a:AEP:SLA` (agregar),
@@ -302,11 +316,17 @@ export async function handleCallback(data, { store, session, user, chatId }) {
         ]],
       };
     }
-    if (accion === 's') return { text: await cmdBuscar(store, session, [from, to]) };
+    if (accion === 's') {
+      return {
+        text: await cmdBuscar(store, session, perfil, [from, to]),
+        buttons: [[{ text: '🔄 Buscar de nuevo', data: `s:${from}:${to}` }, { text: '📋 Mis rutas', data: 'rutas' }]],
+      };
+    }
+    if (accion === 'rutas') return { text: await cmdRutas(store, perfil), buttons: [[{ text: '➕ Sumar otra', data: 'menu' }]] };
     return { text: 'Ese botón ya no vale, mandá /rutas.' };
   } catch (err) {
     if (err.name === 'SessionExpiredError') throw err;
-    return { text: `⚠️ ${err.message}` };
+    return { text: mensajeDeError(err) };
   }
 }
 
@@ -438,7 +458,7 @@ export async function handleCommand(text, { store, session, user, chatId }) {
     if (err.name === 'SessionExpiredError') throw err;
     if (err.name === 'LoginError') return `🔴 ${err.message}`;
     if (err instanceof SinPaseError) return `⚠️ ${err.message}`;
-    return `⚠️ ${err.message}`;
+    return mensajeDeError(err);
   }
 }
 

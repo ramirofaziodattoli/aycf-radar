@@ -486,6 +486,28 @@ const memStore = () => {
   assert.match(agregada.text, /Agregada/);
   assert.ok(agregada.buttons.flat().length, 'no deja al usuario en un callejon');
   assert.equal((await store.get('watches')).length, 1, 'el boton guarda de verdad');
+
+  // Cada rama del callback con los MISMOS argumentos que le pasa el webhook: un
+  // parámetro de menos acá salía por Telegram como "Cannot read properties of
+  // undefined (reading 'length')" y no lo veía ningún test.
+  const sesionFalsa = { header: () => 'x', passId: 'p', absorb: async () => false };
+  const ctx = { store, session: sesionFalsa, user: conectado, chatId: '1' };
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true, status: 200, headers: { getSetCookie: () => [] },
+    text: async () => JSON.stringify({ content: { flights: { flightsOutbound: [] } } }),
+  });
+  for (const data of ['menu', 'o:BRC', 'a:BRC:AEP', 's:BRC:AEP', 'rutas']) {
+    const r = await handleCallback(data, ctx);
+    assert.ok(r?.text, `el callback ${data} contesta algo`);
+    assert.ok(!/undefined|Cannot read/.test(r.text), `el callback ${data} no explota: ${r.text}`);
+  }
+  globalThis.fetch = origFetch;
+
+  // Un bug interno no puede salir por Telegram como un TypeError crudo.
+  const roto = await handleCallback('o:NOEXISTE', { store, user: conectado, chatId: '1' });
+  assert.ok(!/Cannot read propert/i.test(roto.text ?? ''), 'los TypeError se traducen');
+
 }
 
 console.log('✅ todo ok');
