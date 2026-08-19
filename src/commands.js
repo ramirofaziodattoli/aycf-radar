@@ -13,7 +13,7 @@ import { haySecreto } from './crypto.js';
 const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
 
 El pase de JetSMART libera los asientos a las 00:01 y son pocos. Yo miro por vos
-cada 15 minutos y te escribo apenas aparece uno en tus rutas.
+todas las noches apenas se liberan y te escribo si aparece uno en tus rutas.
 
 *Para empezar, mandame tu mail y tu contraseña de go.jetsmart.com en un mensaje:*
 
@@ -404,7 +404,7 @@ async function cmdEstado(store, session) {
   await search(session, { from: primera.from, to: primera.to, date }, store);
   return `✅ *Todo en orden*\n\n` +
     `Sesión: viva\nRutas: ${watches.length}\nBuscando para: ${date}\n` +
-    `Store: ${store.name}\n\n_Barrido cada 15 min + uno dedicado a las 00:01._`;
+    `Store: ${store.name}\n\n_Barrido diario en la liberación de las 00:01._`;
 }
 
 /**

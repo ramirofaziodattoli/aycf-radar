@@ -4,7 +4,7 @@ Te avisa apenas hay cupo en las rutas que te interesan del pase **All You Can Fl
 
 El pase libera los asientos a las 00:01 del día anterior, en cantidades mínimas —en algunas rutas
 menos de un asiento por vuelo— y el portal es lento justo en ese minuto. Este radar consulta solo,
-cada 15 minutos, y te manda un Telegram con los vuelos que aparecieron.
+solo a las 00:01, cuando se libera el inventario, y te manda un Telegram con lo que apareció.
 
 Cero dependencias. Corre en Vercel, en una VPS o en tu máquina. **Multi-usuario:** cada persona
 conecta su propia cuenta desde Telegram con `/conectar` y tiene sus rutas, su sesión y sus avisos.
@@ -24,8 +24,13 @@ conecta su propia cuenta desde Telegram con `/conectar` y tiene sus rutas, su se
 
 ## Cómo anda
 
-Un cron pega cada 15 min al endpoint de disponibilidad de Caravelo (el proveedor del pase),
-filtra por tus criterios, y notifica **solo lo que no te avisó antes**.
+Un cron pega al endpoint de disponibilidad de Caravelo (el proveedor del pase), filtra por tus
+criterios, y notifica **solo lo que no te avisó antes**.
+
+**Por defecto corre una vez por día, a las 00:01**, que es cuando se libera el inventario y el
+único momento que realmente importa. Es también lo único que permite el plan Hobby de Vercel. Si
+tenés Pro, agregar un `*/15 * * * *` al `vercel.json` te suma el barrido continuo, que sirve para
+pescar cancelaciones durante el día.
 
 **Horizonte: D+1, y no es una limitación del radar.** Los T&C fijan la ventana de canje entre 24h
 y 120 min antes de la salida, y el inventario se libera por día calendario a medianoche. Consultar
@@ -33,7 +38,7 @@ D+2 devuelve vacío siempre. El barrido diario *es* el universo canjeable comple
 
 ### La sesión vence por tiempo absoluto — no hay keep-alive posible
 
-**Medido en producción, no supuesto.** El cron corrió puntual cada 15 minutos:
+**Medido en producción, no supuesto.** Con el cron corriendo puntual cada 15 minutos:
 
 ```
 02:30 → 200 OK
@@ -211,26 +216,32 @@ vercel --prod
 Env vars: `AYCF_PASS_ID`, `AYCF_EMAIL`, `AYCF_PASSWORD`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`,
 `TELEGRAM_WEBHOOK_SECRET`, `SECRET_KEY`, `WATCHES`, `CRON_SECRET`, más las de Redis.
 
-- **Plan Pro:** en Hobby los crons corren una vez por día y sin garantía del minuto exacto — con
-  eso la sesión se muere y te perdés el momento de la liberación.
+- **Crons:** el `vercel.json` trae uno solo, `1 3 * * *` (00:01 ART), que es lo que permite Hobby.
+  ⚠️ **En Hobby el minuto no está garantizado**: Vercel dispara los crons diarios dentro de la
+  hora, así que podés terminar barriendo a las 00:40 con lo bueno ya volado. Si eso te importa,
+  hay dos salidas: plan Pro, o un scheduler externo (cron-job.org y parecidos) pegándole a
+  `/api/cron` con `Authorization: Bearer $CRON_SECRET` a la hora exacta.
+- **La sesión no importa entre corridas:** vence a los ~40 min pase lo que pase, así que un cron
+  diario arranca siempre con sesión muerta y se reloguea solo. Es justo lo que hace viable correr
+  una sola vez por día.
 - **Redis obligatorio:** Upstash desde el Marketplace, o cualquier Redis con REST. También lee las
   `KV_REST_API_*` de Vercel KV.
 - **`CRON_SECRET`:** Vercel lo manda como Bearer. Sin esto la URL queda pública y cualquiera
   dispara requests con tu sesión.
 
 ### VPS / Raspberry / lo que tengas
-Sin Redis el estado va a `.state.json`. Un cron del sistema cada 15 min:
+Sin Redis el estado va a `.state.json`. Un cron del sistema a las 00:01, sin límites de plan:
 
 ```cron
-*/15 * * * * cd /opt/aycf-radar && /usr/bin/node --env-file=.env run-local.mjs >> radar.log 2>&1
+1 0 * * * cd /opt/aycf-radar && /usr/bin/node --env-file=.env run-local.mjs >> radar.log 2>&1
 ```
 
 ## Sé buen vecino
 
-Cada corrida hace **un request por ruta distinta**. Con 10 rutas cada 15 min son ~960 requests
-diarios contra JetSMART. Es tu propia cuenta y tu propio cupo, pero no hay motivo para apretar más:
-el inventario cambia en la liberación de medianoche y cuando alguien cancela. Si tenés muchas
-rutas, alargá el intervalo. Con varios usuarios conectados esto se multiplica: el barrido los
+Cada corrida hace **un request por ruta distinta**. Con el cron diario y 10 rutas son 10 requests
+por día; con un barrido cada 15 min serían ~960. Es tu propia cuenta y tu propio cupo, pero no hay
+motivo para apretar más: el inventario cambia en la liberación de medianoche y cuando alguien
+cancela. Con varios usuarios conectados esto se multiplica: el barrido los
 recorre en serie, no en paralelo, justamente para no martillar.
 
 ## Endpoints
@@ -238,7 +249,7 @@ recorre en serie, no en paralelo, justamente para no martillar.
 | Ruta | Para qué |
 |---|---|
 | `GET /api/cron` | Barrido de todos los usuarios conectados. Acepta `?date=YYYY-MM-DD` |
-| `GET /api/reminder` | Chequeo de las 23:45: avisa si tu cuenta no está entrando |
+| `GET /api/reminder` | Chequeo previo a la liberación: avisa si tu cuenta no está entrando. Sin cron en Hobby — engancharlo a un scheduler externo si lo querés |
 | `POST /api/telegram` | Webhook del bot |
 
 Si el radar estuvo caído más de 30 min, la sesión muere y el store se limpia solo, para que la

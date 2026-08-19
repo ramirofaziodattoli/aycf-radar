@@ -21,8 +21,8 @@ export function tomorrowInAR(now = new Date()) {
  * siguiente y es EL momento del día: ahí se avisa siempre, aunque no haya nada,
  * porque un "no hay cupo" a esa hora es lo que dispara el plan B.
  *
- * La ventana arranca en :01 a propósito: el cron de cada 15 minutos pega a las
- * 00:00, un minuto antes de que se libere, y esa corrida no confirma nada.
+ * La ventana arranca en :01 a propósito: una corrida a las 00:00 pega un minuto
+ * antes de que se libere el inventario y no confirma nada.
  */
 export function isReleaseRun(now = new Date()) {
   const ar = new Date(now.getTime() - 3 * 3600 * 1000);
@@ -61,7 +61,7 @@ export async function runSweep({ date, watches, store, session, chatId, notify =
       const match = flights.filter((f) => matchFlight(watch, f));
       if (match.length === 0) continue;
 
-      // Dedupe: si esto corre cada 15 min, sin esto te spamea el mismo vuelo
+      // Dedupe: si el barrido corre seguido, sin esto te spamea el mismo vuelo
       // hasta que salga. Solo avisamos de lo que no vimos antes.
       const nuevos = [];
       for (const f of match) {
@@ -148,7 +148,7 @@ export async function runAllRadars({ date } = {}) {
 
   const out = [];
   // En serie a propósito: Caravelo es la API de un tercero y no hace falta
-  // martillarla con N usuarios en paralelo para un barrido que tiene 15 minutos.
+  // martillarla con N usuarios en paralelo: la corrida no tiene apuro.
   for (const user of users) {
     try {
       out.push({ chatId: user.chatId, ...(await runRadar({ date, user })) });
