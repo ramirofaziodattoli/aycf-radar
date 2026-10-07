@@ -43,6 +43,13 @@ export function envUser() {
 export const esDueno = (chatId) =>
   Boolean(process.env.TELEGRAM_CHAT_ID) && String(chatId) === String(process.env.TELEGRAM_CHAT_ID);
 
+/** Cómo se llama en Telegram, para que /usuarios no sea una lista de números. */
+export const nombreDe = (from) => {
+  if (!from) return null;
+  if (from.username) return `@${from.username}`;
+  return [from.first_name, from.last_name].filter(Boolean).join(' ') || null;
+};
+
 export async function getUser(store, chatId) {
   const row = await store.get(rowKey(chatId));
   if (!row) return esDueno(chatId) ? envUser() : null;
@@ -51,6 +58,8 @@ export async function getUser(store, chatId) {
     email: row.email ?? null,
     passId: row.passId ?? null,
     password: row.password ? decrypt(row.password) : null,
+    nombre: row.nombre ?? null,
+    createdAt: row.createdAt ?? null,
   };
 }
 
@@ -62,6 +71,8 @@ export async function saveUser(store, chatId, data) {
 
   if (data.email !== undefined) row.email = data.email;
   if (data.passId !== undefined) row.passId = data.passId;
+  if (data.nombre !== undefined) row.nombre = data.nombre;
+  if (!row.createdAt) row.createdAt = new Date().toISOString();
   if (data.password !== undefined) {
     if (!haySecreto()) throw new Error('el bot no tiene SECRET_KEY configurada: no puedo guardar tu contraseña');
     row.password = encrypt(data.password);

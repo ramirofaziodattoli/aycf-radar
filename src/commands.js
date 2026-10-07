@@ -3,11 +3,11 @@
 import { search, discoverPassId, SinPaseError } from './jetsmart.js';
 import { tomorrowInAR } from './radar.js';
 import { validateWatch, watchLabel } from './watches.js';
-import { resolveWatches, saveWatches } from './config.js';
+import { resolveWatches, saveWatches, WATCHES_KEY } from './config.js';
 import { formatFlight } from './notify.js';
 import { getCatalog, resolveAirport, airportName, routeExists, destinationsFrom } from './airports.js';
 import { Session } from './session.js';
-import { saveUser, deleteUser, estaConectado, usaSemilla } from './users.js';
+import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, scoped, nombreDe } from './users.js';
 import { haySecreto } from './crypto.js';
 
 const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
@@ -40,6 +40,9 @@ ni códigos.
 
 _Solo se puede consultar el día siguiente: el pase libera los cupos a las 00:01
 y no existe inventario más allá de eso._`;
+
+// Solo el dueño del deploy (TELEGRAM_CHAT_ID) lo ve y lo puede usar.
+const AYUDA_ADMIN = '/usuarios — quiénes usan el bot (solo vos)';
 
 /**
  * Acepta códigos ("BRC") o nombres ("bariloche"). Los nombres pueden traer varias
@@ -343,7 +346,7 @@ const NO_CONECTADO =
  * El pase se intenta detectar solo y se verifica con una búsqueda real; si no sale,
  * se lo pedimos con /pase en vez de guardar un UUID cualquiera.
  */
-async function cmdConectar(store, chatId, user, args) {
+async function cmdConectar(store, chatId, user, args, from) {
   const [email, ...resto] = args;
   const password = resto.join(' ');
   if (!email || !password) {
@@ -375,7 +378,9 @@ async function cmdConectar(store, chatId, user, args) {
     }
   }
 
-  await saveUser(store.raw ?? store, chatId, { email, password, ...(passId ? { passId } : {}) });
+  await saveUser(store.raw ?? store, chatId, {
+    email, password, nombre: nombreDe(from), ...(passId ? { passId } : {}),
+  });
   await session.persist();
 
   if (!passId) {
@@ -407,6 +412,27 @@ async function cmdPase(store, chatId, user, args) {
   await search(session, { from: 'AEP', to: 'COR', date: tomorrowInAR() }, store);
   await saveUser(store.raw ?? store, chatId, { passId: uuid });
   return '✅ Pase guardado y verificado.';
+}
+
+/**
+ * Quién usa el bot. Es del dueño: el que hostea es responsable de las cuentas que
+ * guarda y necesita saber cuántas son y de quién. Nunca muestra contraseñas ni
+ * pases: con el mail y las rutas alcanza para reconocer a cada uno.
+ */
+async function cmdUsuarios(store) {
+  const base = store.raw ?? store;
+  const users = await listUsers(base);
+  if (!users.length) return '👥 Nadie conectado todavía.';
+  const lineas = [];
+  for (const [i, u] of users.entries()) {
+    const rutas = (await scoped(base, u.chatId).get(WATCHES_KEY)) ?? [];
+    // dd/mm del ISO: los que se conectaron antes de que se guardara la fecha no tienen.
+    const desde = u.createdAt ? `${u.createdAt.slice(8, 10)}/${u.createdAt.slice(5, 7)}` : '—';
+    // Backticks: Telegram parsea `_` como cursiva y un `@juan_perez` suelto rompe el mensaje.
+    lineas.push(`${i + 1}. \`${u.chatId}\` · \`${u.nombre ?? (u.env ? 'vos' : 'sin nombre')}\` · ` +
+      `\`${u.email ?? '—'}\` · ${rutas.length} ruta(s) · desde ${desde}`);
+  }
+  return `👥 *${users.length} usuario(s)*\n\n${lineas.join('\n')}`;
 }
 
 async function cmdDesconectar(store, chatId) {
@@ -443,7 +469,7 @@ export function comandoDe(text, user) {
   return { cmd: '/start', args: [] };
 }
 
-export async function handleCommand(text, { store, session, user, chatId }) {
+export async function handleCommand(text, { store, session, user, chatId, from }) {
   const { cmd, args } = comandoDe(text, user);
 
   // Un chat sin cuenta conectada igual es un chat: sin el chatId, `usaSemilla`
@@ -451,7 +477,7 @@ export async function handleCommand(text, { store, session, user, chatId }) {
   const perfil = user ?? (chatId ? { chatId: String(chatId) } : null);
 
   try {
-    return await dispatch(cmd, args, { store, session, user: perfil, chatId });
+    return await dispatch(cmd, args, { store, session, user: perfil, chatId, from });
   } catch (err) {
     // Un error de tipeo se contesta; los de sesión suben para que el webhook
     // dé la instrucción concreta de reconectar.
@@ -465,17 +491,21 @@ export async function handleCommand(text, { store, session, user, chatId }) {
 /** Los que le pegan a JetSmart: sin cuenta conectada no hay nada que consultar. */
 export const NECESITA_SESION = ['/buscar', '/estado', '/pase'];
 
-async function dispatch(cmd, args, { store, session, user, chatId }) {
+async function dispatch(cmd, args, { store, session, user, chatId, from }) {
+  const ayuda = esDueno(chatId) ? `${AYUDA}\n${AYUDA_ADMIN}` : AYUDA;
   switch (cmd) {
     case '/start':
       return estaConectado(user)
-        ? (await botonesOrigen(store, '👋 Ya estás conectado. ¿Desde dónde volás?')) ?? AYUDA
+        ? (await botonesOrigen(store, '👋 Ya estás conectado. ¿Desde dónde volás?')) ?? ayuda
         : BIENVENIDA;
     case '/ayuda':
     case '/help':
-      return estaConectado(user) ? AYUDA : `${AYUDA}\n\n${BIENVENIDA}`;
+      return estaConectado(user) ? ayuda : `${ayuda}\n\n${BIENVENIDA}`;
     case '/conectar':
-      return cmdConectar(store, chatId, user, args);
+      return cmdConectar(store, chatId, user, args, from);
+    case '/usuarios':
+      if (!esDueno(chatId)) break; // para los demás, el comando no existe
+      return cmdUsuarios(store);
     case '/pase':
       return cmdPase(store, chatId, user, args);
     case '/desconectar':
@@ -497,9 +527,8 @@ async function dispatch(cmd, args, { store, session, user, chatId }) {
       return cmdAeropuertos(store, args);
     case '/estado':
       return cmdEstado(store, session, user);
-    default:
-      return `No conozco \`${cmd}\`.\n\n${AYUDA}`;
   }
+  return `No conozco \`${cmd}\`.\n\n${ayuda}`;
 }
 
 export { NO_CONECTADO };

@@ -510,4 +510,177 @@ const memStore = () => {
 
 }
 
+
+// --- la pasada de rescate avisa la liberación a quien le falló la de las 00:01 ---
+{
+  const store = memStore();
+  const session = { header: () => 'x', passId: 'pase-de-prueba' };
+  const watches = [{ from: 'AEP', to: 'COR', minSeats: 1 }];
+  const orig = globalThis.fetch;
+  const avisos = [];
+  globalThis.fetch = async (url, opt) => {
+    if (String(url).includes('api.telegram.org')) avisos.push(JSON.parse(opt.body).text);
+    return { ok: true, status: 200, text: async () => '{}', headers: { getSetCookie: () => [] } };
+  };
+  process.env.TELEGRAM_TOKEN = 'x'; process.env.TELEGRAM_CHAT_ID = 'y';
+  const pasada = () => runSweep({
+    date: '2026-07-29', watches, store, session, release: false, _search: async () => [],
+  });
+
+  await pasada();
+  assert.equal(avisos.length, 0, 'una pasada común sin cupo no avisa');
+
+  // La corrida de las 00:01 falló y dejó la bandera: esta pasada hace de liberación.
+  await store.set('release-pending', '2026-07-29');
+  await pasada();
+  assert.equal(avisos.length, 1, 'la pasada de rescate avisa aunque no haya cupo');
+  assert.match(avisos[0], /LIBERACIÓN/, 'con el formato de la liberación');
+  assert.equal(await store.get('release-pending'), null, 'y limpia la bandera');
+
+  // Una bandera de otra fecha es basura vieja, no dispara nada.
+  await store.set('release-pending', '2026-07-28');
+  await pasada();
+  assert.equal(avisos.length, 1, 'bandera de otra fecha: silencio');
+
+  globalThis.fetch = orig;
+}
+
+// --- si el barrido muere a mitad, lo visto antes NO queda marcado ---
+{
+  const store = memStore();
+  const session = { header: () => 'x', passId: 'pase-de-prueba' };
+  const watches = [{ from: 'AEP', to: 'COR' }, { from: 'BRC', to: 'EZE' }];
+  const explota = async (_s, { from }) => {
+    if (from === 'BRC') throw new Error('Caravelo respondió 504');
+    return [V];
+  };
+  await assert.rejects(() => runSweep({
+    date: '2026-07-29', watches, store, session, notify: false, release: false, _search: explota,
+  }), /504/);
+  assert.equal(await store.get(dedupeKey('2026-07-29', watches[0], V)), null,
+    'el vuelo de la ruta 1 no quedó como visto: nadie lo recibió');
+}
+
+// --- la corrida de la liberación que falla deja la bandera para el rescate ---
+{
+  const { runRadar } = await import('./src/radar.js');
+  const { createStore } = await import('./src/store.js');
+  const { rm } = await import('node:fs/promises');
+  const limpio = { ...process.env };
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '{}', headers: { getSetCookie: () => [] } });
+  process.env.TELEGRAM_TOKEN = 'x'; process.env.TELEGRAM_CHAT_ID = 'y';
+  delete process.env.AYCF_COOKIE; delete process.env.AYCF_EMAIL; delete process.env.AYCF_PASSWORD; delete process.env.AYCF_PASS_ID;
+  const RUTAS = JSON.stringify([{ from: 'AEP', to: 'COR' }]);
+
+  process.env.STATE_FILE = '/tmp/aycf-test-rescate-1.json';
+  await rm(process.env.STATE_FILE, { force: true });
+  const falla = await runRadar({ watchesRaw: RUTAS, release: true });
+  assert.equal(falla.error, 'session-expired', 'sin credenciales la corrida falla');
+  assert.equal(await createStore().get('release-pending'), tomorrowInAR(),
+    'la liberación fallida deja la bandera con la fecha buscada');
+
+  process.env.STATE_FILE = '/tmp/aycf-test-rescate-2.json';
+  await rm(process.env.STATE_FILE, { force: true });
+  await runRadar({ watchesRaw: RUTAS, release: false });
+  assert.equal(await createStore().get('release-pending'), null,
+    'una corrida común que falla no deja bandera');
+
+  globalThis.fetch = orig;
+  process.env = limpio;
+}
+
+// --- /usuarios: el dueño ve quién usa el bot; para los demás no existe ---
+{
+  const { handleCommand } = await import('./src/commands.js');
+  const { saveUser, scoped, nombreDe } = await import('./src/users.js');
+  const limpio = { ...process.env };
+  delete process.env.AYCF_EMAIL; delete process.env.AYCF_PASS_ID;
+  process.env.TELEGRAM_CHAT_ID = '1';
+
+  assert.equal(nombreDe({ username: 'juan_p', first_name: 'Juan' }), '@juan_p', 'el @ manda');
+  assert.equal(nombreDe({ first_name: 'Juan', last_name: 'Pérez' }), 'Juan Pérez');
+  assert.equal(nombreDe(undefined), null);
+
+  const base = memStore();
+  base.name = 'memory';
+  const juan = await saveUser(base, '2', { email: 'juan_perez@mail.com', passId: 'p2', nombre: '@juan_p' });
+  assert.ok(juan.createdAt, 'el alta queda fechada');
+  const otraVez = await saveUser(base, '2', { passId: 'p2b' });
+  assert.equal(otraVez.createdAt, juan.createdAt, 'la fecha de alta no se pisa');
+  assert.equal(otraVez.nombre, '@juan_p', 'el nombre tampoco');
+  await scoped(base, '2').set('watches', [{ from: 'AEP', to: 'COR' }]);
+
+  const dueno = { store: scoped(base, '1'), user: { chatId: '1' }, chatId: '1' };
+  const lista = await handleCommand('/usuarios', dueno);
+  assert.match(lista, /1 usuario/);
+  assert.match(lista, /juan_p/);
+  assert.match(lista, /juan_perez@mail\.com/);
+  assert.match(lista, /1 ruta/);
+  assert.doesNotMatch(lista, /p2b/, 'el pase no se lista');
+
+  const otro = { store: scoped(base, '2'), user: otraVez, chatId: '2' };
+  assert.match(await handleCommand('/usuarios', otro), /No conozco/, 'para los demás el comando no existe');
+  assert.match(await handleCommand('/ayuda', dueno), /\/usuarios/, 'el dueño lo ve en la ayuda');
+  assert.doesNotMatch(await handleCommand('/ayuda', otro), /\/usuarios/);
+
+  process.env = limpio;
+}
+
+// --- precalentado de las 23:55: loguea a todos y avisa SOLO si no puede ---
+{
+  const { default: warmup } = await import('./api/reminder.js');
+  const { createStore } = await import('./src/store.js');
+  const { saveUser, scoped } = await import('./src/users.js');
+  const { rm } = await import('node:fs/promises');
+  const limpio = { ...process.env };
+  const orig = globalThis.fetch;
+  process.env.SECRET_KEY = 'clave-de-prueba-larga';
+  process.env.TELEGRAM_TOKEN = 'x'; process.env.TELEGRAM_CHAT_ID = '1';
+  delete process.env.CRON_SECRET; delete process.env.AYCF_EMAIL; delete process.env.AYCF_PASS_ID;
+  process.env.STATE_FILE = '/tmp/aycf-test-warmup.json';
+  await rm(process.env.STATE_FILE, { force: true });
+
+  const base = createStore();
+  await saveUser(base, '7', { email: 'ana@mail.com', password: 'secreto', passId: 'p7' });
+  await scoped(base, '7').set('watches', [{ from: 'AEP', to: 'COR' }]);
+  const res = () => ({ status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } });
+  const avisos = [];
+
+  // Keycloak no contesta: hay que avisarle a Ana que en 6 minutos se libera y no entro.
+  globalThis.fetch = async (url, opt = {}) => {
+    if (String(url).includes('api.telegram.org')) {
+      avisos.push(JSON.parse(opt.body));
+      return { ok: true, status: 200, text: async () => '{}', headers: { getSetCookie: () => [] } };
+    }
+    throw new Error('fetch failed');
+  };
+  const caido = await warmup({ headers: {} }, res());
+  assert.equal(caido.body.users.length, 1);
+  assert.equal(caido.body.users[0].viva, false);
+  assert.equal(avisos.length, 1, 'avisa cuando no puede entrar');
+  assert.equal(String(avisos[0].chat_id), '7', 'al chat de Ana, no al del dueño');
+  assert.match(avisos[0].text, /no puedo entrar/i);
+
+  // Login OK: sesión fresca guardada y ni un mensaje.
+  const FORM = '<form id="kc-form-login" action="https://x/auth"></form>';
+  globalThis.fetch = async (url, opt = {}) => {
+    if (String(url).includes('api.telegram.org')) { avisos.push(JSON.parse(opt.body)); return { ok: true, status: 200, text: async () => '{}', headers: { getSetCookie: () => [] } }; }
+    if (opt.method === 'POST') return {
+      status: 302, text: async () => '',
+      headers: { get: (h) => (h === 'location' ? 'https://go.jetsmart.com/ok' : null), getSetCookie: () => ['laravel_session=FRESCA'] },
+    };
+    if (String(url).includes('/ok')) return { status: 200, headers: { get: () => null, getSetCookie: () => [] }, text: async () => 'listo' };
+    return { status: 200, headers: { get: () => null, getSetCookie: () => [] }, text: async () => FORM };
+  };
+  const vivo = await warmup({ headers: {} }, res());
+  assert.equal(vivo.body.users[0].viva, true);
+  assert.equal(avisos.length, 1, 'si entró, silencio: nadie quiere un mensaje a las 23:55 para decir que todo anda');
+  assert.match((await scoped(base, '7').get('session:cookies'))?.laravel_session ?? '', /FRESCA/,
+    'la sesión fresca queda guardada para las 00:01');
+
+  globalThis.fetch = orig;
+  process.env = limpio;
+}
+
 console.log('✅ todo ok');

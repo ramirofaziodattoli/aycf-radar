@@ -29,6 +29,13 @@ export function isReleaseRun(now = new Date()) {
   return ar.getUTCHours() === 0 && ar.getUTCMinutes() >= 1 && ar.getUTCMinutes() <= 5;
 }
 
+/**
+ * Bandera por usuario: la corrida de la liberación falló (Caravelo saturado a las
+ * 00:01, medido el 06 y 07/10) y la próxima pasada tiene que hacer de 00:01,
+ * con o sin cupo. Vale una hora: alcanza para los rescates de las 00:10 y 00:20.
+ */
+export const RELEASE_PENDING = 'release-pending';
+
 export function dedupeKey(date, watch, flight) {
   return `seen:${date}|${watch.from}-${watch.to}|${flight.code}`;
 }
@@ -44,13 +51,17 @@ export function groupByRoute(watches) {
   return [...m.values()];
 }
 
-// `_search` es una costura para testear sin pegarle a la red.
-export async function runSweep({ date, watches, store, session, chatId, notify = true, _search = search }) {
+// `_search` es una costura para testear sin pegarle a la red; `release` se decide
+// afuera para que todos los usuarios de una corrida compartan el mismo criterio.
+export async function runSweep({
+  date, watches, store, session, chatId, notify = true, release = isReleaseRun(), _search = search,
+}) {
   const activos = watches.filter((w) => appliesTo(w, date));
   if (activos.length === 0) return { date, scanned: 0, hits: [], skipped: watches.length };
 
   const rutas = groupByRoute(activos);
   const hits = [];
+  const vistos = [];
   let scanned = 0;
 
   for (const ruta of rutas) {
@@ -62,30 +73,41 @@ export async function runSweep({ date, watches, store, session, chatId, notify =
       if (match.length === 0) continue;
 
       // Dedupe: si el barrido corre seguido, sin esto te spamea el mismo vuelo
-      // hasta que salga. Solo avisamos de lo que no vimos antes.
+      // hasta que salga. Solo avisamos de lo que no vimos antes. Se marca como
+      // visto DESPUÉS de avisar: si el barrido muere en la ruta 2, lo de la ruta 1
+      // tiene que seguir siendo nuevo para la pasada de rescate.
       const nuevos = [];
       for (const f of match) {
         const key = dedupeKey(date, watch, f);
         if (await store.get(key)) continue;
-        await store.set(key, { seats: f.seats }, 60 * 60 * 36);
+        vistos.push({ key, seats: f.seats });
         nuevos.push(f);
       }
       if (nuevos.length) hits.push({ watch, flights: nuevos });
     }
   }
 
-  // En la corrida de la liberación se avisa siempre, con o sin cupo.
-  const release = isReleaseRun();
-  const avisar = hits.length > 0 || release || process.env.NOTIFY_EMPTY === 'true';
+  // En la corrida de la liberación se avisa siempre, con o sin cupo. Y si la de
+  // las 00:01 falló y dejó la bandera, esta pasada hace de liberación.
+  const pendiente = (await store.get(RELEASE_PENDING)) === date;
+  const esLiberacion = release || pendiente;
+  const avisar = hits.length > 0 || esLiberacion || process.env.NOTIFY_EMPTY === 'true';
 
   // Encontrar vuelos y no poder avisar es una falla, no un éxito: si el token de
   // Telegram murió, el radar seguiría reportando ok con el dashboard en verde.
   let notified = null;
   if (notify && avisar) {
     notified = hits.length
-      ? await notifyHits(hits, date, release, chatId)
-      : await notifyEmpty(date, rutas.length, release, chatId);
+      ? await notifyHits(hits, date, esLiberacion, chatId)
+      : await notifyEmpty(date, rutas.length, esLiberacion, chatId);
     if (!notified) console.error('¡No se pudo notificar por ningún canal!');
+  }
+
+  // Recién ahora queda registrado. Si Telegram falló, no se marca nada: la
+  // próxima pasada lo vuelve a intentar en vez de darlo por avisado.
+  if (notified !== false) {
+    for (const { key, seats } of vistos) await store.set(key, { seats }, 60 * 60 * 36);
+    if (pendiente) await store.set(RELEASE_PENDING, null, 1);
   }
 
   return {
@@ -103,11 +125,14 @@ export async function runSweep({ date, watches, store, session, chatId, notify =
  * Un barrido para UN usuario. El store viene ya acotado a su namespace, la sesión
  * usa sus credenciales y los avisos van a su chat.
  */
-export async function runRadar({ date, watchesRaw, user = envUser() ?? { env: true } } = {}) {
+export async function runRadar({
+  date, watchesRaw, user = envUser() ?? { env: true }, release = isReleaseRun(),
+} = {}) {
   const base = createStore();
   const store = user.chatId ? scoped(base, user.chatId) : base;
   const chatId = user.env ? undefined : user.chatId; // el dueño usa el chat de env
   let session;
+  let target;
 
   // TODO lo que pueda fallar va adentro del try. Antes, un WATCHES mal formado o
   // una sesión sin sembrar tiraban un 500 mudo: sin Telegram, sin log útil, y
@@ -116,12 +141,16 @@ export async function runRadar({ date, watchesRaw, user = envUser() ?? { env: tr
     const watches = await resolveWatches(store, watchesRaw, { seed: usaSemilla(user) });
     if (!watches.length) return { ok: true, chatId: user.chatId, skipped: 'sin rutas' };
 
-    const target = date || tomorrowInAR();
+    target = date || tomorrowInAR();
     return await withSession(store, (s) => {
       session = s;
-      return runSweep({ date: target, watches, store, session: s, chatId });
+      return runSweep({ date: target, watches, store, session: s, chatId, release });
     }, user);
   } catch (err) {
+    // La liberación falló: que la pasada de rescate avise como si fuera esta.
+    // Sin la bandera, el "sin cupo" que dispara el plan B se pierde.
+    if (release && target) await store.set(RELEASE_PENDING, target, 60 * 60).catch(() => {});
+
     if (err instanceof SessionExpiredError) {
       // Si no la borramos, la sesión muerta le gana a AYCF_COOKIE en el próximo
       // load() y re-sembrar la semilla no arregla nada. `session` puede no existir
@@ -147,11 +176,19 @@ export async function runAllRadars({ date } = {}) {
   if (!users.length) return [await runRadar({ date })];
 
   const out = [];
+  // Se decide una vez: el usuario 8 arranca después de las 00:05 y sigue siendo
+  // la corrida de la liberación.
+  const release = isReleaseRun();
   // En serie a propósito: Caravelo es la API de un tercero y no hace falta
-  // martillarla con N usuarios en paralelo: la corrida no tiene apuro.
+  // martillarla con N usuarios en paralelo. Además el orden en serie es lo que
+  // hace que los últimos entren cuando la estampida de las 00:01 ya pasó.
+  // ponytail: ~30 s por usuario con Caravelo saturado; con maxDuration 800 entran
+  // ~25 usuarios. Pasado eso, fan-out por usuario (una invocación cada uno).
   for (const user of users) {
+    const t0 = Date.now();
     try {
-      out.push({ chatId: user.chatId, ...(await runRadar({ date, user })) });
+      out.push({ chatId: user.chatId, ...(await runRadar({ date, user, release })) });
+      console.log(`usuario ${user.chatId}: ${Date.now() - t0} ms`);
     } catch (err) {
       // El fallo de un usuario no puede dejar sin barrido a los demás.
       console.error(`usuario ${user.chatId}: ${err.message}`);

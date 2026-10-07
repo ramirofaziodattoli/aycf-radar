@@ -110,6 +110,7 @@ propio namespace del store, con su sesión y sus watches.
 | `/rutas`, `/borrar N` | Ver y sacar rutas |
 | `/buscar AEP SLA` | Buscar ahora mismo |
 | `/estado` | Si la sesión y la cuenta están bien |
+| `/usuarios` | Solo el dueño del deploy (`TELEGRAM_CHAT_ID`): quiénes están conectados, con mail, rutas y fecha de alta. Nunca contraseñas |
 
 **Las contraseñas se guardan cifradas** (AES-256-GCM, clave derivada de `SECRET_KEY`). Sin
 `SECRET_KEY` el bot se niega a guardarlas. No rotes esa clave: si cambia, lo guardado deja de
@@ -216,14 +217,19 @@ vercel --prod
 Env vars: `AYCF_PASS_ID`, `AYCF_EMAIL`, `AYCF_PASSWORD`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`,
 `TELEGRAM_WEBHOOK_SECRET`, `SECRET_KEY`, `WATCHES`, `CRON_SECRET`, más las de Redis.
 
-- **Crons:** el `vercel.json` trae uno solo, `1 3 * * *` (00:01 ART), que es lo que permite Hobby.
-  ⚠️ **En Hobby el minuto no está garantizado**: Vercel dispara los crons diarios dentro de la
-  hora, así que podés terminar barriendo a las 00:40 con lo bueno ya volado. Si eso te importa,
+- **Crons (plan Pro):** el `vercel.json` trae cuatro. `55 2 * * *` (23:55 ART) **precalienta**:
+  loguea a todos de nuevo para que a las 00:01 cada usuario sea un solo request. `1 3 * * *`
+  (00:01) es la liberación. `10 3` y `20 3` son **pasadas de rescate**: Caravelo se satura justo en
+  el minuto de la liberación (medido el 06 y 07/10 de 2026: login > 20 s, búsqueda > 30 s, 504 de
+  CloudFront) y a quien le falló la de las 00:01 le llega el reporte, con o sin cupo, en la
+  siguiente. `api/cron.js` lleva `maxDuration: 800` porque los usuarios se recorren en serie, ~30 s
+  cada uno cuando Caravelo está lento.
+  ⚠️ **En Hobby** entra un solo cron diario y el minuto no está garantizado: Vercel lo dispara dentro
+  de la hora, así que podés terminar barriendo a las 00:40 con lo bueno ya volado. Si eso te importa,
   hay dos salidas: plan Pro, o un scheduler externo (cron-job.org y parecidos) pegándole a
   `/api/cron` con `Authorization: Bearer $CRON_SECRET` a la hora exacta.
-- **La sesión no importa entre corridas:** vence a los ~40 min pase lo que pase, así que un cron
-  diario arranca siempre con sesión muerta y se reloguea solo. Es justo lo que hace viable correr
-  una sola vez por día.
+- **La sesión vence a los ~40 min pase lo que pase.** Por eso el precalentado de las 23:55 y no
+  antes; y si igual llega muerta, el barrido se reloguea solo.
 - **Redis obligatorio:** Upstash desde el Marketplace, o cualquier Redis con REST. También lee las
   `KV_REST_API_*` de Vercel KV.
 - **`CRON_SECRET`:** Vercel lo manda como Bearer. Sin esto la URL queda pública y cualquiera
@@ -249,14 +255,14 @@ recorre en serie, no en paralelo, justamente para no martillar.
 | Ruta | Para qué |
 |---|---|
 | `GET /api/cron` | Barrido de todos los usuarios conectados. Acepta `?date=YYYY-MM-DD` |
-| `GET /api/reminder` | Chequeo previo a la liberación: avisa si tu cuenta no está entrando. Sin cron en Hobby — engancharlo a un scheduler externo si lo querés |
+| `GET /api/reminder` | Precalentado de las 23:55: loguea a todos de nuevo y avisa solo a quien no puede entrar |
 | `POST /api/telegram` | Webhook del bot |
 
 Si el radar estuvo caído más de 30 min, la sesión muere y el store se limpia solo, para que la
 próxima corrida re-siembre desde `AYCF_COOKIE`. Sin eso, la sesión muerta le ganaría a la env var
 y quedarías en un 401 permanente por más que actualices la semilla.
 
-Los dos crons exigen `Authorization: Bearer $CRON_SECRET` si la env var está definida; el webhook
+Los crons exigen `Authorization: Bearer $CRON_SECRET` si la env var está definida; el webhook
 valida el header `x-telegram-bot-api-secret-token` contra `TELEGRAM_WEBHOOK_SECRET`.
 
 ## Tests

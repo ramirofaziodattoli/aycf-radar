@@ -1,18 +1,19 @@
-// Recordatorio de las 23:45: chequear que la sesión llegue viva a la liberación.
+// Precalentado de las 23:55: loguear a todos ANTES de la estampida de las 00:01.
 //
-// La sesión de Caravelo vence por tiempo ABSOLUTO (~40 min), no por inactividad,
-// así que no hay keep-alive que la sostenga toda la noche. Lo que sí funciona es
-// tenerla fresca en la ventana que importa.
+// La sesión de Caravelo vence por tiempo ABSOLUTO (~40 min), así que la de ayer
+// está muerta cuando se libera el inventario. Un login fresco a las 23:55 llega
+// vivo a las 00:01 y a las pasadas de rescate de las 00:10 y 00:20, y convierte a
+// cada usuario de la liberación en UN request (la búsqueda) en vez de cinco (login
+// + búsqueda) en el minuto en que Caravelo está saturado: medido el 06 y 07/10, a
+// esa hora el login tardaba más de 20 s y la búsqueda más de 30 s, y los 7
+// usuarios fallaban.
 //
-// OJO: esto va por `withSession`, no por `Session.load()` a secas. Con load() una
-// sesión vencida se reportaba como "🔴 caída" aunque el re-login automático la
-// levantara sin problema dos minutos después: el bot avisaba que no estabas
-// conectado estando perfectamente conectado.
+// Avisa SOLO si no puede entrar: a las 23:55 nadie quiere un "todo bien". Y si
+// igual falla, el barrido de las 00:01 reintenta el login por su cuenta.
 
 import { createStore } from '../src/store.js';
-import { withSession, SessionExpiredError } from '../src/session.js';
-import { search } from '../src/jetsmart.js';
-import { tomorrowInAR } from '../src/radar.js';
+import { Session } from '../src/session.js';
+import { tieneCredenciales } from '../src/login.js';
 import { resolveWatches } from '../src/config.js';
 import { reply } from '../src/notify.js';
 import { scoped, listUsers, usaSemilla } from '../src/users.js';
@@ -24,41 +25,30 @@ export default async function handler(req, res) {
   }
 
   const base = createStore();
-  const users = await listUsers(base);
   const resultados = [];
 
-  for (const user of users) {
+  for (const user of await listUsers(base)) {
     const store = scoped(base, user.chatId);
-    const chatId = user.env ? undefined : user.chatId;
     const watches = await resolveWatches(store, undefined, { seed: usaSemilla(user) }).catch(() => []);
-    // Sin rutas no hay liberación que esperar: no le tocamos el timbre a nadie.
-    if (!watches.length) continue;
+    // Sin rutas no hay liberación que esperar; sin credenciales (usuarios de
+    // /cookie) no hay login que hacer.
+    if (!watches.length || !tieneCredenciales(user)) continue;
 
-    let viva = false;
-    let motivo = '';
+    let viva = true;
     try {
-      await withSession(
-        store,
-        (s) => search(s, { from: watches[0].from, to: watches[0].to, date: tomorrowInAR() }, store),
-        user
-      );
-      viva = true;
+      // Incondicional: aunque la sesión esté viva, una fresca garantiza los 40 min.
+      await new Session(store, user).relogin();
     } catch (err) {
-      motivo = err instanceof SessionExpiredError ? err.detalle : err.message;
-      console.error(`reminder ${user.chatId}: ${motivo}`);
+      viva = false;
+      console.error(`warmup ${user.chatId}: ${err.message}`);
+      await reply(
+        '🔴 *No puedo entrar a tu cuenta y en 6 minutos se libera el inventario.*\n\n' +
+        `Motivo: ${err.message}\n\n` +
+        'Reconectá mandándome tu mail y contraseña en un mensaje.\n\n' +
+        '_Sin eso, el aviso de las 00:01 no va a salir._',
+        user.env ? undefined : user.chatId
+      ).catch(() => {});
     }
-
-    await reply(
-      viva
-        ? '🌙 *Faltan 16 minutos para la liberación de las 00:01.*\n\n' +
-          'Tu sesión está viva y me relogueo solo si vence. No tenés que hacer nada.'
-        : '🔴 *No puedo entrar a tu cuenta y en 16 minutos se libera el inventario.*\n\n' +
-          `Motivo: ${motivo}\n\n` +
-          'Reconectá con `/conectar tu@mail.com tucontraseña`, o mandame un `/cookie` fresco.\n\n' +
-          '_Sin eso, el aviso de las 00:01 no va a salir._',
-      chatId
-    ).catch(() => {});
-
     resultados.push({ chatId: user.chatId, viva });
   }
 

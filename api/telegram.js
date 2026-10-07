@@ -47,7 +47,9 @@ export default async function handler(req, res) {
     const base = createStore();
     const store = scoped(base, chatId);
     const user = await getUser(base, chatId);
-    const ctx = { store, user, chatId };
+    // `from` es quién escribe (en un botón, el que lo tocó): solo se usa para
+    // guardar cómo se llama en Telegram cuando se conecta.
+    const ctx = { store, user, chatId, from: cb?.from ?? msg?.from };
 
     // Un toque de botón no necesita el mismo ruteo que un comando: siempre
     // pertenece a alguien conectado y siempre reemplaza el mensaje anterior.

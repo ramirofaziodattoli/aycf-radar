@@ -99,6 +99,9 @@ export async function search(session, { from, to, date }, store = null) {
       intervalSubtype: null,
       outboundKey: null,
     }),
+    // CloudFront corta el origen a los 30 s; esto deja ese techo explícito y no
+    // depende de que la CDN de Caravelo lo haga por nosotros.
+    signal: AbortSignal.timeout(30_000),
   });
 
   if (res.status === 401 || res.status === 403) throw new SessionExpiredError();
