@@ -86,6 +86,40 @@ export function formatFallo(order, intentos = []) {
 }
 
 /**
+ * Ensayo de compra (`/ensayo`): una sola pasada de search → elegir → quote por tramo
+ * → initPayment, sin lock, sin escribir en el store, sin tokenizar ni pagar.
+ * Devuelve el itinerario, lo cotizado y si el INIT de Spreedly anduvo, o el paso
+ * que falló. Sin reintentos ni relogin: es para mirar, no para insistir.
+ */
+async function ensayar({ order, store, session, api }) {
+  const fresco = (await getOrder(store, order.id)) ?? order;
+  const msg = (e) => String(e?.message ?? e ?? '').replace(/[*_`[\]]/g, '').slice(0, 160);
+  const falla = (paso, e, extra) => ({ estado: 'ensayo', paso, error: msg(e), ...extra });
+
+  const vuelos = [];
+  for (let i = 0; i < fresco.tramos.length; i++) {
+    try {
+      vuelos[i] = await api.search(session, { from: fresco.tramos[i].from, to: fresco.tramos[i].to, date: fresco.fechaVuelo }, store);
+    } catch (e) { return falla('search', e); }
+  }
+  const it = chooseItinerary(fresco, vuelos);
+  const itinerario = it.faltan?.length ? { tramos: it.tramos, faltan: it.faltan } : { tramos: it.tramos };
+
+  const cotizaciones = [];
+  for (const i of ordenDeCompra(it)) {
+    const f = it.tramos[i];
+    try {
+      const q = await api.quote(session, f);
+      cotizaciones.push({ code: f.code, total: q.total });
+    } catch (e) { return falla('quote', e, { itinerario, cotizaciones }); }
+  }
+  if (!it.tramos.length) return { estado: 'ensayo', itinerario, cotizaciones, init: null };
+
+  try { await api.initPayment(session); } catch (e) { return falla('initPayment', e, { itinerario, cotizaciones }); }
+  return { estado: 'ensayo', itinerario, cotizaciones, init: { ok: true } };
+}
+
+/**
  * Corre el loop hasta `deadline` y deja el pedido en su estado final.
  * Devuelve { estado, resultado, intentos, motivo }, o { estado: 'confirmado' } si
  * otro proceso tiene el lock (y no se liberó en `esperarLockMs`).
@@ -97,7 +131,12 @@ export async function runBuy({
   api = { search, quote, initPayment, tokenizeCard, doPurchase, listBookings },
   notify = reply,
   esperarLockMs = 0,
+  dryRun = false,
 }) {
+  // Ensayo: antes del lock y de cualquier escritura. Es una función aparte que ni
+  // siquiera recibe `card` ni `api.tokenizeCard`/`doPurchase`: no hay camino al pago.
+  if (dryRun) return ensayar({ order, store, session, api });
+
   // El rescate de las 00:13 espera a que la corrida anterior suelte el lock (o
   // a que venza su TTL si la mató el maxDuration) en vez de rendirse al toque.
   const ttl = () => Math.max(Math.ceil((deadline - now()) / 1000) + LOCK_MARGEN_S, VIDA_MAXIMA_S + LOCK_MARGEN_S);

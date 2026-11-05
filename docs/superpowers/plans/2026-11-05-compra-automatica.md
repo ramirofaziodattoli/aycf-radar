@@ -294,7 +294,7 @@ Escribir los 7 casos como asserts concretos (uno por bloque `{}`), no como comen
 - Consumes: Task 1 (`ordersDueTonight`, `getOrder`), Task 4 (`runBuy`, `deadlineAR`), `envUser()`/`esDueno`/`scoped` de `src/users.js`, `withSession` de `src/session.js`.
 - Produces:
   - `api/buy.js` handler: 401 sin `CRON_SECRET`; 200 `{ ok: true, skipped: 'auto-buy-off' }` si `AUTO_BUY !== 'on'`; lee `AYCF_CARD` (JSON) y si falta → avisa al dueño y 200 `{ skipped: 'sin-tarjeta' }`; por cada pedido de `ordersDueTonight` del store del dueño, `withSession(store, s => runBuy({...}), envUser())` con `deadline = deadlineAR('00:15')`; acepta `?order=<id>` para forzar uno (rescates y pruebas). Responde `{ ok, orders: [{ id, estado }] }`.
-  - `vercel.json`: `"api/buy.js": { "maxDuration": 800 }`; crons `0 3`, `8 3`, `16 3`, `30 3` y `0 4-23 * * *` → `/api/buy`. Los existentes quedan.
+  - `vercel.json`: `"api/buy.js": { "maxDuration": 800 }`; crons `0 3`, `8 3`, `16 3`, `30 3` y `0 0-2,4-23 * * *` → `/api/buy`. Los existentes quedan.
   - `runAllRadars`: antes del barrido del dueño, `skipOwnerTonight = AUTO_BUY === 'on' && (await ordersDueTonight(scoped(base, dueño))).length > 0`; en ese caso `out.push({ chatId, skipped: 'compra-en-curso' })` y no corre `runRadar` para él.
   - `api/reminder.js`: después del precalentado, si el dueño tiene pedidos para esta noche, un mensaje por pedido con `formatPedido(order)` (Task 6) y botón `[{ text: '❌ Cancelar', data: 'ord:no:<id>' }]`.
   - README: sección «Compra automática (opcional, sólo el dueño)» con las env vars `AUTO_BUY`, `AYCF_CARD`, `ANTHROPIC_API_KEY`, la advertencia de T&C y el kill switch.

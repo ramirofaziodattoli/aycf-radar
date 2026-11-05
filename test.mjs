@@ -1372,6 +1372,106 @@ const memStore = () => {
   process.env = limpio;
 }
 
+// --- /ensayo: llega hasta INIT y no paga ---
+{
+  const { rm } = await import('node:fs/promises');
+  const { runBuy } = await import('./src/buy.js');
+  const { newOrder, saveOrder, setEstado, getOrder } = await import('./src/orders.js');
+  const { createStore } = await import('./src/store.js');
+  const { scoped } = await import('./src/users.js');
+  const { handleCommand, NECESITA_SESION } = await import('./src/commands.js');
+  const limpio = { ...process.env };
+  process.env.STATE_FILE = '/tmp/aycf-test-ensayo.json'; await rm(process.env.STATE_FILE, { force: true });
+  process.env.TELEGRAM_CHAT_ID = '1';
+  const store = scoped(createStore(), '1');
+  const v = (code, from, to, dep, arr, seats) => ({ code, from, to, departsAt: `2026-11-08 ${dep}:00`, arrivesAt: `2026-11-08 ${arr}:00`, departsHHMM: dep, arrivesHHMM: arr, seats, duration: '2h 10m', taxes: 15103.85 });
+  const IDA = v('JA3100', 'BRC', 'AEP', '06:00', '08:10', 2);
+  const VUELTA = v('JA3024', 'AEP', 'COR', '15:00', '16:20', 3);
+  const o0 = newOrder({ chatId: '1', fechaVuelo: '2026-11-08', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }] });
+  await saveOrder(store, o0);
+  const order = await setEstado(store, o0.id, 'confirmado');
+  const antes = JSON.stringify(await getOrder(store, order.id));
+
+  const mk = (prog) => {
+    const calls = { search: 0, quote: 0, initPayment: 0, tokenizeCard: 0, doPurchase: 0, listBookings: 0 };
+    const api = {};
+    for (const k of Object.keys(calls)) api[k] = async (...a) => { calls[k]++; const r = await prog[k]?.(...a); if (r instanceof Error) throw r; return r; };
+    return { api, calls };
+  };
+  const ok = {
+    search: async (_s, t) => (t.from === 'BRC' ? [IDA] : [VUELTA]),
+    quote: async (_s, f) => ({ total: 15103.85, code: f.code }),
+    initPayment: async () => ({ certificateToken: 'C' }),
+  };
+  const correr = async (prog) => {
+    const m = mk(prog); const sleeps = [];
+    const r = await runBuy({ order, store, session: {}, chatId: '1', deadline: Date.now() + 60_000, dryRun: true,
+      sleep: async (ms) => { sleeps.push(ms); }, notify: async () => { throw new Error('el ensayo no avisa'); }, api: m.api });
+    return { r, ...m, sleeps };
+  };
+
+  // Camino feliz: INIT ok, nada pagado, el pedido intacto.
+  {
+    const { r, calls } = await correr(ok);
+    assert.equal(r.estado, 'ensayo');
+    assert.deepEqual(r.itinerario.tramos.map((t) => t.code), ['JA3100', 'JA3024']);
+    assert.deepEqual(r.cotizaciones.map((c) => c.code), ['JA3100', 'JA3024']);
+    assert.equal(r.cotizaciones[0].total, 15103.85);
+    assert.deepEqual(r.init, { ok: true });
+    assert.equal(calls.tokenizeCard, 0, 'no tokeniza la tarjeta');
+    assert.equal(calls.doPurchase, 0, 'no paga');
+    assert.equal(calls.initPayment, 1, 'un solo INIT');
+    assert.equal(JSON.stringify(await getOrder(store, order.id)), antes, 'el pedido no cambia (ni intentos ni pagoEnVuelo)');
+    assert.equal(await store.get(`order-lock:${order.id}`), null, 'no toma el lock');
+  }
+  // Sin cupo: itinerario vacío, no cotiza ni inicia, una sola pasada.
+  {
+    const { r, calls, sleeps } = await correr({ ...ok, search: async () => [] });
+    assert.equal(r.estado, 'ensayo');
+    assert.equal(r.itinerario.tramos.length, 0);
+    assert.equal(calls.quote + calls.initPayment, 0);
+    assert.equal(sleeps.length, 0, 'sin dormir');
+  }
+  // Error de búsqueda / cotización / INIT: se informa el paso.
+  {
+    const a = await correr({ ...ok, search: async () => new Error('timeout') });
+    assert.equal(a.r.paso, 'search'); assert.match(a.r.error, /timeout/);
+    const b = await correr({ ...ok, quote: async () => new Error('500 quote') });
+    assert.equal(b.r.paso, 'quote'); assert.equal(b.calls.initPayment, 0);
+    const c = await correr({ ...ok, initPayment: async () => new Error('spreedly caído') });
+    assert.equal(c.r.paso, 'initPayment'); assert.match(c.r.error, /spreedly/);
+    assert.equal(c.r.cotizaciones.length, 2);
+    for (const x of [a, b, c]) { assert.equal(x.r.estado, 'ensayo'); assert.equal(x.calls.tokenizeCard + x.calls.doPurchase, 0); }
+    assert.equal(JSON.stringify(await getOrder(store, order.id)), antes, 'ni los errores se anotan en el pedido');
+  }
+
+  // Comando: sólo dueño, con AUTO_BUY, id conocido.
+  const dueno = { store, user: { chatId: '1' }, chatId: '1', session: {} };
+  process.env.AUTO_BUY = 'on';
+  const resultado = { estado: 'ensayo', itinerario: { tramos: [IDA, VUELTA] }, cotizaciones: [{ code: 'JA3100', total: 15103.85 }, { code: 'JA3024', total: 16000 }], init: { ok: true } };
+  let visto;
+  const _runBuy = async (args) => { visto = args; return resultado; };
+  const out = await handleCommand(`/ensayo ${order.id}`, { ...dueno, _runBuy });
+  assert.equal(visto.dryRun, true);
+  assert.equal(visto.chatId, '1');
+  assert.equal(visto.order.id, order.id);
+  assert.ok(visto.deadline - Date.now() > 50_000 && visto.deadline - Date.now() <= 60_000, 'deadline a 60 s');
+  assert.match(out, /JA3100/); assert.match(out, /JA3024/); assert.match(out, /INIT de Spreedly OK/);
+  assert.match(out, /15\.103,85/, 'tasas por tramo');
+  const falla = await handleCommand(`/ensayo ${order.id}`, { ...dueno, _runBuy: async () => ({ estado: 'ensayo', paso: 'initPayment', error: 'spreedly caído', itinerario: { tramos: [IDA] }, cotizaciones: [] }) });
+  assert.match(falla, /falló en initPayment: spreedly caído/);
+  assert.match(await handleCommand('/ensayo zzz', { ...dueno, _runBuy }), /Ese pedido no existe/);
+  assert.match(await handleCommand('/ensayo', { ...dueno, _runBuy }), /Ese pedido no existe/);
+  process.env.AUTO_BUY = 'off';
+  assert.match(await handleCommand(`/ensayo ${order.id}`, { ...dueno, _runBuy }), /AUTO_BUY/);
+  process.env.AUTO_BUY = 'on';
+  assert.match(await handleCommand(`/ensayo ${order.id}`, { store: scoped(createStore(), '2'), user: { chatId: '2' }, chatId: '2', session: {}, _runBuy }), /No conozco/, 'para los demás no existe');
+  assert.match(await handleCommand('/ayuda', dueno), /\/ensayo/);
+  assert.ok(NECESITA_SESION.includes('/ensayo'));
+
+  process.env = limpio;
+}
+
 // --- /api/buy: sólo el dueño, sólo con AUTO_BUY, y el radar del dueño se saltea ---
 {
   const { default: buy, ventanaDe } = await import('./api/buy.js');
@@ -1600,7 +1700,7 @@ const memStore = () => {
     '📌 *Pedido* · sábado 07/11 · BRC → AEP (06:00–12:00) · lo busco el viernes 06/11 a las 00:00');
   // Vuelo de mañana: el inventario ya salió a las 00:01 de hoy y lo levantan las pasadas horarias.
   assert.equal(formatPedido({ ...borrador, fechaVuelo: '2026-11-06' }, { hoy: HOY }),
-    '📌 *Pedido* · viernes 06/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco en la próxima pasada (cada hora hasta las 20:00)');
+    '📌 *Pedido* · viernes 06/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco en la próxima pasada (cada hora hasta las 23:00)');
 
   // (c) los botones: confirmar, cancelar, id que no existe, y sólo para el dueño.
   const noDueno = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '2' });
@@ -1666,7 +1766,7 @@ const memStore = () => {
   const manana = await cmdPedido(store, '1', 'mañana a aeroparque', {
     hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, fechaVuelo: '2026-11-06', tramos: [{ from: 'BRC', to: 'AEP', ventana: null }] }),
   });
-  assert.match(manana.text, /lo busco en la próxima pasada \(cada hora hasta las 20:00\)/);
+  assert.match(manana.text, /lo busco en la próxima pasada \(cada hora hasta las 23:00\)/);
   const idManana = manana.buttons[0][0].data.replace(/^ord:ok:/, '');
   assert.equal((await getOrder(store, idManana)).estado, 'borrador');
   const confManana = await handleCallback(`ord:ok:${idManana}`, { store, user: null, chatId: '1', hoy: HOY });

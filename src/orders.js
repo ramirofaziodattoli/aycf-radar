@@ -131,7 +131,7 @@ const sumarDias = (iso, n) => {
 
 /**
  * ¿Lo compra una pasada horaria de hoy? El inventario de mañana ya se liberó a las
- * 00:01 de hoy y las pasadas (cada hora hasta las 20:00 ART) lo levantan; el resto
+ * 00:01 de hoy y las pasadas (cada hora hasta las 23:00 ART) lo levantan; el resto
  * espera a la corrida de las 00:00 del día anterior al vuelo.
  */
 export const esDeMañana = (o, hoy = hoyEnAR()) => o.fechaVuelo === sumarDias(hoy, 1);
@@ -169,7 +169,7 @@ export function formatPedido(o, { hoy = hoyEnAR() } = {}) {
     return `${t.from} → ${t.to}${horario}${escala}`;
   });
   const cuando = esDeMañana(o, hoy)
-    ? 'lo busco en la próxima pasada (cada hora hasta las 20:00)'
+    ? 'lo busco en la próxima pasada (cada hora hasta las 23:00)'
     : `lo busco el ${nocheDeCompra(o)} a las 00:00`;
   return ['📌 *Pedido*', fechaLarga(o.fechaVuelo), ...tramos, cuando].join(' · ');
 }

@@ -10,6 +10,7 @@ import { Session } from './session.js';
 import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, scoped, nombreDe } from './users.js';
 import { haySecreto } from './crypto.js';
 import { cmdPedido, cmdPedidos } from './intake.js';
+import { runBuy } from './buy.js';
 import { getOrder, setEstado, nocheDeCompra, esDeMañana, hoyEnAR } from './orders.js';
 
 const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
@@ -46,6 +47,7 @@ y no existe inventario más allá de eso._`;
 // Solo el dueño del deploy (TELEGRAM_CHAT_ID) lo ve y lo puede usar.
 const AYUDA_ADMIN = `/usuarios — quiénes usan el bot (solo vos)
 /pedidos — mis pedidos de compra automática
+/ensayo <id> — ensayo de compra sin pagar (sólo vos)
 
 También podés contarme qué pasaje necesitás y lo compro solo a las 00:00.`;
 
@@ -508,7 +510,7 @@ export function comandoDe(text, user, { chatId } = {}) {
   return { cmd: '/start', args: [] };
 }
 
-export async function handleCommand(text, { store, session, user, chatId, from }) {
+export async function handleCommand(text, { store, session, user, chatId, from, _runBuy }) {
   const { cmd, args } = comandoDe(text, user, { chatId });
 
   // Un chat sin cuenta conectada igual es un chat: sin el chatId, `usaSemilla`
@@ -516,7 +518,7 @@ export async function handleCommand(text, { store, session, user, chatId, from }
   const perfil = user ?? (chatId ? { chatId: String(chatId) } : null);
 
   try {
-    return await dispatch(cmd, args, { store, session, user: perfil, chatId, from });
+    return await dispatch(cmd, args, { store, session, user: perfil, chatId, from, _runBuy });
   } catch (err) {
     // Un error de tipeo se contesta; los de sesión suben para que el webhook
     // dé la instrucción concreta de reconectar.
@@ -527,10 +529,31 @@ export async function handleCommand(text, { store, session, user, chatId, from }
   }
 }
 
-/** Los que le pegan a JetSmart: sin cuenta conectada no hay nada que consultar. */
-export const NECESITA_SESION = ['/buscar', '/estado', '/pase'];
+const ARS = new Intl.NumberFormat('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-async function dispatch(cmd, args, { store, session, user, chatId, from }) {
+/** `/ensayo <id>`: el flujo de compra completo hasta el INIT de Spreedly, sin pagar. */
+export async function cmdEnsayo(store, session, chatId, args, { _runBuy = runBuy } = {}) {
+  if (process.env.AUTO_BUY !== 'on') return 'La compra automática está apagada (AUTO_BUY).';
+  const order = args[0] ? await getOrder(store, args[0]) : null;
+  if (!order) return 'Ese pedido no existe.';
+  const r = await _runBuy({ order, store, session, chatId, deadline: Date.now() + 60_000, dryRun: true });
+  const lineas = ['🧪 *Ensayo de compra* (no pagué nada)'];
+  const tramos = r.itinerario?.tramos ?? [];
+  if (!tramos.length) lineas.push('Sin cupo para armar el itinerario ahora.');
+  for (const f of tramos) {
+    const q = r.cotizaciones?.find((c) => c.code === f.code);
+    lineas.push(`${f.from} → ${f.to} · ${formatFlight(f)}${q ? ` · tasas cotizadas ARS ${ARS.format(q.total)}` : ''}`);
+  }
+  if (r.itinerario?.faltan?.length) lineas.push(`⚠️ Falta vuelo para: ${r.itinerario.faltan.map((i) => `${order.tramos[i].from} → ${order.tramos[i].to}`).join(', ')}`);
+  if (r.init?.ok) lineas.push('✅ INIT de Spreedly OK');
+  else if (r.paso) lineas.push(`🔴 falló en ${r.paso}: ${r.error}`);
+  return lineas.join('\n');
+}
+
+/** Los que le pegan a JetSmart: sin cuenta conectada no hay nada que consultar. */
+export const NECESITA_SESION = ['/buscar', '/estado', '/pase', '/ensayo'];
+
+async function dispatch(cmd, args, { store, session, user, chatId, from, _runBuy }) {
   const ayuda = esDueno(chatId) ? `${AYUDA}\n${AYUDA_ADMIN}` : AYUDA;
   switch (cmd) {
     case '/start':
@@ -552,6 +575,9 @@ async function dispatch(cmd, args, { store, session, user, chatId, from }) {
     case '/pedidos':
       if (!esDueno(chatId)) break;
       return cmdPedidos(store);
+    case '/ensayo':
+      if (!esDueno(chatId)) break;
+      return cmdEnsayo(store, session, chatId, args, { _runBuy });
     case '/pase':
       return cmdPase(store, chatId, user, args);
     case '/desconectar':

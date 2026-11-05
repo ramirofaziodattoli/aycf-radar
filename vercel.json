@@ -11,6 +11,6 @@
     { "path": "/api/buy", "schedule": "0 3 * * *" },
     { "path": "/api/buy", "schedule": "13 3 * * *" },
     { "path": "/api/buy", "schedule": "30 3 * * *" },
-    { "path": "/api/buy", "schedule": "0 4-23 * * *" }
+    { "path": "/api/buy", "schedule": "0 0-2,4-23 * * *" }
   ]
 }
