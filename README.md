@@ -267,8 +267,11 @@ Si el pago no da una respuesta clara (timeout, 5xx, una página que no se entien
 un redirect a `payment-summary`), el PNR se lee de ese resumen; si no se puede, el aviso dice «PNR en el mail». Cancelar desde el botón o `/pedidos` corta
 el loop aunque esté a punto de pagar.
 
-En esas noches el radar del dueño se saltea (`compra-en-curso`): dos procesos pegándole a Caravelo
-con la misma cuenta se pisan.
+Mientras haya algún pedido confirmado a futuro, el radar del dueño se saltea (`compra-en-curso`): dos
+procesos con la misma cookie de Caravelo se la pisan (`error.token.mismatch`).
+
+Cada pedido guarda sus últimos 40 intentos. Una pasada horaria sin cupo y sin errores no anota nada;
+sí cuentan los errores de búsqueda, los pasos de pago y el resumen de las ventanas de 00:00 y 00:13.
 
 | Env var | Qué es |
 |---|---|

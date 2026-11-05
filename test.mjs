@@ -686,7 +686,7 @@ const memStore = () => {
 // --- pedidos: modelo, store y lock ---
 {
   const { rm } = await import('node:fs/promises');
-  const { newOrder, validateOrder, saveOrder, getOrder, listOrders, setEstado, ordersDueTonight, ordersPendientes, lockOrder, unlockOrder, formatPedido } = await import('./src/orders.js');
+  const { newOrder, validateOrder, saveOrder, getOrder, listOrders, setEstado, ordersPendientes, lockOrder, unlockOrder, formatPedido, MAX_INTENTOS } = await import('./src/orders.js');
   const { createStore } = await import('./src/store.js');
   const { scoped } = await import('./src/users.js');
   const limpio = { ...process.env };
@@ -704,10 +704,10 @@ const memStore = () => {
 
   await saveOrder(store, o);
   assert.equal((await getOrder(store, o.id)).fechaVuelo, '2026-11-08');
-  assert.equal((await ordersDueTonight(store, '2026-11-08')).length, 0, 'un borrador no se compra');
+  assert.equal((await ordersPendientes(store, { desde: '2026-11-08' })).length, 0, 'un borrador no se compra');
   await setEstado(store, o.id, 'confirmado');
-  assert.equal((await ordersDueTonight(store, '2026-11-08')).length, 1);
-  assert.equal((await ordersDueTonight(store, '2026-11-09')).length, 0);
+  assert.equal((await ordersPendientes(store, { desde: '2026-11-08' })).length, 1);
+  assert.equal((await ordersPendientes(store, { desde: '2026-11-09' })).length, 0, 'un vuelo anterior a `desde` no');
   // ordersPendientes: todo lo confirmado desde `desde`, el vuelo más cercano primero.
   const lejos = await saveOrder(store, { ...newOrder({ chatId: '1', fechaVuelo: '2026-11-10', tramos: [{ from: 'AEP', to: 'COR' }] }), estado: 'confirmado' });
   const cerca = await saveOrder(store, { ...newOrder({ chatId: '1', fechaVuelo: '2026-11-07', tramos: [{ from: 'AEP', to: 'COR' }] }), estado: 'confirmado' });
@@ -719,6 +719,11 @@ const memStore = () => {
   for (const x of [lejos, cerca, viejo, borrador]) await setEstado(store, x.id, 'cancelado');
   await setEstado(store, o.id, 'fallido', { intento: { hora: 'x', paso: 'quotation', error: 'boom' } });
   assert.equal((await getOrder(store, o.id)).intentos.length, 1);
+  // Tope de intentos: quedan los últimos 40, los más nuevos.
+  assert.equal(MAX_INTENTOS, 40);
+  for (let k = 0; k < 45; k++) await setEstado(store, o.id, 'fallido', { intento: { hora: String(k), paso: 'search', error: `e${k}` } });
+  const tope = (await getOrder(store, o.id)).intentos;
+  assert.equal(tope.length, 40); assert.equal(tope[0].error, 'e5'); assert.equal(tope.at(-1).error, 'e44');
   assert.equal((await listOrders(store, { estados: ['fallido'] })).length, 1);
 
   assert.equal(await lockOrder(store, o.id, 60), true);
@@ -1479,20 +1484,26 @@ const memStore = () => {
     assert.equal(x.r.estado, 'dudoso'); assert.equal(x.calls.doPurchase.length, 1);
   }
 
-  // I3) Fuera del cierre, sin cupo: sigue confirmado, intentos persistidos y callado en la pasada horaria.
+  // I3) Fuera del cierre, sin cupo: sigue confirmado y callado en la pasada horaria.
   {
     const order = await pedido();
     const { r, msgs, calls } = await correr(order, { search: [] });
     assert.equal(r.estado, 'confirmado'); assert.equal(calls.doPurchase.length, 0);
     assert.equal(msgs.length, 0, 'la pasada horaria no avisa si no compró');
     const g = await getOrder(store, order.id);
-    assert.equal(g.estado, 'confirmado'); assert.ok(g.intentos.length > 0, 'los intentos quedan persistidos');
-    assert.match(g.intentos.at(-1).error, /sin cupo hasta las 00:15/);
-    // 00:00 / 00:13: avisa y sigue confirmado.
+    assert.equal(g.estado, 'confirmado');
+    assert.deepEqual(g.intentos, [], 'una pasada horaria limpia sin cupo no anota nada');
+    // Con un error de search en la pasada: se anota el error y el resumen de fin de ventana.
+    const oErr = await pedido();
+    await correr(oErr, { search: (_, n) => (n === 1 ? new Error('timeout') : []) });
+    assert.deepEqual((await getOrder(store, oErr.id)).intentos.map((x) => x.paso), ['search', 'search']);
+    assert.match((await getOrder(store, oErr.id)).intentos.at(-1).error, /sin cupo hasta las 00:15/);
+    // 00:00 / 00:13: avisa, anota el resumen y sigue confirmado.
     const o2 = await pedido();
     const x = await correr(o2, { search: [] }, { avisarSinCupo: true });
     assert.equal(x.r.estado, 'confirmado');
     assert.equal(x.msgs.length, 1); assert.equal(x.msgs[0].text, '⏳ Sin cupo hasta las 00:15, sigo intentando en los rescates.');
+    assert.match((await getOrder(store, o2.id)).intentos.at(-1).error, /sin cupo hasta las 00:15/);
   }
   // I3) Un tramo comprado y el otro nunca aparece: confirmado con resultado hasta el cierre; ahí parcial, sin recomprar.
   {
@@ -1855,8 +1866,18 @@ const memStore = () => {
   const dueno = out.find((o) => String(o.chatId) === '1');
   assert.equal(dueno.skipped, 'compra-en-curso');
   assert.ok(out.find((o) => String(o.chatId) === '7' && o.skipped !== 'compra-en-curso'), 'Ana sigue con su barrido');
-  // Sin pedidos para esta noche (inyectado) o con AUTO_BUY apagado, el dueño barre como siempre.
-  const sinPedidos = await runAllRadars({ date: tomorrowInAR(), _dueTonight: async () => [] });
+  // Con sólo un pedido para pasado mañana también se saltea: /api/buy lo intenta en cada pasada
+  // con la misma cookie (dos procesos = error.token.mismatch).
+  const enDosDias = new Date(Date.parse(tomorrowInAR()) + 2 * 86_400_000).toISOString().slice(0, 10);
+  const { listOrders, setEstado: setEstadoD } = await import('./src/orders.js');
+  for (const x of await listOrders(duenoStore, { estados: ['confirmado'] })) {
+    if (x.fechaVuelo !== enDosDias) await setEstadoD(duenoStore, x.id, 'cancelado');
+  }
+  assert.ok((await listOrders(duenoStore, { estados: ['confirmado'] })).length >= 1, 'queda el de pasado mañana');
+  const soloLejano = await runAllRadars({ date: tomorrowInAR() });
+  assert.equal(soloLejano.find((o) => String(o.chatId) === '1').skipped, 'compra-en-curso', 'un pedido lejano también saltea al dueño');
+  // Sin pedidos pendientes (inyectado) o con AUTO_BUY apagado, el dueño barre como siempre.
+  const sinPedidos = await runAllRadars({ date: tomorrowInAR(), _pendientes: async () => [] });
   assert.notEqual(sinPedidos.find((o) => String(o.chatId) === '1').skipped, 'compra-en-curso');
   process.env.AUTO_BUY = 'off';
   const apagado = await runAllRadars({ date: tomorrowInAR() });

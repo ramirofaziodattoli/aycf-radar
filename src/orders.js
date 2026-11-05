@@ -13,6 +13,7 @@ const rowKey = (id) => `order:${id}`;
 const lockKey = (id) => `order-lock:${id}`;
 const cancelKey = (id) => `order-cancel:${id}`;
 const TTL_CANCEL = 48 * 3600;
+export const MAX_INTENTOS = 40;
 const IATA = /^[A-Z]{3}$/;
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -88,7 +89,8 @@ export async function setEstado(store, id, estado, extra = {}) {
   if (!ESTADOS.includes(estado)) throw new Error(`estado desconocido: ${estado}`);
   // La identidad del pedido no se toca por la ventana de `extra`.
   const { intento, id: _id, chatId: _chatId, fechaVuelo: _fecha, ...resto } = extra;
-  const next = { ...o, ...resto, estado, intentos: intento ? [...o.intentos, intento] : o.intentos };
+  // Un pedido confirmado días antes pasa por muchas pasadas: quedan los últimos MAX_INTENTOS.
+  const next = { ...o, ...resto, estado, intentos: intento ? [...o.intentos, intento].slice(-MAX_INTENTOS) : o.intentos };
   await saveOrder(store, next);
   return next;
 }
@@ -106,14 +108,6 @@ export async function cancelOrder(store, id) {
 
 /** ¿El usuario canceló este pedido? Lee sólo la clave aparte (ver `cancelOrder`). */
 export const fueCancelado = async (store, id) => Boolean(await store.get(cancelKey(id)));
-
-/**
- * Los confirmados para el vuelo de `date`. Lo usan el salteo del radar del dueño
- * (noche de compra) y nada más: la compra mira `ordersPendientes`.
- */
-export async function ordersDueTonight(store, date = tomorrowInAR()) {
-  return (await listOrders(store, { estados: ['confirmado'] })).filter((o) => o.fechaVuelo === date);
-}
 
 /**
  * Todo lo confirmado con vuelo desde `desde` (mañana por defecto), el más cercano

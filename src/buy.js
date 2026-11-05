@@ -434,7 +434,11 @@ export async function runBuy({
     if (!final && !cierre) {
       // Se terminó la ventana sin cupo (o sin todo el cupo): el pedido sigue
       // `confirmado` para los rescates, con lo comprado y los intentos persistidos.
-      anotar('search', `sin cupo hasta las ${horaAR(deadline)}`);
+      // El resumen de fin de ventana se anota en las ventanas que avisan (00:00 y
+      // 00:13) o si la pasada tuvo algo que contar (errores, pasos de pago): una
+      // pasada horaria limpia sin cupo no deja rastro, si no un pedido confirmado
+      // días antes junta una entrada por hora.
+      if (avisarSinCupo || nuevos.length) anotar('search', `sin cupo hasta las ${horaAR(deadline)}`);
       const resultado = armarResultado();
       const guardado = await guardar(comprados.size ? { resultado } : {});
       const partes = [];
