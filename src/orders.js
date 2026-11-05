@@ -11,6 +11,8 @@ const IDX = 'orders';
 const TTL_PEDIDO = 30 * 24 * 3600;
 const rowKey = (id) => `order:${id}`;
 const lockKey = (id) => `order-lock:${id}`;
+const cancelKey = (id) => `order-cancel:${id}`;
+const TTL_CANCEL = 48 * 3600;
 const IATA = /^[A-Z]{3}$/;
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -90,6 +92,20 @@ export async function setEstado(store, id, estado, extra = {}) {
   await saveOrder(store, next);
   return next;
 }
+
+/**
+ * Cancela un pedido por dos caminos. `setEstado` es leer-mezclar-escribir: si el
+ * loop de compra está escribiendo su marcador de pago justo en ese momento, puede
+ * pisar el `cancelado`. Por eso además va una clave aparte, un `set` plano que
+ * nadie más escribe, y el loop la mira justo antes de pagar.
+ */
+export async function cancelOrder(store, id) {
+  await store.set(cancelKey(id), new Date().toISOString(), TTL_CANCEL);
+  return setEstado(store, id, 'cancelado');
+}
+
+/** ¿El usuario canceló este pedido? Lee sólo la clave aparte (ver `cancelOrder`). */
+export const fueCancelado = async (store, id) => Boolean(await store.get(cancelKey(id)));
 
 /** Los que hay que comprar esta noche: confirmados y para el vuelo de `date`. */
 export async function ordersDueTonight(store, date = tomorrowInAR()) {

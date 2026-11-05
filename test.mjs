@@ -810,6 +810,12 @@ const memStore = () => {
   assert.deepEqual(JSON.parse(calls.at(-1).body), { type: 'INIT', paymentGateway: 'spreedly' });
 
   const card = { number: '4111111111111111', month: '12', year: '2030', cvv: '123', holder: 'RAMIRO FAZIO' };
+  // Minor final: el error de tokenización no copia el body de Spreedly (trae first_six/last_four/full_name).
+  const malo = { transaction: { payment_method: { first_six: '411111', last_four: '1111', full_name: 'RAMIRO FAZIO', errors: [{ attribute: 'cvv', key: 'errors.invalid', message: 'is invalid' }] } } };
+  const errTok = await tokenizeCard(card, init, { _fetch: f(json(malo, 422)) }).catch((e) => e);
+  assert.equal(errTok.message, 'tokenización: Spreedly respondió 422 (errors.invalid)');
+  assert.ok(!/411111|1111|RAMIRO/.test(errTok.message));
+  assert.equal((await tokenizeCard(card, init, { _fetch: f(json({ first_six: '411111' }, 500)) }).catch((e) => e)).message, 'tokenización: Spreedly respondió 500');
   const tok = await tokenizeCard(card, init, { _fetch: f(json({ transaction: { payment_method: { token: 'TOK' } } })) });
   assert.equal(tok, 'TOK');
   assert.match(calls.at(-1).url, /core\.spreedly\.com\/v1\/payment_methods\.json$/);
@@ -850,6 +856,17 @@ const memStore = () => {
   assert.equal((await buy(R(200, { success: false }))).motivo, 'desconocido', '2xx sin señal positiva no es éxito');
   assert.equal((await buy(R(200, '<p>No hay asientos disponibles</p>'))).motivo, 'desconocido', '2xx nunca es sin-cupo');
   assert.equal((await buy(R(409, '<p>No hay asientos disponibles</p>'))).motivo, 'sin-cupo');
+  // C1 final: un 5xx nunca es sin cupo (habilitaría pagar otro vuelo).
+  assert.equal((await buy(R(503, '<h1>Service Unavailable</h1>'))).motivo, 'desconocido', '503 no es sin-cupo');
+  assert.equal((await buy(R(502, 'The server is temporarily unavailable'))).motivo, 'desconocido', '502 no es sin-cupo');
+  assert.equal((await buy(R(503, { exceptionMessage: 'flight.no.seats' }))).motivo, 'desconocido', 'ni con código: 5xx es desconocido');
+  assert.equal((await buy(R(500, '<p>payment declined</p>'))).motivo, 'desconocido', '5xx tampoco es rechazada');
+  assert.equal((await buy(R(409, { exceptionMessage: 'flight.no.seats' }))).motivo, 'sin-cupo', 'código explícito en 4xx');
+  assert.equal((await buy(R(409, { exceptionMessage: 'Seat map temporarily unavailable, retry' }))).motivo, 'desconocido', 'prosa no es código');
+  assert.equal((await buy(R(400, '<p>Service unavailable</p>'))).motivo, 'desconocido', 'sin `availab` suelto');
+  // I6 final: una fila sin fecha legible no prueba la reserva.
+  assert.equal(hayReserva([{ pnr: 'ABC123', flightCode: 'JA3021' }], { code: 'JA3021', departsAt: '2026-11-06 22:04:00' }), false);
+  assert.equal(hayReserva([{ pnr: 'ABC123', flightCode: 'JA3021', date: 'mañana' }], { code: 'JA3021', departsAt: '2026-11-06 22:04:00' }), false);
   const conScript = await buy(R(200, '<script>var e="payment declined"</script><h1>Compra confirmada</h1> PNR ABC123'));
   assert.equal(conScript.ok, true); assert.equal(conScript.pnr, 'ABC123');
   assert.equal((await buy(R(200, '<p>Vuelo JA3021 confirmado. PNR ABC123</p>'))).pnr, 'ABC123');
@@ -976,13 +993,13 @@ const memStore = () => {
     sinTarjeta([msgs, r]);
   }
 
-  // 2) Sólo el primer tramo tiene cupo: compra ese y queda parcial, sin perseguir el otro.
+  // 2) En el cierre, sólo el primer tramo tiene cupo: compra ese y queda parcial, sin perseguir el otro.
   {
     const order = await pedido();
     const { r, msgs, calls, sleeps } = await correr(order, {
       search: ([, tramo]) => (tramo.from === 'BRC' ? [IDA] : []),
       doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
-    });
+    }, { cierre: true });
     assert.equal(r.estado, 'parcial');
     assert.deepEqual(r.resultado.faltan, [1]);
     assert.deepEqual(r.resultado.tramos.map((x) => x.code), ['JA3100']);
@@ -1031,10 +1048,10 @@ const memStore = () => {
     assert.match(msgs[0].text, /No pude comprar/); assert.match(msgs[0].text, /133\.324/); assert.match(msgs[0].text, /40\.000/);
   }
 
-  // 6) Nunca hay cupo: a las 00:15 se rinde con un solo mensaje.
+  // 6) Nunca hay cupo y es el cierre (23:00 del día anterior): se rinde con un solo mensaje.
   {
     const order = await pedido();
-    const { r, msgs, sleeps, calls } = await correr(order, { search: [] });
+    const { r, msgs, sleeps, calls } = await correr(order, { search: [] }, { cierre: true });
     assert.equal(r.estado, 'fallido'); assert.equal(r.motivo, 'sin-cupo');
     assert.ok(r.intentos.length > 0);
     assert.equal(msgs.length, 1); assert.match(msgs[0].text, /No pude comprar/);
@@ -1052,28 +1069,29 @@ const memStore = () => {
     assert.equal(calls.search.length, 0); assert.equal(msgs.length, 0);
   }
 
-  // 8) Resultado desconocido y sin reserva: un solo reintento, con verificación en el medio.
+  // 8) Con AYCF_BOOKINGS_CALIBRADO: desconocido y sin reserva: un solo reintento, con 15 s y verificación en el medio.
   {
     const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
     const orden = [];
-    const { r, calls } = await correr(order, {
+    const { r, calls, sleeps } = await correr(order, {
       search: [SLA],
       doPurchase: (_, n) => { orden.push('pay'); return n === 1 ? { ok: false, motivo: 'desconocido', raw: '' } : { ok: true, pnr: 'ABC123', raw: '' }; },
       listBookings: () => { orden.push('check'); return []; },
-    });
+    }, { bookingsCalibrado: true });
     assert.equal(r.estado, 'comprado');
+    assert.deepEqual(sleeps, [15000], 'con el flag, 15 s antes de mirar las reservas');
     assert.deepEqual(orden, ['pay', 'check', 'pay'], 'entre dos pagos siempre hay una verificación');
     assert.equal(calls.doPurchase.length, 2);
     assert.equal(calls.tokenizeCard.length, 2, 'el token de Spreedly es de un solo uso: el reintento tokeniza de nuevo');
     assert.equal(calls.initPayment.length, 2);
   }
 
-  // 9) Dos desconocidos seguidos: no hay tercer pago, queda dudoso.
+  // 9) Con el flag: dos desconocidos seguidos: no hay tercer pago, queda dudoso.
   {
     const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
     const { r, calls } = await correr(order, {
       search: [SLA], doPurchase: { ok: false, motivo: 'desconocido', raw: '' }, listBookings: [],
-    });
+    }, { bookingsCalibrado: true });
     assert.equal(r.estado, 'dudoso');
     assert.equal(calls.doPurchase.length, 2);
     assert.equal(calls.listBookings.length, 2);
@@ -1215,7 +1233,7 @@ const memStore = () => {
       search: (_, n) => (n === 1 ? [SLA] : [otro]),
       doPurchase: (_, n) => (n === 1 ? { ok: false, motivo: 'desconocido', raw: '' } : { ok: false, motivo: 'sin-cupo', raw: '' }),
       listBookings: [],
-    });
+    }, { bookingsCalibrado: true });
     assert.equal(r.estado, 'dudoso');
     assert.equal(calls.doPurchase.length, 2); assert.equal(calls.search.length, 1, 'no hay tercer search-y-pago');
   }
@@ -1227,7 +1245,7 @@ const memStore = () => {
       search: [SLA],
       doPurchase: (_, n) => (n === 1 ? new Error('timeout') : { ok: false, motivo: 'rechazada', raw: '' }),
       listBookings: [],
-    });
+    }, { bookingsCalibrado: true });
     assert.equal(r.estado, 'dudoso');
     assert.equal(calls.listBookings.length, 2, 'el resultado del reintento también se verifica');
     assert.equal(calls.tokenizeCard.length, 2);
@@ -1238,7 +1256,7 @@ const memStore = () => {
       search: [SLA],
       doPurchase: (_, n) => (n === 1 ? new Error('timeout') : { ok: false, motivo: '3ds', raw: '' }),
       listBookings: (_, n) => (n === 1 ? [] : RESERVA),
-    });
+    }, { bookingsCalibrado: true });
     assert.equal(r.estado, 'comprado', 'si el reintento dice 3ds pero la reserva está, se compró');
   }
 
@@ -1331,7 +1349,7 @@ const memStore = () => {
       doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
     }));
     assert.equal(calls.doPurchase.length, 0); assert.equal(calls.quote.length, 0);
-    assert.equal(r.estado, 'fallido'); assert.equal(r.motivo, 'sin-cupo');
+    assert.equal(r.estado, 'confirmado', 'fuera del cierre, sin cupo sigue confirmado para los rescates');
   }
 
   // Un reintento (paso previo que falló) que termina después del cierre en un tramo no ambiguo: no paga.
@@ -1341,7 +1359,7 @@ const memStore = () => {
       search: [SLA],
       quote: ([, f], n) => { if (n === 1) { reloj.t = DEADLINE + 1000; return new Error('timeout'); } return { total: 15103.85, breakdown: [], code: f.code }; },
       doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
-    }));
+    }), { cierre: true });
     assert.equal(calls.quote.length, 2); assert.equal(calls.doPurchase.length, 0);
     assert.equal(r.estado, 'fallido'); assert.equal(r.motivo, 'sin-cupo');
   }
@@ -1353,7 +1371,7 @@ const memStore = () => {
       search: [SLA],
       doPurchase: { ok: false, motivo: 'desconocido', raw: '' },
       listBookings: () => { reloj.t = DEADLINE + 1000; return []; },
-    }));
+    }), { bookingsCalibrado: true });
     assert.equal(calls.doPurchase.length, 1); assert.equal(calls.listBookings.length, 1);
     assert.equal(r.estado, 'dudoso');
   }
@@ -1368,6 +1386,95 @@ const memStore = () => {
     assert.equal(calls.doPurchase.length, 0); assert.equal(r.estado, 'fallido');
     assert.equal(msgs.length, 1);
     assert.match(msgs[0].text, /ya no está confirmado \(estado fallido\), no compré nada más/);
+  }
+
+  // --- revisión final ---
+  const { cancelOrder } = await import('./src/orders.js');
+
+  // C2) Flag apagado (default): desconocido ⇒ dudoso, un solo pago, una mirada a las reservas, sin espera.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls, sleeps, msgs } = await correr(order, {
+      search: [SLA], doPurchase: { ok: false, motivo: 'desconocido', raw: '' }, listBookings: [],
+    });
+    assert.equal(r.estado, 'dudoso');
+    assert.equal(calls.doPurchase.length, 1, 'sin el parser calibrado no hay reintento');
+    assert.equal(calls.listBookings.length, 1, 'se mira una vez: si la reserva estuviera, contaría como comprado');
+    assert.equal(calls.search.length, 1); assert.deepEqual(sleeps, []);
+    assert.match(msgs[0].text, /No sé si compré/);
+    // Un throw de doPurchase, igual.
+    const o2 = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const x = await correr(o2, { search: [SLA], doPurchase: new Error('socket hang up'), listBookings: [] });
+    assert.equal(x.r.estado, 'dudoso'); assert.equal(x.calls.doPurchase.length, 1);
+  }
+
+  // I3) Fuera del cierre, sin cupo: sigue confirmado, intentos persistidos y callado en la pasada horaria.
+  {
+    const order = await pedido();
+    const { r, msgs, calls } = await correr(order, { search: [] });
+    assert.equal(r.estado, 'confirmado'); assert.equal(calls.doPurchase.length, 0);
+    assert.equal(msgs.length, 0, 'la pasada horaria no avisa si no compró');
+    const g = await getOrder(store, order.id);
+    assert.equal(g.estado, 'confirmado'); assert.ok(g.intentos.length > 0, 'los intentos quedan persistidos');
+    assert.match(g.intentos.at(-1).error, /sin cupo hasta las 00:15/);
+    // 00:00 / 00:13: avisa y sigue confirmado.
+    const o2 = await pedido();
+    const x = await correr(o2, { search: [] }, { avisarSinCupo: true });
+    assert.equal(x.r.estado, 'confirmado');
+    assert.equal(x.msgs.length, 1); assert.equal(x.msgs[0].text, '⏳ Sin cupo hasta las 00:15, sigo intentando en los rescates.');
+  }
+  // I3) Un tramo comprado y el otro nunca aparece: confirmado con resultado hasta el cierre; ahí parcial, sin recomprar.
+  {
+    const order = await pedido();
+    const a = await correr(order, {
+      search: ([, t]) => (t.from === 'BRC' ? [IDA] : []), doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    });
+    assert.equal(a.r.estado, 'confirmado');
+    assert.ok(a.sleeps.length > 0, 'antes del cierre el tramo que falta se sigue buscando');
+    assert.deepEqual((await getOrder(store, order.id)).resultado.tramos.map((t) => t.code), ['JA3100']);
+    assert.equal(a.msgs.length, 1, 'compró algo: avisa aunque sea pasada horaria');
+    assert.match(a.msgs[0].text, /ABC123/); assert.match(a.msgs[0].text, /sigo intentando/);
+    const b = await correr(await getOrder(store, order.id), {
+      search: ([, t]) => (t.from === 'BRC' ? [IDA] : []), doPurchase: { ok: true, pnr: 'OTRO99', raw: '' },
+    }, { cierre: true });
+    assert.equal(b.r.estado, 'parcial'); assert.deepEqual(b.r.resultado.faltan, [1]);
+    assert.equal(b.calls.doPurchase.length, 0, 'lo ya comprado no se recompra');
+    assert.deepEqual(b.calls.search.map(([, t]) => t.from), ['AEP'], 'sólo busca lo que falta');
+  }
+
+  // I5) La clave de cancelación aparece entre la cotización y el pago: cero pagos y queda cancelado.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls, msgs } = await correr(order, {
+      search: [SLA],
+      // Sólo la clave (el `cancelado` del estado lo pudo pisar el marcador): igual frena.
+      quote: async ([, f]) => { await store.set(`order-cancel:${order.id}`, new Date().toISOString(), 60); return { total: 15103.85, breakdown: [], code: f.code }; },
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    });
+    assert.equal(calls.doPurchase.length, 0);
+    assert.equal(r.estado, 'cancelado'); assert.equal((await getOrder(store, order.id)).estado, 'cancelado');
+    assert.match(msgs[0].text, /⏹️ Pedido cancelado, no compré nada más/);
+  }
+  {
+    // El cancel entra mientras se escribe el marcador del pago (y el marcador lo pisa).
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { store: espia } = espiar();
+    const gancho = { ...espia, set: async (k, val, ttl) => {
+      await espia.set(k, val, ttl);
+      if (k === `order:${order.id}` && val?.pagoEnVuelo) await cancelOrder(store, order.id).then(() => store.set(k, val, ttl));
+    } };
+    const { r, calls } = await correr(order, { search: [SLA], doPurchase: { ok: true, pnr: 'ABC123', raw: '' } }, { store: gancho });
+    assert.equal(calls.doPurchase.length, 0, 'la clave aparte se mira justo antes de pagar');
+    const g = await getOrder(store, order.id);
+    assert.equal(r.estado, 'cancelado'); assert.equal(g.estado, 'cancelado'); assert.equal(g.pagoEnVuelo ?? null, null);
+  }
+
+  // I6) Recuperación de un pago en vuelo con reservas todas sin fecha: no se sabe ⇒ dudoso.
+  {
+    const order = await conPagoEnVuelo();
+    const { r, calls } = await correr(order, { search: [SLA], listBookings: [{ pnr: 'ABC123', flightCode: 'JA3021' }] });
+    assert.equal(r.estado, 'dudoso'); assert.equal(calls.doPurchase.length, 0);
+    assert.match(r.intentos.at(-1).error, /sin fecha legible/);
   }
   process.env = limpio;
 }
@@ -1498,10 +1605,13 @@ const memStore = () => {
 
   // Ventanas: el reparto de los 20 min en dos invocaciones de ≤ 800 s.
   const art = (hh, mm, ss = 0) => new Date(Date.UTC(2026, 10, 6, hh + 3, mm, ss));
-  assert.deepEqual(ventanaDe(art(0, 0, 5)), { deadline: Date.UTC(2026, 10, 6, 3, 12), esperarLockMs: 0 });
-  assert.deepEqual(ventanaDe(art(0, 13, 2)), { deadline: Date.UTC(2026, 10, 6, 3, 20), esperarLockMs: 360_000 });
+  assert.deepEqual(ventanaDe(art(0, 0, 5)), { deadline: Date.UTC(2026, 10, 6, 3, 12), esperarLockMs: 0, avisarSinCupo: true, cierre: false });
+  assert.deepEqual(ventanaDe(art(0, 13, 2)), { deadline: Date.UTC(2026, 10, 6, 3, 20), esperarLockMs: 360_000, avisarSinCupo: true, cierre: false });
   const corta = ventanaDe(art(14, 0));
   assert.equal(corta.deadline, art(14, 0).getTime() + 60_000); assert.equal(corta.esperarLockMs, 0);
+  assert.equal(corta.avisarSinCupo, false, 'las pasadas horarias callan'); assert.equal(corta.cierre, false);
+  assert.equal(ventanaDe(art(0, 30)).cierre, false);
+  assert.equal(ventanaDe(art(23, 0)).cierre, true, 'la de las 23:00 cierra'); assert.equal(ventanaDe(art(23, 0)).avisarSinCupo, false);
 
   // (a) sin el secreto correcto: 401.
   process.env.CRON_SECRET = 's3';
@@ -1514,9 +1624,22 @@ const memStore = () => {
   assert.equal(r0.code, 200); assert.deepEqual(r0.body, { ok: true, skipped: 'auto-buy-off' });
   assert.equal(msgs.length, 0);
 
-  // Prendido y sin pedidos: nada que avisar aunque falte la tarjeta.
+  // I7 final: prendido sin CRON_SECRET, falla cerrado (500) y una línea al log.
   process.env.AUTO_BUY = 'on';
-  assert.deepEqual((await buy({ headers: {}, query: {} }, res())).body, { ok: true, orders: [] });
+  {
+    const errores = []; const origErr = console.error;
+    console.error = (...a) => errores.push(a.join(' '));
+    const r = await buy({ headers: {}, query: {} }, res(), { _runBuy: async () => { throw new Error('no debería correr'); } });
+    console.error = origErr;
+    assert.equal(r.code, 500); assert.deepEqual(r.body, { ok: false, error: 'CRON_SECRET requerido' });
+    assert.equal(errores.length, 1); assert.match(errores[0], /CRON_SECRET/);
+  }
+  // De acá en adelante, con el secreto como lo manda Vercel.
+  process.env.CRON_SECRET = 's3';
+  const AUTH = { authorization: 'Bearer s3' };
+
+  // Prendido y sin pedidos: nada que avisar aunque falte la tarjeta.
+  assert.deepEqual((await buy({ headers: AUTH, query: {} }, res())).body, { ok: true, orders: [] });
   assert.equal(msgs.length, 0);
 
   // (c) con un pedido para mañana y sin tarjeta: aviso al dueño y nada más.
@@ -1524,11 +1647,11 @@ const memStore = () => {
   const duenoStore = scoped(base, '1');
   const pedido = newOrder({ chatId: '1', fechaVuelo: tomorrowInAR(), tramos: [{ from: 'BRC', to: 'AEP' }] });
   await saveOrder(duenoStore, { ...pedido, estado: 'confirmado' });
-  const r1 = await buy({ headers: {}, query: {} }, res());
+  const r1 = await buy({ headers: AUTH, query: {} }, res());
   assert.deepEqual(r1.body, { ok: true, skipped: 'sin-tarjeta' });
   assert.equal(msgs.length, 1); assert.match(msgs[0].text, /AYCF_CARD/);
   process.env.AYCF_CARD = '{esto no es json 4111111111111111';
-  const r2 = await buy({ headers: {}, query: {} }, res());
+  const r2 = await buy({ headers: AUTH, query: {} }, res());
   assert.equal(r2.body.skipped, 'sin-tarjeta', 'JSON roto = tarjeta no cargada');
   assert.ok(!JSON.stringify(r2.body).includes('4111'), 'la tarjeta no se devuelve');
   msgs.length = 0;
@@ -1545,7 +1668,7 @@ const memStore = () => {
     const llamadas = [];
     const ok = async (a) => { llamadas.push(a); return { estado: 'comprado' }; };
 
-    const r1 = await buy({ headers: {}, query: {} }, res(), { _runBuy: ok, _withSession: sesion });
+    const r1 = await buy({ headers: AUTH, query: {} }, res(), { _runBuy: ok, _withSession: sesion });
     assert.equal(r1.code, 200);
     assert.deepEqual(llamadas.map((a) => a.order.id).sort(), [pedido.id, o2.id].sort());
     assert.deepEqual(r1.body.orders.map((o) => o.id), llamadas.map((a) => a.order.id), 'en el orden en que se procesaron');
@@ -1557,24 +1680,40 @@ const memStore = () => {
     llamadas.length = 0;
     let n = 0;
     const rompe = async (a) => { llamadas.push(a); if (++n === 1) throw new Error(`boom ${CARD.number}`); return { estado: 'comprado' }; };
-    const r2 = await buy({ headers: {}, query: {} }, res(), { _runBuy: rompe, _withSession: sesion });
+    const r2 = await buy({ headers: AUTH, query: {} }, res(), { _runBuy: rompe, _withSession: sesion });
     assert.equal(r2.code, 200); assert.equal(llamadas.length, 2, 'el segundo corre igual');
     assert.deepEqual(r2.body.orders[0], { id: llamadas[0].order.id, error: 'interno' });
     assert.equal(r2.body.orders[1].estado, 'comprado');
 
-    const r3 = await buy({ headers: {}, query: {} }, res(), { _runBuy: async () => { throw new Error('x'); }, _withSession: sesion });
+    const r3 = await buy({ headers: AUTH, query: {} }, res(), { _runBuy: async () => { throw new Error('x'); }, _withSession: sesion });
     assert.equal(r3.code, 500); assert.equal(r3.body.orders.length, 2);
 
     llamadas.length = 0;
-    const r4 = await buy({ headers: {}, query: { order: [fallido.id, 'otro'] } }, res(), { _runBuy: ok, _withSession: sesion });
-    assert.equal(llamadas.length, 1); assert.equal(llamadas[0].order.id, fallido.id, '?order fuerza uno en cualquier estado');
+    const r4 = await buy({ headers: AUTH, query: { order: [fallido.id, 'otro'] } }, res(), { _runBuy: ok, _withSession: sesion });
+    assert.equal(llamadas.length, 1); assert.equal(llamadas[0].order.id, fallido.id, '?order le pasa el pedido a runBuy');
     assert.deepEqual(r4.body.orders, [{ id: fallido.id, estado: 'comprado' }]);
+    assert.equal(llamadas[0].bookingsCalibrado, false, 'sin AYCF_BOOKINGS_CALIBRADO, apagado');
+    assert.equal(typeof llamadas[0].avisarSinCupo, 'boolean'); assert.equal(typeof llamadas[0].cierre, 'boolean');
+    // I4 final: ?order no fuerza nada; con el runBuy real, un pedido fallido vuelve tal cual (sin red).
+    const r6 = await buy({ headers: AUTH, query: { order: fallido.id } }, res(), { _withSession: sesion });
+    assert.deepEqual(r6.body.orders, [{ id: fallido.id, estado: 'fallido' }]);
+    // A las 23:00 ART el cierre va sólo para el vuelo de mañana; el flag sale del env.
+    llamadas.length = 0;
+    process.env.AYCF_BOOKINGS_CALIBRADO = 'on';
+    const a23 = new Date(Date.now() - ((Date.now() - 3 * 3600_000) % 86_400_000) + 23 * 3600_000 + 120_000);
+    await buy({ headers: AUTH, query: {} }, res(), { _runBuy: ok, _withSession: sesion, now: a23 });
+    delete process.env.AYCF_BOOKINGS_CALIBRADO;
+    assert.ok(llamadas.some((a) => a.cierre), 'el pedido de mañana va con cierre');
+    for (const a of llamadas) {
+      assert.equal(a.bookingsCalibrado, true);
+      assert.equal(a.cierre, a.order.fechaVuelo === tomorrowInAR(a23));
+    }
 
     // Sin cuenta del dueño y con AUTO_BUY on: aviso al chat del dueño.
     msgs.length = 0;
     const { AYCF_EMAIL, AYCF_PASS_ID } = process.env;
     delete process.env.AYCF_EMAIL; delete process.env.AYCF_PASS_ID;
-    const r5 = await buy({ headers: {}, query: {} }, res());
+    const r5 = await buy({ headers: AUTH, query: {} }, res());
     assert.equal(r5.body.skipped, 'sin-dueno'); assert.equal(msgs.length, 1);
     process.env.AYCF_EMAIL = AYCF_EMAIL; process.env.AYCF_PASS_ID = AYCF_PASS_ID;
     delete process.env.AYCF_CARD;
@@ -1603,7 +1742,7 @@ const memStore = () => {
   try {
     const noche = newOrder({ chatId: '1', fechaVuelo: '2026-11-07', tramos: [{ from: 'BRC', to: 'AEP' }] });
     await saveOrder(duenoStore, { ...noche, estado: 'confirmado' });
-    await recordatorio({ headers: {} }, res());
+    await recordatorio({ headers: AUTH }, res());
   } finally { Date.now = real; }
   const rec = msgs.filter((m) => /Lo compro solo a las 00:00/.test(m.text));
   assert.equal(rec.length, 1, 'sólo el pedido de esta noche');
@@ -1668,7 +1807,7 @@ const memStore = () => {
   assert.equal(visto.init.headers['content-type'], 'application/json');
   assert.ok(visto.init.signal, 'con timeout');
   assert.equal(visto.body.model, 'claude-opus-5-5');
-  assert.equal(visto.body.max_tokens, 1024);
+  assert.equal(visto.body.max_tokens, 8000, 'con Opus 5.5 el pensamiento cuenta dentro de max_tokens');
   assert.equal(visto.body.output_config.effort, 'low');
   assert.equal(visto.body.output_config.format.type, 'json_schema');
   assert.deepEqual(visto.body.output_config.format.schema, ORDER_SCHEMA);
@@ -1712,6 +1851,7 @@ const memStore = () => {
   const canc = await handleCallback(`ord:no:${id}`, { store, user: null, chatId: '1' });
   assert.equal((await getOrder(store, id)).estado, 'cancelado');
   assert.equal(canc.text, '❌ Pedido cancelado.');
+  assert.ok(await store.get(`order-cancel:${id}`), 'I5: el cancel también escribe la clave aparte que mira el loop');
   const revive = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '1' });
   assert.equal((await getOrder(store, id)).estado, 'cancelado', 'un botón viejo no resucita un cancelado');
   assert.ok(!/Listo/.test(revive.text));

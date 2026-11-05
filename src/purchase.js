@@ -6,7 +6,10 @@
 // token. Cada función recibe `{ _fetch }` al final para poder testear sin red.
 //
 // Regla de logs: jamás un body (lleva tarjeta o datos de la cuenta). Si algo
-// falla se loguea `status` + los primeros 120 chars de la RESPUESTA.
+// falla en Caravelo se loguea `status` + los primeros 120 chars de la RESPUESTA.
+// Spreedly es la excepción: su respuesta refleja datos de la tarjeta
+// (`first_six`, `last_four`, `full_name`), así que de ella sólo sale el status y
+// las `errors[].key`.
 
 import { SessionExpiredError, TOKEN_MISMATCH } from './session.js';
 import { UA } from './login.js';
@@ -136,8 +139,16 @@ export async function tokenizeCard(card, init, { _fetch = fetch } = {}) {
   let json = null;
   try { json = JSON.parse(text); } catch { /* se informa abajo */ }
   const token = json?.transaction?.payment_method?.token;
-  if (!res.ok || !token) throw falla('tokenización', res, text);
+  if (!res.ok || !token) throw fallaSpreedly(res, json);
   return token;
+}
+
+/** Error de Spreedly sin nada del body: status y, si vienen, las claves de error (`errors.blank`). */
+function fallaSpreedly(res, json) {
+  const errores = json?.errors ?? json?.transaction?.payment_method?.errors ?? json?.transaction?.errors;
+  const claves = (Array.isArray(errores) ? errores : [])
+    .map((e) => e?.key).filter((k) => typeof k === 'string' && /^[\w.-]{1,60}$/.test(k));
+  return new Error(`tokenización: Spreedly respondió ${res.status}${claves.length ? ` (${claves.join(', ')})` : ''}`);
 }
 
 /**
@@ -171,6 +182,10 @@ export async function doPurchase(session, { token, card, quotation }, { _fetch =
   const marcador = `${msg ?? ''} ${visible}`;
   const es2xx = res.status >= 200 && res.status < 300;
 
+  // Un 5xx no dice nada del pago: «Service Unavailable» / «temporarily unavailable»
+  // NO es sin cupo (leerlo así habilitaba pagar otro vuelo). Siempre desconocido.
+  if (res.status >= 500) return { ok: false, motivo: 'desconocido', raw };
+
   // En un 2xx el texto NUNCA decide un fallo: si el cobro pasó, reintentar por un
   // "sin cupo" falso cobraría dos veces. Solo el exceptionMessage JSON es confiable.
   if (/declin|rechaz/i.test(es2xx ? (msg ?? '') : marcador)) return { ok: false, motivo: 'rechazada', raw };
@@ -183,7 +198,14 @@ export async function doPurchase(session, { token, card, quotation }, { _fetch =
     if (pnr !== null) return { ok: true, pnr: pnr || undefined, raw };
   }
 
-  if (!es2xx && /no hay asientos|no.?seat|sin cupo|availab/i.test(marcador)) return { ok: false, motivo: 'sin-cupo', raw };
+  // CALIBRAR: sin-cupo sólo en un 4xx y con señal inequívoca: un exceptionMessage
+  // que es un CÓDIGO (sin espacios) y nombra asientos/cupo/availability, o una frase
+  // explícita en el texto visible. Nada de `availab` suelto: matchea «unavailable».
+  const es4xx = res.status >= 400 && res.status < 500;
+  const codigoSinCupo = typeof msg === 'string' && /^[\w.:-]+$/.test(msg) && /seat|cupo|availability/i.test(msg);
+  if (es4xx && (codigoSinCupo || /no hay asientos|sin cupo|no seats available/i.test(marcador))) {
+    return { ok: false, motivo: 'sin-cupo', raw };
+  }
 
   if (res.status >= 300 && res.status < 400) {
     const loc = res.headers?.get?.('location') ?? '';
@@ -283,11 +305,20 @@ export async function listBookings(session, { _fetch = fetch } = {}) {
   throw new Error('bookings-unavailable');
 }
 
-/** ¿Ya hay una reserva de este vuelo (mismo código y mismo día)? */
+/** Día YYYY-MM-DD de una fila de reservas, o null si no trae una fecha legible. */
+export function diaDeReserva(b) {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(b?.date ?? ''));
+  return m ? m[1] : null;
+}
+
+/**
+ * ¿Ya hay una reserva de este vuelo (mismo código y mismo día)?
+ * Una fila sin fecha legible no prueba nada: el mismo número de vuelo sale todos
+ * los días, así que no cuenta (quien verifica decide qué hacer si TODAS vienen sin fecha).
+ */
+// CALIBRAR: el parser de reservas no se validó con una compra real; hasta entonces
+// este match es la única prueba de «compró» y por eso exige código + día.
 export function hayReserva(bookings, flight) {
   const dia = String(flight.departsAt ?? '').slice(0, 10);
-  return bookings.some((b) => {
-    if ((b.flightCode ?? b.code) !== flight.code) return false;
-    return b.date ? String(b.date).slice(0, 10) === dia : true;
-  });
+  return bookings.some((b) => (b.flightCode ?? b.code) === flight.code && diaDeReserva(b) === dia);
 }

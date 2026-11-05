@@ -11,9 +11,9 @@
 // env ni loguea bodies. Los errores que se anotan pasan por `limpiar()`.
 
 import { chooseItinerary, ordenDeCompra, superaTope } from './itinerary.js';
-import { setEstado, getOrder, lockOrder, unlockOrder, renovarLock } from './orders.js';
+import { setEstado, getOrder, lockOrder, unlockOrder, renovarLock, fueCancelado } from './orders.js';
 import { randomBytes } from 'node:crypto';
-import { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva } from './purchase.js';
+import { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva, diaDeReserva } from './purchase.js';
 import { search } from './jetsmart.js';
 import { reply } from './notify.js';
 import { SessionExpiredError } from './session.js';
@@ -31,6 +31,13 @@ const LOCK_MARGEN_S = 60;
 const VIDA_MAXIMA_S = 800;
 const ESPERA_LOCK = 10_000;
 const DUDOSO = { tipo: 'fin', estado: 'dudoso', motivo: 'dudoso' };
+// Con el parser de reservas calibrado, cuánto se espera a que una compra recién
+// hecha aparezca en «Mis reservas» antes de mirar.
+const ESPERA_RESERVA = 15_000;
+// Los motivos de doPurchase que son una respuesta clara. Cualquier otro (desconocido,
+// un throw) es ambiguo: el pago pudo haber cobrado.
+const MOTIVOS_CLAROS = ['sin-cupo', 'rechazada', '3ds'];
+const CANCELADO_TXT = '⏹️ Pedido cancelado, no compré nada más.';
 
 /** Epoch ms de HOY (en Argentina) a las `hhmm` ART. Si ya pasó, el mismo instante: no rueda a mañana. */
 export function deadlineAR(hhmm = '00:15', now = new Date()) {
@@ -69,7 +76,7 @@ const MOTIVOS = {
   // El desafío del banco queda atado a la sesión del bot: nadie más lo puede completar.
   '3ds': () => 'el banco pidió validar la compra (3DS) y ese paso no lo puedo hacer: comprala a mano en el portal',
   rechazada: () => 'el banco rechazó la tarjeta',
-  'sin-cupo': () => 'no apareció cupo hasta el cierre de la ventana',
+  'sin-cupo': () => 'no apareció cupo en ninguna pasada hasta el cierre (23:00 del día anterior al vuelo)',
 };
 
 /** Por qué no se compró, en una frase. */
@@ -120,10 +127,22 @@ async function ensayar({ order, store, session, api }) {
   return { estado: 'ensayo', itinerario, cotizaciones, init: { ok: true } };
 }
 
+/** «HH:MM» en hora argentina (UTC-3 fijo) de un epoch ms. */
+const horaAR = (ms) => new Date(ms - 3 * 3600 * 1000).toISOString().slice(11, 16);
+
 /**
- * Corre el loop hasta `deadline` y deja el pedido en su estado final.
+ * Corre el loop hasta `deadline` y deja el pedido en su estado.
  * Devuelve { estado, resultado, intentos, motivo }, o { estado: 'confirmado' } si
  * otro proceso tiene el lock (y no se liberó en `esperarLockMs`).
+ *
+ * Sin cupo al terminar la ventana el pedido SIGUE `confirmado` (lo retoman los
+ * rescates); sólo con `cierre` (la pasada de las 23:00 del día anterior al vuelo)
+ * queda `fallido` o `parcial`. `avisarSinCupo` (00:00 y 00:13) avisa que sigue
+ * intentando; las pasadas horarias callan salvo que compren algo.
+ *
+ * `bookingsCalibrado`: hasta validar el parser de reservas con una compra real,
+ * una lista legible sin la reserva NO prueba que no se compró. Apagado (default),
+ * un pago ambiguo deja el pedido `dudoso` sin reintentar.
  */
 export async function runBuy({
   order, store, session, chatId, card, deadline,
@@ -133,6 +152,9 @@ export async function runBuy({
   notify = reply,
   esperarLockMs = 0,
   dryRun = false,
+  bookingsCalibrado = false,
+  avisarSinCupo = false,
+  cierre = false,
 }) {
   // Ensayo: antes del lock y de cualquier escritura. Es una función aparte que ni
   // siquiera recibe `card` ni `api.tokenizeCard`/`doPurchase`: no hay camino al pago.
@@ -159,6 +181,7 @@ export async function runBuy({
 
     const n = order.tramos.length;
     const nuevos = [];
+    let compradosAhora = 0; // tramos pagados en ESTA corrida (los de antes no se avisan de nuevo)
     let persistidos = 0;
     const comprados = new Map(); // índice de tramo → { flight, pnr, tasas }
     // Lo que una corrida anterior ya pagó no se vuelve a comprar.
@@ -195,6 +218,7 @@ export async function runBuy({
     // Lo pagado se escribe apenas se sabe: si el proceso muere, el rescate lo ve.
     const registrar = async (i, flight, pnr, tasas) => {
       comprados.set(i, { flight, pnr: pnr ?? null, tasas });
+      compradosAhora++;
       await guardar({ resultado: armarResultado(), pagoEnVuelo: null });
     };
 
@@ -216,6 +240,12 @@ export async function runBuy({
       for (let k = 0; k < 2; k++) {
         try {
           const bookings = await api.listBookings(session);
+          // Filas sin fecha legible no prueban nada (ni que sí ni que no): si son
+          // todas así, es lo mismo que no haber podido leer.
+          if (bookings.length && !bookings.some(diaDeReserva)) {
+            anotar('listBookings', 'reservas sin fecha legible');
+            return null;
+          }
           const fila = bookings.find((b) => hayReserva([b], flight));
           return { reservado: hayReserva(bookings, flight), pnr: fila?.pnr ?? null };
         } catch (e) {
@@ -228,7 +258,11 @@ export async function runBuy({
     };
 
     // El único lugar donde se llama a doPurchase. Reglas:
-    // - entre dos pagos SIEMPRE hay un `verificar` legible sin la reserva;
+    // - con `bookingsCalibrado` apagado, un resultado ambiguo termina en `dudoso`
+    //   sin segundo pago (se mira una vez las reservas: si está, se compró);
+    // - con el flag prendido, entre dos pagos SIEMPRE hay una espera de 15 s y un
+    //   `verificar` legible sin la reserva;
+    // - una cancelación (clave aparte) se mira antes del marcador y antes de pagar;
     // - un intento ambiguo (desconocido o timeout sin reserva a la vista) deja el
     //   tramo "en duda": desde ahí, cualquier resultado que no sea ok es `dudoso`,
     //   nunca otro vuelo ni `fallido` (el primer pago pudo haber cobrado);
@@ -253,6 +287,8 @@ export async function runBuy({
         if (now() >= deadline) return ambiguo ? DUDOSO : { tipo: 'ventana' };
         // Sin el lock, otra corrida puede estar pagando este mismo pedido.
         if (!(await renovarLock(store, order.id, dueño, ttl()))) return ambiguo ? DUDOSO : { tipo: 'sin-lock' };
+        // El usuario canceló: la clave aparte no la pisa ningún `guardar`.
+        if (await fueCancelado(store, order.id)) return ambiguo ? DUDOSO : { tipo: 'cancelado' };
 
         // Marcador ANTES de pagar: si el proceso muere acá, el rescate verifica en vez de repagar.
         const g = await guardar({ pagoEnVuelo: {
@@ -260,6 +296,13 @@ export async function runBuy({
           tasas: q.total, hora: new Date(now()).toISOString(),
         } });
         if (g.estado !== 'confirmado') return ambiguo ? DUDOSO : { tipo: 'fin', estado: 'interrumpido' };
+        // Entre la lectura de `guardar` y su escritura pudo entrar un cancel que el
+        // marcador pisó: la clave aparte lo delata. Justo antes de pagar, se mira otra vez.
+        if (await fueCancelado(store, order.id)) {
+          if (ambiguo) return DUDOSO;
+          await guardar({ pagoEnVuelo: null });
+          return { tipo: 'cancelado' };
+        }
 
         let r;
         try { r = await api.doPurchase(session, { token, card, quotation: q }); } catch (e) {
@@ -268,10 +311,20 @@ export async function runBuy({
         }
         if (r.ok) return { tipo: 'comprado', pnr: r.pnr ?? null, tasas: q.total };
         if (!r.lanzo) anotar('doPurchase', r.motivo);
+        const esAmbiguo = !MOTIVOS_CLAROS.includes(r.motivo);
         if (!ambiguo && (r.motivo === 'rechazada' || r.motivo === '3ds')) {
           await guardar({ pagoEnVuelo: null });
           return { tipo: 'fin', estado: 'fallido', motivo: r.motivo };
         }
+        if (esAmbiguo && !bookingsCalibrado) {
+          // CALIBRAR: sin el parser validado, una lista legible sin la reserva no
+          // prueba que no cobró. Se mira una vez (si está, se compró); si no, dudoso
+          // y sin reintento. Nunca hay un segundo doPurchase por este camino.
+          const v = await verificar(flight);
+          return v?.reservado ? { tipo: 'comprado', pnr: v.pnr, tasas: q.total } : DUDOSO;
+        }
+        // Flag prendido: se le da tiempo a la reserva a aparecer antes de mirar.
+        if (esAmbiguo || ambiguo) await sleep(ESPERA_RESERVA);
         const v = await verificar(flight);
         if (!v) return DUDOSO;
         if (v.reservado) return { tipo: 'comprado', pnr: v.pnr, tasas: q.total };
@@ -334,8 +387,9 @@ export async function runBuy({
       const it = chooseItinerary(order, porTramo);
       const aComprar = ordenDeCompra(it).filter((i) => !comprados.has(i));
       if (aComprar.length === 0) {
-        // Ya hay algo comprado y lo que falta no aparece: parcial, no se persigue.
-        if (comprados.size) final = { estado: 'parcial' };
+        // Ya hay algo comprado y lo que falta no aparece: en el cierre es parcial;
+        // antes, se sigue buscando (lo comprado queda fijo y no se recompra).
+        if (comprados.size && cierre) final = { estado: 'parcial' };
         continue;
       }
 
@@ -351,6 +405,7 @@ export async function runBuy({
         if (r.tipo === 'comprado') { await registrar(i, flight, r.pnr, r.tasas); continue; }
         if (r.tipo === 'ventana') { cerrado = true; break; }
         if (r.tipo === 'sin-lock') { final = { estado: 'sin-lock' }; break; }
+        if (r.tipo === 'cancelado') { final = { estado: 'cancelado' }; break; }
         if (r.tipo === 'error') pausa = PAUSA_ERROR;
         if (r.tipo === 'fin') final = { estado: r.estado, motivo: r.motivo, detalle: r.detalle };
         reBuscar = true;
@@ -358,7 +413,7 @@ export async function runBuy({
       }
       if (final || cerrado) break;
       if (comprados.size === n) { final = { estado: 'comprado' }; break; }
-      if (!reBuscar && it.faltan?.length && comprados.size) final = { estado: 'parcial' };
+      if (!reBuscar && it.faltan?.length && comprados.size && cierre) final = { estado: 'parcial' };
     }
 
     // Otra corrida tiene el lock: ella escribe y avisa. Acá no se toca nada.
@@ -371,16 +426,34 @@ export async function runBuy({
       const o = await getOrder(store, order.id);
       const estado = o?.estado ?? 'desconocido';
       const texto = estado === 'cancelado'
-        ? '⏹️ Pedido cancelado, no compré nada más.'
+        ? CANCELADO_TXT
         : `⏹️ El pedido ya no está confirmado (estado ${estado}), no compré nada más.`;
       try { await notify(texto, chatId); } catch (e) { console.error(`buy: no pude avisar: ${limpiar(e)}`); }
       return { estado, resultado: o?.resultado ?? null, intentos: o?.intentos ?? [], motivo: null };
     }
 
+    if (!final && !cierre) {
+      // Se terminó la ventana sin cupo (o sin todo el cupo): el pedido sigue
+      // `confirmado` para los rescates, con lo comprado y los intentos persistidos.
+      anotar('search', `sin cupo hasta las ${horaAR(deadline)}`);
+      const resultado = armarResultado();
+      const guardado = await guardar(comprados.size ? { resultado } : {});
+      const partes = [];
+      if (compradosAhora) partes.push(formatCompra(order, resultado));
+      if (guardado.estado === 'cancelado') {
+        if (compradosAhora) partes.push(CANCELADO_TXT);
+      } else if (avisarSinCupo || compradosAhora) {
+        partes.push(`⏳ Sin cupo hasta las ${horaAR(deadline)}, sigo intentando en los rescates.`);
+      }
+      if (partes.length) {
+        try { await notify(partes.join('\n\n'), chatId); } catch (e) { console.error(`buy: no pude avisar: ${limpiar(e)}`); }
+      }
+      return { estado: guardado.estado, resultado, intentos: guardado.intentos, motivo: null };
+    }
     if (!final) {
-      // Se terminó la ventana.
+      // El cierre (23:00 del día anterior al vuelo): ya no hay más pasadas.
       final = { estado: 'fallido', motivo: 'sin-cupo' };
-      anotar('search', 'sin cupo hasta el cierre de la ventana');
+      anotar('search', 'sin cupo hasta el cierre');
     }
     // Un fallo después de haber comprado algún tramo es un parcial: hay plata gastada.
     if (final.estado === 'fallido' && comprados.size) final = { ...final, estado: 'parcial' };
@@ -393,11 +466,12 @@ export async function runBuy({
       resultado, motivo: final.motivo ?? null, detalle: final.detalle ?? null,
       ...(final.estado === 'dudoso' ? {} : { pagoEnVuelo: null }),
     }, final.estado === 'interrumpido' ? 'confirmado' : final.estado);
+    // `cancelado` desde la clave aparte: `guardar` lo escribe si el estado había quedado pisado.
 
     const partes = [];
     if (comprados.size) partes.push(formatCompra(order, resultado));
     if (final.estado === 'dudoso') partes.push(formatFallo({ ...guardado, estado: 'dudoso' }, nuevos));
-    else if (guardado.estado === 'cancelado') partes.push('⏹️ Pedido cancelado, no compré nada más.');
+    else if (guardado.estado === 'cancelado') partes.push(CANCELADO_TXT);
     else if (final.estado === 'interrumpido') partes.push(`⏹️ El pedido ya no está confirmado (estado ${guardado.estado}), no compré nada más.`);
     else if (final.estado === 'fallido') partes.push(formatFallo(guardado, nuevos));
     else if (final.estado === 'parcial' && final.motivo) partes.push(`🔴 No compré el resto: ${motivoTexto(final.motivo, final.detalle)}.`);

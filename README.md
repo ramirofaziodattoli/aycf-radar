@@ -244,7 +244,7 @@ Sin Redis el estado va a `.state.json`. Un cron del sistema a las 00:01, sin lí
 
 ## Compra automática (opcional, sólo el dueño)
 
-Si dejás un pedido confirmado (vuelo de mañana, hasta dos tramos), el bot lo **compra solo** cuando
+Si dejás un pedido confirmado (cualquier fecha futura, con N tramos encadenados), el bot lo **compra solo** cuando
 se libera el inventario, con tu tarjeta y tu pase. Es sólo para el dueño del deploy: los demás
 usuarios siguen con el radar de siempre.
 
@@ -255,6 +255,15 @@ La noche, en hora argentina:
 - **00:13** pasada de rescate hasta las **00:20**; espera el lock de la anterior por si sigue viva.
 - **00:30 y cada hora** pasadas cortas (~1 min) para lo que haya quedado pendiente.
 
+Sin cupo al final de una ventana el pedido **sigue confirmado**: las corridas de las 00:00 y 00:13
+te avisan «⏳ Sin cupo hasta las HH:MM, sigo intentando en los rescates» y las pasadas horarias
+callan salvo que compren algo. Recién la pasada de las **23:00** del día anterior al vuelo lo cierra:
+`fallido` (sin cupo) o `parcial` si compró algunos tramos y el resto nunca apareció.
+
+Si el pago no da una respuesta clara (timeout, 5xx, una página que no se entiende), el pedido queda
+**dudoso** y no se reintenta: mirá el mail de JetSMART. Cancelar desde el botón o `/pedidos` corta
+el loop aunque esté a punto de pagar.
+
 En esas noches el radar del dueño se saltea (`compra-en-curso`): dos procesos pegándole a Caravelo
 con la misma cuenta se pisan.
 
@@ -263,8 +272,11 @@ con la misma cuenta se pisan.
 | `AUTO_BUY` | `on` lo prende. Cualquier otro valor (o borrarla) es el **kill switch**: `/api/buy` no toca nada. |
 | `AYCF_CARD` | JSON `{"number","month","year","cvv","holder"}`. Marcala **Sensitive** y cargala vos en Vercel: nunca por Telegram. Si falta y hay pedidos, el bot te avisa. |
 | `ANTHROPIC_API_KEY` | Para armar el pedido escribiéndole en lenguaje natural. |
+| `CRON_SECRET` | **Obligatoria con `AUTO_BUY=on`**: sin ella `/api/buy` responde 500 y no compra (si no, la URL quedaría pública). |
+| `AYCF_BOOKINGS_CALIBRADO` | `on` cuando el parser de «Mis reservas» esté validado con una compra real. Con `on`, un pago ambiguo espera 15 s, mira las reservas y reintenta una vez si no está; apagado (default) queda `dudoso` sin reintentar. |
 
-`/api/buy?order=<id>` fuerza un pedido puntual en cualquier estado (rescates y pruebas a mano).
+`/api/buy?order=<id>` re-corre un pedido confirmado (para probar). No fuerza nada: un pedido en
+otro estado (dudoso, fallido, cancelado…) vuelve tal cual.
 
 > **Ojo:** automatizar una compra puede ir contra los términos del portal. Es tu cuenta y tu
 > responsabilidad. El bot nunca esquiva CAPTCHA ni 3DS: si aparece uno, no compra y te avisa.
@@ -290,7 +302,8 @@ Si el radar estuvo caído más de 30 min, la sesión muere y el store se limpia 
 próxima corrida re-siembre desde `AYCF_COOKIE`. Sin eso, la sesión muerta le ganaría a la env var
 y quedarías en un 401 permanente por más que actualices la semilla.
 
-Los crons exigen `Authorization: Bearer $CRON_SECRET` si la env var está definida; el webhook
+Los crons exigen `Authorization: Bearer $CRON_SECRET` si la env var está definida (y `/api/buy`, con
+`AUTO_BUY=on`, la exige siempre); el webhook
 valida el header `x-telegram-bot-api-secret-token` contra `TELEGRAM_WEBHOOK_SECRET`.
 
 ## Tests

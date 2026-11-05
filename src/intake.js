@@ -96,7 +96,8 @@ export async function parseOrderText(texto, { hoy = hoyEnAR(), aeropuertos = {},
     headers: { 'x-api-key': key, 'anthropic-version': '2026-10-21', 'content-type': 'application/json' },
     body: JSON.stringify({
       model: 'claude-opus-5-5',
-      max_tokens: 1024,
+      // Con Opus 5.5 el pensamiento cuenta dentro de max_tokens: 1024 cortaba la respuesta.
+      max_tokens: 8000,
       output_config: { effort: 'low', format: { type: 'json_schema', schema: ORDER_SCHEMA } },
       system: reglas(hoy, aeropuertos),
       messages: [{ role: 'user', content: texto }],

@@ -11,7 +11,7 @@ import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, sc
 import { haySecreto } from './crypto.js';
 import { cmdPedido, cmdPedidos } from './intake.js';
 import { runBuy } from './buy.js';
-import { getOrder, setEstado, nocheDeCompra, esDeMañana, hoyEnAR } from './orders.js';
+import { getOrder, setEstado, cancelOrder, nocheDeCompra, esDeMañana, hoyEnAR } from './orders.js';
 
 const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
 
@@ -327,7 +327,8 @@ async function callbackPedido(store, chatId, accion, id, hoy) {
   if (!['borrador', 'confirmado', 'dudoso'].includes(o.estado)) {
     return { text: `Ese pedido ya está *${o.estado}*, no hay nada que cancelar.` };
   }
-  await setEstado(store, id, 'cancelado');
+  // Estado + clave aparte: el loop de compra mira la clave justo antes de pagar.
+  await cancelOrder(store, id);
   return { text: '❌ Pedido cancelado.' };
 }
 
