@@ -683,4 +683,53 @@ const memStore = () => {
   process.env = limpio;
 }
 
+// --- pedidos: modelo, store y lock ---
+{
+  const { rm } = await import('node:fs/promises');
+  const { newOrder, validateOrder, saveOrder, getOrder, listOrders, setEstado, ordersDueTonight, lockOrder, unlockOrder, formatPedido } = await import('./src/orders.js');
+  const { createStore } = await import('./src/store.js');
+  const { scoped } = await import('./src/users.js');
+  const limpio = { ...process.env };
+  process.env.STATE_FILE = '/tmp/aycf-test-orders.json'; await rm(process.env.STATE_FILE, { force: true });
+  const store = scoped(createStore(), '1');
+
+  assert.throws(() => validateOrder({ fechaVuelo: '08/11/2026', tramos: [{ from: 'BRC', to: 'AEP' }] }), /YYYY-MM-DD/);
+  assert.throws(() => validateOrder({ fechaVuelo: '2026-11-08', tramos: [] }), /tramo/);
+  assert.throws(() => validateOrder({ fechaVuelo: '2026-11-08', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'EZE', to: 'COR' }] }), /encaden/,
+    'el segundo tramo tiene que salir de donde llegó el primero (AEP≠EZE se declara, no se adivina)');
+  const o = newOrder({ chatId: '1', fechaVuelo: '2026-11-08', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }] });
+  assert.match(o.id, /^ord_[0-9a-f]{10}$/); assert.equal(o.estado, 'borrador');
+  assert.equal(o.escalaMinimaHoras, 2.5); assert.equal(o.topeTasasPorTramoARS, 40000);
+  assert.equal(formatPedido(o), 'domingo 08/11 · BRC → AEP · AEP → COR · escala ≥ 2.5 h');
+
+  await saveOrder(store, o);
+  assert.equal((await getOrder(store, o.id)).fechaVuelo, '2026-11-08');
+  assert.equal((await ordersDueTonight(store, '2026-11-08')).length, 0, 'un borrador no se compra');
+  await setEstado(store, o.id, 'confirmado');
+  assert.equal((await ordersDueTonight(store, '2026-11-08')).length, 1);
+  assert.equal((await ordersDueTonight(store, '2026-11-09')).length, 0);
+  await setEstado(store, o.id, 'fallido', { intento: { hora: 'x', paso: 'quotation', error: 'boom' } });
+  assert.equal((await getOrder(store, o.id)).intentos.length, 1);
+  assert.equal((await listOrders(store, { estados: ['fallido'] })).length, 1);
+
+  assert.equal(await lockOrder(store, o.id, 60), true);
+  assert.equal(await lockOrder(store, o.id, 60), false, 'el segundo cron no entra');
+  await unlockOrder(store, o.id);
+  assert.equal(await lockOrder(store, o.id, 60), true);
+
+  // RedisStore.setnx: SET key val EX ttl NX, y OK/null se traducen a true/false.
+  const orig = globalThis.fetch;
+  process.env.UPSTASH_REDIS_REST_URL = 'https://redis.test'; process.env.UPSTASH_REDIS_REST_TOKEN = 't';
+  const { createStore: createRedis } = await import('./src/store.js?redis-setnx');
+  const respuestas = [{ result: 'OK' }, { result: null }]; const cuerpos = [];
+  globalThis.fetch = async (url, opt) => { cuerpos.push(JSON.parse(opt.body)); return { ok: true, json: async () => respuestas.shift() }; };
+  try {
+    const redis = createRedis();
+    assert.equal(redis.name, 'redis');
+    assert.equal(await redis.setnx('k', { a: 1 }, 60), true);
+    assert.equal(await redis.setnx('k', { a: 1 }, 60), false);
+    assert.deepEqual(cuerpos[0], ['SET', 'k', '{"a":1}', 'EX', '60', 'NX']);
+  } finally { globalThis.fetch = orig; process.env = limpio; }
+}
+
 console.log('✅ todo ok');

@@ -1,0 +1,114 @@
+// Pedidos de compra automática: "quiero este vuelo, comprámelo a las 00:00".
+//
+// Un pedido vive en el store del usuario (scoped) y recorre estados:
+// borrador → confirmado → comprando → comprado | fallido. Acá solo está el
+// modelo, la persistencia y el lock; la compra en sí es de otro módulo.
+
+import { randomBytes } from 'node:crypto';
+import { tomorrowInAR } from './radar.js';
+
+const IDX = 'orders';
+const TTL_PEDIDO = 30 * 24 * 3600;
+const rowKey = (id) => `order:${id}`;
+const lockKey = (id) => `order-lock:${id}`;
+const IATA = /^[A-Z]{3}$/;
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+export const ESTADOS = ['borrador', 'confirmado', 'comprando', 'comprado', 'fallido', 'cancelado'];
+
+/** Tira Error en español si el pedido no se puede comprar tal cual está. */
+export function validateOrder(o) {
+  if (!o || typeof o !== 'object') throw new Error('el pedido está vacío');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(o.fechaVuelo ?? '') || Number.isNaN(Date.parse(o.fechaVuelo))) {
+    throw new Error('fechaVuelo tiene que ser YYYY-MM-DD');
+  }
+  if (!Array.isArray(o.tramos) || o.tramos.length === 0) throw new Error('el pedido necesita al menos un tramo');
+  o.tramos.forEach((t, i) => {
+    if (!IATA.test(t?.from ?? '') || !IATA.test(t?.to ?? '')) {
+      throw new Error(`el tramo ${i + 1} necesita from y to como código IATA de 3 letras mayúsculas`);
+    }
+    // Se declara, no se adivina: AEP→EZE entre tramos es un traslado que no compramos.
+    if (i > 0 && t.from !== o.tramos[i - 1].to) {
+      throw new Error(`los tramos no encadenan: el ${i + 1} sale de ${t.from} y el ${i} llega a ${o.tramos[i - 1].to}`);
+    }
+    if (t.ventana != null) {
+      const v = t.ventana;
+      if (!Array.isArray(v) || v.length !== 2 || !HHMM.test(v[0]) || !HHMM.test(v[1])) {
+        throw new Error(`la ventana del tramo ${i + 1} tiene que ser [HH:MM, HH:MM]`);
+      }
+    }
+  });
+  if (o.escalaMinimaHoras !== undefined && !(typeof o.escalaMinimaHoras === 'number' && o.escalaMinimaHoras > 0)) {
+    throw new Error('escalaMinimaHoras tiene que ser un número mayor a 0');
+  }
+  return o;
+}
+
+export function newOrder({ chatId, fechaVuelo, tramos, escalaMinimaHoras = 2.5, preferencia = 'cualquier horario', topeTasasPorTramoARS = 40000 }) {
+  return validateOrder({
+    id: 'ord_' + randomBytes(5).toString('hex'),
+    chatId: String(chatId),
+    estado: 'borrador',
+    creado: new Date().toISOString(),
+    fechaVuelo,
+    tramos,
+    escalaMinimaHoras,
+    preferencia,
+    topeTasasPorTramoARS,
+    intentos: [],
+    resultado: null,
+  });
+}
+
+export async function saveOrder(store, order) {
+  const ids = (await store.get(IDX)) ?? [];
+  await store.set(rowKey(order.id), order, TTL_PEDIDO);
+  if (!ids.includes(order.id)) await store.set(IDX, [...ids, order.id]);
+  return order;
+}
+
+export const getOrder = (store, id) => store.get(rowKey(id));
+
+export async function listOrders(store, { estados } = {}) {
+  const ids = (await store.get(IDX)) ?? [];
+  const out = [];
+  for (const id of ids) {
+    const o = await getOrder(store, id);
+    if (o && (!estados || estados.includes(o.estado))) out.push(o);
+  }
+  return out;
+}
+
+/** Cambia el estado y mezcla `extra`; `extra.intento` se suma a la lista de intentos. */
+export async function setEstado(store, id, estado, extra = {}) {
+  const o = await getOrder(store, id);
+  if (!o) throw new Error(`no existe el pedido ${id}`);
+  const { intento, ...resto } = extra;
+  const next = { ...o, ...resto, estado, intentos: intento ? [...o.intentos, intento] : o.intentos };
+  await saveOrder(store, next);
+  return next;
+}
+
+/** Los que hay que comprar esta noche: confirmados y para el vuelo de `date`. */
+export async function ordersDueTonight(store, date = tomorrowInAR()) {
+  return (await listOrders(store, { estados: ['confirmado'] })).filter((o) => o.fechaVuelo === date);
+}
+
+/**
+ * Un pedido se compra una sola vez aunque lleguen dos crons juntos. El TTL es
+ * la red de seguridad: si la función muere sin soltarlo, se libera solo.
+ */
+export const lockOrder = (store, id, ttlSeconds = 900) => store.setnx(lockKey(id), 1, ttlSeconds);
+export const unlockOrder = (store, id) => store.set(lockKey(id), null, 1);
+
+const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+
+/** Una línea Markdown: "domingo 08/11 · BRC → AEP · AEP → COR · escala ≥ 2.5 h". */
+export function formatPedido(o) {
+  const [y, m, d] = o.fechaVuelo.split('-').map(Number);
+  const dia = DIAS[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+  const partes = [`${dia} ${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}`];
+  partes.push(...o.tramos.map((t) => `${t.from} → ${t.to}`));
+  if (o.tramos.length >= 2) partes.push(`escala ≥ ${o.escalaMinimaHoras} h`);
+  return partes.join(' · ');
+}

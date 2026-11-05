@@ -32,6 +32,14 @@ class RedisStore {
     if (ttlSeconds) args.push('EX', String(ttlSeconds));
     await this.#cmd(...args);
   }
+
+  // SET ... NX es atómico en Redis: dos crons que llegan juntos, uno solo gana.
+  async setnx(key, value, ttlSeconds) {
+    const args = ['SET', key, JSON.stringify(value)];
+    if (ttlSeconds) args.push('EX', String(ttlSeconds));
+    args.push('NX');
+    return (await this.#cmd(...args)) === 'OK';
+  }
 }
 
 class FileStore {
@@ -64,6 +72,14 @@ class FileStore {
     db[key] = { v: value, exp: ttlSeconds ? Date.now() + ttlSeconds * 1000 : null };
     await writeFile(this.path, JSON.stringify(db, null, 2), { mode: 0o600 });
   }
+
+  // Sin atomicidad entre procesos (leer y escribir son dos pasos): alcanza para
+  // self-hosting con un solo proceso. El lock que importa en serio es el de Redis.
+  async setnx(key, value, ttlSeconds) {
+    if ((await this.get(key)) !== null) return false;
+    await this.set(key, value, ttlSeconds);
+    return true;
+  }
 }
 
 class MemoryStore {
@@ -79,6 +95,14 @@ class MemoryStore {
 
   async set(key, value, ttlSeconds) {
     this.#m.set(key, { v: value, exp: ttlSeconds ? Date.now() + ttlSeconds * 1000 : null });
+  }
+
+  // Un solo hilo y sin await entre el chequeo y el set: acá sí es atómico.
+  async setnx(key, value, ttlSeconds) {
+    const row = this.#m.get(key);
+    if (row && row.v !== null && !(row.exp && Date.now() > row.exp)) return false;
+    this.#m.set(key, { v: value, exp: ttlSeconds ? Date.now() + ttlSeconds * 1000 : null });
+    return true;
   }
 }
 
