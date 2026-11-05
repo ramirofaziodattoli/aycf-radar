@@ -40,6 +40,10 @@ class RedisStore {
     args.push('NX');
     return (await this.#cmd(...args)) === 'OK';
   }
+
+  async del(key) {
+    await this.#cmd('DEL', key);
+  }
 }
 
 class FileStore {
@@ -80,6 +84,13 @@ class FileStore {
     await this.set(key, value, ttlSeconds);
     return true;
   }
+
+  async del(key) {
+    const { writeFile } = await import('node:fs/promises');
+    const db = await this.#read();
+    delete db[key];
+    await writeFile(this.path, JSON.stringify(db, null, 2), { mode: 0o600 });
+  }
 }
 
 class MemoryStore {
@@ -103,6 +114,10 @@ class MemoryStore {
     if (row && row.v !== null && !(row.exp && Date.now() > row.exp)) return false;
     this.#m.set(key, { v: value, exp: ttlSeconds ? Date.now() + ttlSeconds * 1000 : null });
     return true;
+  }
+
+  async del(key) {
+    this.#m.delete(key);
   }
 }
 

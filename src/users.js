@@ -22,6 +22,7 @@ export function scoped(store, ns) {
     get: (key) => store.get(k(key)),
     set: (key, value, ttl) => store.set(k(key), value, ttl),
     setnx: (key, value, ttl) => store.setnx(k(key), value, ttl),
+    del: (key) => store.del(k(key)),
   };
 }
 

@@ -1,7 +1,7 @@
 // Pedidos de compra automática: "quiero este vuelo, comprámelo a las 00:00".
 //
 // Un pedido vive en el store del usuario (scoped) y recorre estados:
-// borrador → confirmado → comprando → comprado | fallido. Acá solo está el
+// borrador → confirmado → comprado | parcial | dudoso | fallido (o cancelado). Acá solo está el
 // modelo, la persistencia y el lock; la compra en sí es de otro módulo.
 
 import { randomBytes } from 'node:crypto';
@@ -14,7 +14,7 @@ const lockKey = (id) => `order-lock:${id}`;
 const IATA = /^[A-Z]{3}$/;
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 
-export const ESTADOS = ['borrador', 'confirmado', 'comprando', 'comprado', 'fallido', 'cancelado'];
+export const ESTADOS = ['borrador', 'confirmado', 'comprado', 'parcial', 'dudoso', 'fallido', 'cancelado'];
 
 /** Tira Error en español si el pedido no se puede comprar tal cual está. */
 export function validateOrder(o) {
@@ -83,7 +83,9 @@ export async function listOrders(store, { estados } = {}) {
 export async function setEstado(store, id, estado, extra = {}) {
   const o = await getOrder(store, id);
   if (!o) throw new Error(`no existe el pedido ${id}`);
-  const { intento, ...resto } = extra;
+  if (!ESTADOS.includes(estado)) throw new Error(`estado desconocido: ${estado}`);
+  // La identidad del pedido no se toca por la ventana de `extra`.
+  const { intento, id: _id, chatId: _chatId, fechaVuelo: _fecha, ...resto } = extra;
   const next = { ...o, ...resto, estado, intentos: intento ? [...o.intentos, intento] : o.intentos };
   await saveOrder(store, next);
   return next;
@@ -99,7 +101,7 @@ export async function ordersDueTonight(store, date = tomorrowInAR()) {
  * la red de seguridad: si la función muere sin soltarlo, se libera solo.
  */
 export const lockOrder = (store, id, ttlSeconds = 900) => store.setnx(lockKey(id), 1, ttlSeconds);
-export const unlockOrder = (store, id) => store.set(lockKey(id), null, 1);
+export const unlockOrder = (store, id) => store.del(lockKey(id));
 
 const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
 

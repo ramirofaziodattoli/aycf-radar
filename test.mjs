@@ -717,6 +717,11 @@ const memStore = () => {
   await unlockOrder(store, o.id);
   assert.equal(await lockOrder(store, o.id, 60), true);
 
+  await assert.rejects(() => setEstado(store, o.id, 'comprando'), /estado desconocido/);
+  await setEstado(store, o.id, 'parcial', { id: 'ord_x', chatId: '9', fechaVuelo: '2030-01-01', resultado: 'ok' });
+  const p = await getOrder(store, o.id);
+  assert.deepEqual([p.id, p.chatId, p.fechaVuelo, p.resultado], [o.id, '1', '2026-11-08', 'ok'], 'extra no pisa la identidad');
+
   // RedisStore.setnx: SET key val EX ttl NX, y OK/null se traducen a true/false.
   const orig = globalThis.fetch;
   process.env.UPSTASH_REDIS_REST_URL = 'https://redis.test'; process.env.UPSTASH_REDIS_REST_TOKEN = 't';
@@ -729,6 +734,9 @@ const memStore = () => {
     assert.equal(await redis.setnx('k', { a: 1 }, 60), true);
     assert.equal(await redis.setnx('k', { a: 1 }, 60), false);
     assert.deepEqual(cuerpos[0], ['SET', 'k', '{"a":1}', 'EX', '60', 'NX']);
+    respuestas.push({ result: 1 });
+    await unlockOrder(scoped(redis, '1'), 'ord_abc');
+    assert.deepEqual(cuerpos[2], ['DEL', 'u:1:order-lock:ord_abc']);
   } finally { globalThis.fetch = orig; process.env = limpio; }
 }
 
