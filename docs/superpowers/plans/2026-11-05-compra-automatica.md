@@ -249,7 +249,7 @@ git commit -m "pedidos: modelo en el store y lock atómico por pedido"
   - `formatCompra(order, resultado) → string` y `formatFallo(order, intentos) → string` (mensajes Markdown).
   - Estados de salida: `comprado` (todos los tramos), `parcial` (al menos uno comprado, `faltan` no vacío), `dudoso`, `fallido` (motivo `rechazada` | `3ds` | `tope` | `sin-cupo` tras deadline), `confirmado` sin cambio sólo si no se pudo tomar el lock.
   - Algoritmo del loop (la única parte que las firmas no determinan):
-    1. `lockOrder` o salir. Hasta `deadline`: por cada tramo pendiente `api.search(session, tramo, date)`; si todos vacíos → `sleep(5000)` y seguir (401 → `session.relogin()` una vez por vuelta).
+    1. `lockOrder` o salir. Hasta `deadline`: por cada tramo pendiente `api.search(session, tramo, date)`; si todos vacíos → `sleep(10_000)` y seguir; si algún `search` tiró error/timeout → `sleep(20_000)` (Ramiro: «no exageres, nos van a bloquear»: un request por tramo cada 10–20 s, nunca ráfagas). 401 → `session.relogin()` una vez por vuelta.
     2. `chooseItinerary`; si `tramos.length === 0` → sleep y seguir.
     3. Por cada índice de `ordenDeCompra`: `quote` (si `superaTope` → `fallido` motivo `tope`, salir del loop); `initPayment`; `tokenizeCard`; `doPurchase`. Cada paso con un reintento inmediato en error/timeout, **salvo `doPurchase`**: ante error/timeout → `listBookings`; `hayReserva` → tomar como comprado; `[]` → un reintento de `doPurchase`; `bookings-unavailable` → `dudoso`, salir.
     4. `doPurchase` `ok:false` con `sin-cupo` → volver al paso 1 (otro vuelo); `rechazada`/`3ds` → `fallido` con ese motivo, salir.
@@ -263,7 +263,7 @@ git commit -m "pedidos: modelo en el store y lock atómico por pedido"
 {
   const { runBuy, deadlineAR } = await import('./src/buy.js');
   // (helpers: order de 2 tramos como en Task 2, store scoped a /tmp, session falsa con relogin contado, card falsa)
-  // 1) Caravelo muerto 3 vueltas (search tira timeout), después aparece cupo: compra los dos, estado 'comprado', notify 1 vez con los dos PNR, sleep llamado 3 veces.
+  // 1) Caravelo muerto 3 vueltas (search tira timeout), después aparece cupo: compra los dos, estado 'comprado', notify 1 vez con los dos PNR, sleep llamado 3 veces con 20000 (error) y nunca menos de 10000 entre vueltas.
   // 2) Sólo el primer tramo tiene cupo todo el tiempo: compra el primero, estado 'parcial', faltan [1], el mensaje dice que el tramo AEP→COR se ve con Ramiro.
   // 3) do-purchase tira timeout y listBookings devuelve la reserva: estado 'comprado', doPurchase llamado UNA vez.
   // 4) do-purchase tira timeout y listBookings tira 'bookings-unavailable': estado 'dudoso', doPurchase UNA vez, mensaje pide mirar el mail.
