@@ -9,7 +9,7 @@ import { getCatalog, resolveAirport, airportName, routeExists, destinationsFrom 
 import { Session } from './session.js';
 import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, scoped, nombreDe } from './users.js';
 import { haySecreto } from './crypto.js';
-import { cmdPedido, cmdPedidos } from './intake.js';
+import { cmdPedido, cmdPedidos, pedidosVivos } from './intake.js';
 import { runBuy } from './buy.js';
 import { getOrder, setEstado, cancelOrder, nocheDeCompra, esDeMañana, hoyEnAR } from './orders.js';
 
@@ -47,7 +47,7 @@ y no existe inventario más allá de eso._`;
 // Solo el dueño del deploy (TELEGRAM_CHAT_ID) lo ve y lo puede usar.
 const AYUDA_ADMIN = `/usuarios — quiénes usan el bot (solo vos)
 /pedidos — mis pedidos de compra automática
-/ensayo <id> — ensayo de compra sin pagar (sólo vos)
+/ensayo [N] — ensayo de compra sin pagar del último pedido o del N de /pedidos (sólo vos)
 
 También podés contarme qué pasaje necesitás y lo compro solo a las 00:00.`;
 
@@ -494,9 +494,12 @@ async function cmdEstado(store, session) {
  *
  * Con la compra automática prendida, el texto libre del dueño es un pedido
  * ("el sábado bariloche a aeroparque"). Dos tokens sueltos siguen siendo una
- * búsqueda: es el atajo de siempre y no tiene fecha para comprar nada.
+ * búsqueda: es el atajo de siempre y no tiene fecha para comprar nada. Salvo
+ * `enDialogo`: si el bot acaba de preguntar algo del pedido (hay `intake:ctx`),
+ * «Sabado» o «bariloche aeroparque» son la respuesta, no una búsqueda. Lo
+ * calcula el webhook antes, así esto sigue siendo síncrono.
  */
-export function comandoDe(text, user, { chatId } = {}) {
+export function comandoDe(text, user, { chatId, enDialogo = false } = {}) {
   const tokens = String(text).trim().split(/\s+/);
   if (tokens[0].startsWith('/')) {
     return { cmd: tokens[0].toLowerCase().replace(/@.*$/, ''), args: tokens.slice(1) };
@@ -504,15 +507,15 @@ export function comandoDe(text, user, { chatId } = {}) {
   if (tokens.length >= 2 && tokens[0].includes('@') && tokens[0].includes('.')) {
     return { cmd: '/conectar', args: tokens };
   }
-  if (esDueno(chatId) && process.env.AUTO_BUY === 'on' && tokens.length !== 2) {
+  if (esDueno(chatId) && process.env.AUTO_BUY === 'on' && (enDialogo || tokens.length !== 2)) {
     return { cmd: '/pedido', args: [String(text).trim()] };
   }
   if (estaConectado(user)) return { cmd: '/buscar', args: tokens };
   return { cmd: '/start', args: [] };
 }
 
-export async function handleCommand(text, { store, session, user, chatId, from, _runBuy }) {
-  const { cmd, args } = comandoDe(text, user, { chatId });
+export async function handleCommand(text, { store, session, user, chatId, from, enDialogo, _runBuy }) {
+  const { cmd, args } = comandoDe(text, user, { chatId, enDialogo });
 
   // Un chat sin cuenta conectada igual es un chat: sin el chatId, `usaSemilla`
   // lo confundiría con el dueño del deploy y le sembraría las rutas ajenas.
@@ -532,10 +535,24 @@ export async function handleCommand(text, { store, session, user, chatId, from, 
 
 const ARS = new Intl.NumberFormat('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-/** `/ensayo <id>`: el flujo de compra completo hasta el INIT de Spreedly, sin pagar. */
+/**
+ * Qué pedido ensaya `/ensayo`: sin nada, el vivo más nuevo; un número N, el N de
+ * `/pedidos` (mismo orden); si no, un id `ord_…`. null si no hay ninguno.
+ */
+async function pedidoDeEnsayo(store, arg) {
+  if (!arg) {
+    // reverse antes del sort estable: con `creado` empatado gana el último del índice.
+    const vivos = (await pedidosVivos(store)).reverse();
+    return vivos.sort((a, b) => String(b.creado).localeCompare(String(a.creado)))[0] ?? null;
+  }
+  if (/^\d+$/.test(arg)) return (await pedidosVivos(store))[Number(arg) - 1] ?? null;
+  return getOrder(store, arg);
+}
+
+/** `/ensayo [N|id]`: el flujo de compra completo hasta el INIT de Spreedly, sin pagar. */
 export async function cmdEnsayo(store, session, chatId, args, { _runBuy = runBuy } = {}) {
   if (process.env.AUTO_BUY !== 'on') return 'La compra automática está apagada (AUTO_BUY).';
-  const order = args[0] ? await getOrder(store, args[0]) : null;
+  const order = await pedidoDeEnsayo(store, args[0]);
   if (!order) return 'Ese pedido no existe.';
   const r = await _runBuy({ order, store, session, chatId, deadline: Date.now() + 60_000, dryRun: true });
   const lineas = ['🧪 *Ensayo de compra* (no pagué nada)'];

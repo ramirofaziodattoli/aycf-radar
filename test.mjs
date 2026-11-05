@@ -1568,7 +1568,16 @@ const memStore = () => {
   const falla = await handleCommand(`/ensayo ${order.id}`, { ...dueno, _runBuy: async () => ({ estado: 'ensayo', paso: 'initPayment', error: 'spreedly caído', itinerario: { tramos: [IDA] }, cotizaciones: [] }) });
   assert.match(falla, /falló en initPayment: spreedly caído/);
   assert.match(await handleCommand('/ensayo zzz', { ...dueno, _runBuy }), /Ese pedido no existe/);
-  assert.match(await handleCommand('/ensayo', { ...dueno, _runBuy }), /Ese pedido no existe/);
+  assert.match(await handleCommand('/ensayo', { ...dueno, store: scoped(createStore(), '3'), _runBuy }), /Ese pedido no existe/, 'sin pedidos vivos');
+  // Sin id: el vivo más nuevo; con N, el N de /pedidos (orden de creación).
+  const o1 = newOrder({ chatId: '1', fechaVuelo: '2026-11-09', tramos: [{ from: 'BRC', to: 'AEP' }] });
+  await saveOrder(store, o1);
+  await handleCommand('/ensayo', { ...dueno, _runBuy }); assert.equal(visto.order.id, o1.id, 'sin args: el más nuevo');
+  await handleCommand('/ensayo 1', { ...dueno, _runBuy }); assert.equal(visto.order.id, order.id, 'N=1: el primero de /pedidos');
+  await handleCommand('/ensayo 2', { ...dueno, _runBuy }); assert.equal(visto.order.id, o1.id, 'N=2');
+  await handleCommand(`/ensayo ${order.id}`, { ...dueno, _runBuy }); assert.equal(visto.order.id, order.id, 'por id');
+  assert.match(await handleCommand('/ensayo 3', { ...dueno, _runBuy }), /^Ese pedido no existe\.$/);
+  assert.match(await handleCommand('/ensayo 0', { ...dueno, _runBuy }), /^Ese pedido no existe\.$/);
   process.env.AUTO_BUY = 'off';
   assert.match(await handleCommand(`/ensayo ${order.id}`, { ...dueno, _runBuy }), /AUTO_BUY/);
   process.env.AUTO_BUY = 'on';
@@ -1832,7 +1841,7 @@ const memStore = () => {
   assert.equal(borrador.fechaVuelo, '2026-11-07', 'el próximo sábado respecto de hoy');
   assert.equal(borrador.tramos.length, 2);
   assert.equal(borrador.escalaMinimaHoras, 2.5, 'null del modelo = el default');
-  assert.equal(out.text, formatPedido(borrador, { hoy: HOY }) + '\n\n¿Lo confirmo?');
+  assert.equal(out.text, formatPedido(borrador, { hoy: HOY }) + `\n\`${id}\` · /ensayo para probarlo sin pagar\n\n¿Lo confirmo?`);
   assert.equal(formatPedido(borrador, { hoy: HOY }),
     '📌 *Pedido* · sábado 07/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco el viernes 06/11 a las 00:00');
   assert.equal(formatPedido({ ...borrador, tramos: [{ from: 'BRC', to: 'AEP', ventana: ['06:00', '12:00'] }] }, { hoy: HOY }),
@@ -1865,8 +1874,16 @@ const memStore = () => {
   assert.equal(comandoDe('el lunes necesito ir a aeroparque', { ...dueno, chatId: '2', env: false }, { chatId: '2' }).cmd, '/buscar');
   assert.equal(comandoDe('/rutas', dueno, { chatId: '1' }).cmd, '/rutas');
   assert.equal(comandoDe('mia@mail.com mi clave larga', dueno, { chatId: '1' }).cmd, '/conectar');
+  // Con una pregunta del pedido pendiente, hasta dos tokens son la respuesta.
+  assert.deepEqual(comandoDe('bariloche aeroparque', dueno, { chatId: '1', enDialogo: true }),
+    { cmd: '/pedido', args: ['bariloche aeroparque'] });
+  assert.equal(comandoDe('Sabado', dueno, { chatId: '1', enDialogo: true }).cmd, '/pedido');
+  assert.equal(comandoDe('bariloche aeroparque', dueno, { chatId: '1', enDialogo: false }).cmd, '/buscar');
+  assert.equal(comandoDe('/pedidos', dueno, { chatId: '1', enDialogo: true }).cmd, '/pedidos', 'los comandos siguen mandando');
+  assert.equal(comandoDe('bariloche aeroparque', { ...dueno, chatId: '2', env: false }, { chatId: '2', enDialogo: true }).cmd, '/buscar', 'sólo el dueño');
   process.env.AUTO_BUY = 'off';
   assert.equal(comandoDe('el lunes necesito ir a aeroparque', dueno, { chatId: '1' }).cmd, '/buscar', 'sin AUTO_BUY no hay pedidos');
+  assert.equal(comandoDe('bariloche aeroparque', dueno, { chatId: '1', enDialogo: true }).cmd, '/buscar', 'sin AUTO_BUY tampoco en diálogo');
   process.env.AUTO_BUY = 'on';
 
   // (f) el formato estricto, el salvavidas cuando la API no está.
@@ -1942,6 +1959,54 @@ const memStore = () => {
   assert.equal(lista.buttons.length, 2, 'el cancelado no aparece');
   assert.equal(lista.buttons[0][0].data, `ord:no:${estricto.buttons[0][0].data.slice(7)}`);
   assert.match(lista.text, /BRC → AEP/);
+  assert.ok(lista.text.includes(`1. \`${estricto.buttons[0][0].data.slice(7)}\` · 📌`), 'cada línea con su id');
+
+  // Memoria corta: «¿Qué día?» → «Sabado» → «Bariloche a aeroparque» arma un solo pedido.
+  {
+    const s2 = memStore();
+    await s2.set('catalog:routes', await store.get('catalog:routes'));
+    const { CTX } = await import('./src/intake.js');
+    const bodies = [];
+    const cola = [
+      { ...PEDIDO, fechaVuelo: null, tramos: [], aclaracion: '¿Qué día querés viajar?' },
+      { ...PEDIDO, fechaVuelo: '2026-11-07', tramos: [], aclaracion: '¿Desde dónde y hacia dónde?' },
+      { ...PEDIDO, tramos: [{ from: 'BRC', to: 'AEP', ventana: null }] },
+    ];
+    const conCola = async (url, init) => { bodies.push(JSON.parse(init.body)); return respuesta(cola.shift()); };
+    const r1 = await cmdPedido(s2, '1', 'quiero un pasaje', { hoy: HOY, _fetch: conCola });
+    assert.equal(r1.text, '¿Qué día querés viajar?');
+    assert.deepEqual(bodies[0].messages, [{ role: 'user', content: 'quiero un pasaje' }], 'sin ctx, un solo turno');
+    assert.deepEqual(await s2.get(CTX), { mensajes: [
+      { role: 'user', content: 'quiero un pasaje' }, { role: 'assistant', content: '¿Qué día querés viajar?' },
+    ] });
+    await cmdPedido(s2, '1', 'Sabado', { hoy: HOY, _fetch: conCola });
+    assert.deepEqual(bodies[1].messages, [
+      { role: 'user', content: 'quiero un pasaje' },
+      { role: 'assistant', content: '¿Qué día querés viajar?' },
+      { role: 'user', content: 'Sabado' },
+    ]);
+    const r3 = await cmdPedido(s2, '1', 'Bariloche a aeroparque', { hoy: HOY, _fetch: conCola });
+    assert.deepEqual(bodies[2].messages.map((m) => m.content), [
+      'quiero un pasaje', '¿Qué día querés viajar?', 'Sabado', '¿Desde dónde y hacia dónde?', 'Bariloche a aeroparque',
+    ]);
+    assert.equal(bodies[2].model, 'claude-opus-5-5'); assert.equal(bodies[2].max_tokens, 8000);
+    assert.deepEqual(bodies[2].output_config.format.schema, ORDER_SCHEMA);
+    assert.match(bodies[2].system, /Si hay mensajes anteriores, son parte del mismo pedido: completá con ellos lo que falte\./);
+    assert.match(r3.buttons[0][0].data, /^ord:ok:ord_/, 'el pedido completo sale con botones');
+    assert.equal(await s2.get(CTX), null, 'pedido completo: ctx limpio');
+
+    // Tope de 6 entradas, de a pares: el primer turno sigue siendo del usuario.
+    const preg = async () => respuesta({ ...PEDIDO, fechaVuelo: null, tramos: [], aclaracion: '¿Y?' });
+    for (const t of ['a', 'b', 'c', 'd']) await cmdPedido(s2, '1', t, { hoy: HOY, _fetch: preg });
+    const ctx = await s2.get(CTX);
+    assert.equal(ctx.mensajes.length, 6);
+    assert.deepEqual(ctx.mensajes[0], { role: 'user', content: 'b' });
+    // La API se cae: la charla queda para reintentar. Una búsqueda la cierra.
+    await cmdPedido(s2, '1', 'e', { hoy: HOY, _fetch: async () => { throw new Error('ECONNRESET'); } });
+    assert.equal((await s2.get(CTX)).mensajes.length, 6);
+    await cmdPedido(s2, '1', 'bariloche córdoba', { hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'busqueda' }) });
+    assert.equal(await s2.get(CTX), null, 'búsqueda: ctx limpio');
+  }
 
   // El webhook: /pedidos por comando y la ayuda del dueño.
   const porComando = await handleCommand('/pedidos', { store, session: null, user: dueno, chatId: '1' });

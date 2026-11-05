@@ -13,6 +13,16 @@ import { getCatalog, routeExists } from './airports.js';
 import { newOrder, saveOrder, listOrders, formatPedido, fechaLarga, hoyEnAR } from './orders.js';
 
 const API = 'https://api.anthropic.com/v1/messages';
+
+// Memoria corta del intake: si el bot preguntó «¿Qué día querés viajar?», la
+// respuesta «Sabado» sola no es un pedido. Se guarda el ida y vuelta pendiente y
+// se le manda al modelo como turnos anteriores. Diez minutos y 6 entradas (tres
+// preguntas) alcanzan; si no cerró en eso, mejor arrancar de cero.
+export const CTX = 'intake:ctx';
+const TTL_CTX = 600;
+const MAX_CTX = 6;
+// El store de los tests no tiene `del`: ahí alcanza con pisar en null.
+const borrarCtx = (store) => (store.del ? store.del(CTX) : store.set(CTX, null));
 const TIMEOUT_MS = 30_000;
 
 const PREFERENCIAS = ['cualquier horario', 'lo más temprano posible', 'lo más tarde posible'];
@@ -76,6 +86,7 @@ function reglas(hoy, aeropuertos) {
     '- "No me importa el horario" o sin horario → ventana: null. Un rango ("a la mañana", "entre las 6 y las 12") → ventana ["HH:MM","HH:MM"].',
     '- Dos tramos el mismo día ("a aeroparque y después a córdoba") son tramos encadenados: el segundo sale de donde llega el primero.',
     '- Un mensaje que sólo nombra dos lugares, sin fecha ni intención de comprar, es tipo "busqueda".',
+    '- Si hay mensajes anteriores, son parte del mismo pedido: completá con ellos lo que falte.',
     '- Si falta algo esencial (la fecha o el destino), tipo "pedido" con aclaracion = UNA sola pregunta corta; si no falta nada, aclaracion: null.',
     '- escalaMinimaHoras: null salvo que el mensaje la diga.',
     '- preferencia: "cualquier horario" salvo que pida lo más temprano o lo más tarde posible.',
@@ -84,11 +95,12 @@ function reglas(hoy, aeropuertos) {
 }
 
 /**
- * Texto libre → objeto del schema, vía la API de Claude. Tira `Error('no-entendi')`
+ * Texto libre → objeto del schema, vía la API de Claude. `previos` son los turnos
+ * de la charla pendiente (ver CTX), en el formato de `messages`. Tira `Error('no-entendi')`
  * si la respuesta no terminó bien o no es JSON. La key nunca sale en un log ni en
  * un mensaje de error: los errores llevan sólo el status.
  */
-export async function parseOrderText(texto, { hoy = hoyEnAR(), aeropuertos = {}, _fetch = fetch } = {}) {
+export async function parseOrderText(texto, { hoy = hoyEnAR(), aeropuertos = {}, previos = [], _fetch = fetch } = {}) {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) throw new Error('sin ANTHROPIC_API_KEY');
   const res = await _fetch(API, {
@@ -100,7 +112,7 @@ export async function parseOrderText(texto, { hoy = hoyEnAR(), aeropuertos = {},
       max_tokens: 8000,
       output_config: { effort: 'low', format: { type: 'json_schema', schema: ORDER_SCHEMA } },
       system: reglas(hoy, aeropuertos),
-      messages: [{ role: 'user', content: texto }],
+      messages: [...previos, { role: 'user', content: texto }],
     }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
@@ -132,21 +144,32 @@ export function parseOrderStrict(texto) {
 /**
  * Del texto al borrador con botones. Cualquier falla de la API cae al formato
  * estricto; si tampoco es eso, se le muestra el formato y no se guarda nada.
+ *
+ * Si el modelo pregunta algo, la pregunta y lo que la motivó quedan en CTX para
+ * el próximo mensaje; cualquier respuesta que no sea otra pregunta cierra la
+ * charla. Si la API se cae, la charla queda: el dueño puede reintentar.
  */
 export async function cmdPedido(store, chatId, texto, { _fetch = fetch, hoy = hoyEnAR() } = {}) {
   const cat = await getCatalog(store);
+  const previos = (await store.get(CTX))?.mensajes ?? [];
   let p;
   try {
-    p = await parseOrderText(texto, { hoy, aeropuertos: cat?.aeropuertos ?? {}, _fetch });
+    p = await parseOrderText(texto, { hoy, aeropuertos: cat?.aeropuertos ?? {}, previos, _fetch });
   } catch (err) {
     console.error(`intake: ${err.message}`);
     p = parseOrderStrict(texto);
   }
+  if (p?.aclaracion && p.tipo === 'pedido') {
+    const mensajes = [...previos, { role: 'user', content: texto }, { role: 'assistant', content: p.aclaracion }];
+    // De a pares, así el primer turno que viaja siempre es del usuario.
+    await store.set(CTX, { mensajes: mensajes.slice(-MAX_CTX) }, TTL_CTX);
+    return { text: escapeMd(p.aclaracion) };
+  }
+  if (p && previos.length) await borrarCtx(store);
   if (!p || p.tipo === 'otro') return { text: AYUDA_ESTRICTA };
   if (p.tipo === 'busqueda') {
     return { text: 'Parece una búsqueda. Mandame `/buscar <origen> <destino>` o los dos nombres sueltos.' };
   }
-  if (p.aclaracion) return { text: escapeMd(p.aclaracion) };
 
   let order;
   try {
@@ -179,7 +202,7 @@ export async function cmdPedido(store, chatId, texto, { _fetch = fetch, hoy = ho
 
   await saveOrder(store, order);
   return {
-    text: formatPedido(order, { hoy }) + '\n\n¿Lo confirmo?',
+    text: `${formatPedido(order, { hoy })}\n\`${order.id}\` · /ensayo para probarlo sin pagar\n\n¿Lo confirmo?`,
     buttons: [[
       { text: '✅ Confirmar', data: `ord:ok:${order.id}` },
       { text: '❌ Cancelar', data: `ord:no:${order.id}` },
@@ -187,11 +210,14 @@ export async function cmdPedido(store, chatId, texto, { _fetch = fetch, hoy = ho
   };
 }
 
-/** Los pedidos que todavía pueden pasar (o en duda), cada uno con su Cancelar. */
+/** Los que todavía pueden pasar (o en duda), en el orden en que se crearon. `/ensayo N` usa este orden. */
+export const pedidosVivos = (store) => listOrders(store, { estados: ['borrador', 'confirmado', 'dudoso'] });
+
+/** Los pedidos vivos, cada uno con su id (para `/ensayo`) y su Cancelar. */
 export async function cmdPedidos(store) {
-  const vivos = await listOrders(store, { estados: ['borrador', 'confirmado', 'dudoso'] });
+  const vivos = await pedidosVivos(store);
   if (!vivos.length) return { text: 'No tenés pedidos vivos. Contame qué pasaje necesitás.' };
-  const lineas = vivos.map((o, i) => `${i + 1}. ${formatPedido(o)} — _${o.estado}_`);
+  const lineas = vivos.map((o, i) => `${i + 1}. \`${o.id}\` · ${formatPedido(o)} — _${o.estado}_`);
   return {
     text: `🧾 *${vivos.length} pedido(s)*\n\n${lineas.join('\n')}`,
     buttons: vivos.map((o, i) => [{ text: `❌ Cancelar ${i + 1}`, data: `ord:no:${o.id}` }]),

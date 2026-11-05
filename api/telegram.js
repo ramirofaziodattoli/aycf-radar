@@ -13,7 +13,8 @@ import { createStore } from '../src/store.js';
 import { withSession, SessionExpiredError } from '../src/session.js';
 import { handleCommand, handleCallback, comandoDe, NECESITA_SESION, NO_CONECTADO } from '../src/commands.js';
 import { reply, editMessage, answerCallback, deleteMessage } from '../src/notify.js';
-import { scoped, getUser, estaConectado } from '../src/users.js';
+import { scoped, getUser, estaConectado, esDueno } from '../src/users.js';
+import { CTX as INTAKE_CTX } from '../src/intake.js';
 
 const permitido = (chatId) => {
   const lista = (process.env.TELEGRAM_ALLOWED_CHATS || '')
@@ -68,8 +69,13 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Qué quiso decir: puede no haber escrito ningún comando.
-    const { cmd } = comandoDe(texto, user, { chatId });
+    // Qué quiso decir: puede no haber escrito ningún comando. Si el bot está
+    // esperando la respuesta a una pregunta del pedido, el texto suelto va ahí.
+    const enDialogo = esDueno(chatId) && process.env.AUTO_BUY === 'on'
+      ? Boolean(await store.get(INTAKE_CTX))
+      : false;
+    ctx.enDialogo = enDialogo;
+    const { cmd } = comandoDe(texto, user, { chatId, enDialogo });
 
     // La contraseña no se queda en el historial del chat si podemos evitarlo.
     if (cmd === '/conectar') await deleteMessage(chatId, msg.message_id).catch(() => {});
