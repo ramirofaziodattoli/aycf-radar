@@ -1,5 +1,7 @@
 // Compra automática del dueño. Lo disparan los crons de la madrugada (00:00, 00:13,
-// 00:30 y cada hora): cada invocación decide por la hora ART qué ventana le toca.
+// 00:30 y cada hora): cada invocación decide por la hora ART qué ventana le toca y
+// prueba TODOS los pedidos confirmados con vuelo de mañana en adelante (el
+// inventario se ve 2-3 días antes), el más cercano primero.
 //
 // Sólo el dueño: la tarjeta vive en una env var (AYCF_CARD) que cargó él en
 // Vercel. Nunca se loguea ni viaja por Telegram.
@@ -7,7 +9,7 @@
 import { createStore } from '../src/store.js';
 import { withSession } from '../src/session.js';
 import { scoped, envUser } from '../src/users.js';
-import { ordersDueTonight, getOrder } from '../src/orders.js';
+import { ordersPendientes, getOrder } from '../src/orders.js';
 import { runBuy, deadlineAR } from '../src/buy.js';
 import { reply } from '../src/notify.js';
 import { tomorrowInAR } from '../src/radar.js';
@@ -75,30 +77,36 @@ export default async function handler(req, res, {
     // pedido en otro estado llega a runBuy y vuelve sin tocarse.
     const q = req.query?.order;
     const id = Array.isArray(q) ? q[0] : q;
-    const pedidos = id ? [await getOrder(store, id)].filter(Boolean) : await ordersDueTonight(store);
+    const mañana = tomorrowInAR(now);
+    const pedidos = id ? [await getOrder(store, id)].filter(Boolean) : await ordersPendientes(store, { desde: mañana });
     if (!pedidos.length) return res.status(200).json({ ok: true, orders: [] });
 
     // Recién acá se pide la tarjeta: sin pedidos, que falte no es un problema.
     const card = leerTarjeta();
     if (!card) {
-      await reply('🔴 Tengo pedidos para esta noche pero no está cargada la tarjeta (AYCF_CARD)').catch(() => {});
+      await reply('🔴 Tengo pedidos para comprar pero no está cargada la tarjeta (AYCF_CARD)').catch(() => {});
       return res.status(200).json({ ok: true, skipped: 'sin-tarjeta' });
     }
 
     const { deadline, esperarLockMs, avisarSinCupo, cierre } = ventanaDe(now);
-    // Hasta validar el parser de reservas con una compra real, apagado: un pago
-    // ambiguo queda dudoso en vez de reintentarse.
+    // La verificación ya lee payment-summary (forma de la compra real del 05/11);
+    // hasta que el dueño la vea andar y lo prenda, un pago ambiguo queda dudoso.
     const bookingsCalibrado = process.env.AYCF_BOOKINGS_CALIBRADO === 'on';
-    const mañana = tomorrowInAR(now);
     const orders = [];
+    // Las pasadas cortas dan un minuto por pedido, contado desde que arranca cada
+    // uno: con varios pedidos, el segundo no puede heredar un deadline ya vencido.
+    const corta = !avisarSinCupo && esperarLockMs === 0;
+    const t0 = Date.now();
     // En serie: un solo Caravelo y una sola tarjeta.
     for (const order of pedidos) {
       // Un pedido que revienta no puede dejar sin compra a los que siguen.
       try {
         const r = await _withSession(store, (session) => _runBuy({
-          order, store, session, chatId: undefined, card, deadline, esperarLockMs,
-          avisarSinCupo, bookingsCalibrado,
-          // El cierre es sólo para el vuelo de mañana: un ?order de otra fecha no se cierra.
+          order, store, session, chatId: undefined, card, esperarLockMs, bookingsCalibrado,
+          deadline: corta ? Math.max(deadline, now.getTime() + (Date.now() - t0) + 60_000) : deadline,
+          // El cierre y el «⏳ sin cupo» son sólo para el vuelo de mañana: los más
+          // lejanos tienen más pasadas por delante y callan salvo que compren.
+          avisarSinCupo: avisarSinCupo && order.fechaVuelo === mañana,
           cierre: cierre && order.fechaVuelo === mañana,
         }), dueno);
         orders.push({ id: order.id, estado: r.estado });

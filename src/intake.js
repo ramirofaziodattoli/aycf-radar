@@ -202,7 +202,7 @@ export async function cmdPedido(store, chatId, texto, { _fetch = fetch, hoy = ho
 
   await saveOrder(store, order);
   return {
-    text: `${formatPedido(order, { hoy })}\n\`${order.id}\` · /ensayo para probarlo sin pagar\n\n¿Lo confirmo?`,
+    text: `${formatPedido(order)}\n\`${order.id}\` · /ensayo para probarlo sin pagar\n\n¿Lo confirmo?`,
     buttons: [[
       { text: '✅ Confirmar', data: `ord:ok:${order.id}` },
       { text: '❌ Cancelar', data: `ord:no:${order.id}` },

@@ -1,5 +1,5 @@
-// El loop de compra: de las 00:00 a las 00:15 (hora argentina) busca cupo para
-// un pedido confirmado y decide cuándo pagar.
+// El loop de compra: en cada pasada (00:00, los rescates y cada hora hasta las
+// 23:00, hora argentina) busca cupo para un pedido confirmado y decide cuándo pagar.
 //
 // Compone lo que ya existe: `itinerary.js` elige qué vuelos, `purchase.js` sabe
 // hablar con Caravelo/Spreedly y `orders.js` guarda el estado y el lock. Acá vive
@@ -13,7 +13,7 @@
 import { chooseItinerary, ordenDeCompra, superaTope } from './itinerary.js';
 import { setEstado, getOrder, lockOrder, unlockOrder, renovarLock, fueCancelado } from './orders.js';
 import { randomBytes } from 'node:crypto';
-import { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva, diaDeReserva } from './purchase.js';
+import { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva } from './purchase.js';
 import { search } from './jetsmart.js';
 import { reply } from './notify.js';
 import { SessionExpiredError } from './session.js';
@@ -140,8 +140,9 @@ const horaAR = (ms) => new Date(ms - 3 * 3600 * 1000).toISOString().slice(11, 16
  * queda `fallido` o `parcial`. `avisarSinCupo` (00:00 y 00:13) avisa que sigue
  * intentando; las pasadas horarias callan salvo que compren algo.
  *
- * `bookingsCalibrado`: hasta validar el parser de reservas con una compra real,
- * una lista legible sin la reserva NO prueba que no se compró. Apagado (default),
+ * `bookingsCalibrado`: la verificación sale de payment-summary (forma medida en
+ * la compra real del 05/11), pero hasta que el dueño la vea andar y prenda el
+ * flag, una lista legible sin la reserva NO prueba que no se compró. Apagado (default),
  * un pago ambiguo deja el pedido `dudoso` sin reintentar.
  */
 export async function runBuy({
@@ -239,13 +240,8 @@ export async function runBuy({
     const verificar = async (flight) => {
       for (let k = 0; k < 2; k++) {
         try {
+          // Las compras del pase salen de payment-summary: ruta + salida, sin código de vuelo.
           const bookings = await api.listBookings(session);
-          // Filas sin fecha legible no prueban nada (ni que sí ni que no): si son
-          // todas así, es lo mismo que no haber podido leer.
-          if (bookings.length && !bookings.some(diaDeReserva)) {
-            anotar('listBookings', 'reservas sin fecha legible');
-            return null;
-          }
           const fila = bookings.find((b) => hayReserva([b], flight));
           return { reservado: hayReserva(bookings, flight), pnr: fila?.pnr ?? null };
         } catch (e) {
@@ -292,7 +288,8 @@ export async function runBuy({
 
         // Marcador ANTES de pagar: si el proceso muere acá, el rescate verifica en vez de repagar.
         const g = await guardar({ pagoEnVuelo: {
-          tramo: i, code: flight.code, departsAt: flight.departsAt, arrivesAt: flight.arrivesAt,
+          tramo: i, code: flight.code, from: flight.from, to: flight.to,
+          departsAt: flight.departsAt, arrivesAt: flight.arrivesAt,
           tasas: q.total, hora: new Date(now()).toISOString(),
         } });
         if (g.estado !== 'confirmado') return ambiguo ? DUDOSO : { tipo: 'fin', estado: 'interrumpido' };
@@ -305,7 +302,7 @@ export async function runBuy({
         }
 
         let r;
-        try { r = await api.doPurchase(session, { token, card, quotation: q }); } catch (e) {
+        try { r = await api.doPurchase(session, { token, flight, quotation: q }); } catch (e) {
           anotar('doPurchase', e);
           r = { ok: false, motivo: 'desconocido', lanzo: true };
         }
@@ -317,8 +314,9 @@ export async function runBuy({
           return { tipo: 'fin', estado: 'fallido', motivo: r.motivo };
         }
         if (esAmbiguo && !bookingsCalibrado) {
-          // CALIBRAR: sin el parser validado, una lista legible sin la reserva no
-          // prueba que no cobró. Se mira una vez (si está, se compró); si no, dudoso
+          // Hasta que el dueño prenda AYCF_BOOKINGS_CALIBRADO (con payment-summary
+          // visto andar en producción), una lista legible sin la reserva no prueba
+          // que no cobró. Se mira una vez (si está, se compró); si no, dudoso
           // y sin reintento. Nunca hay un segundo doPurchase por este camino.
           const v = await verificar(flight);
           return v?.reservado ? { tipo: 'comprado', pnr: v.pnr, tasas: q.total } : DUDOSO;
@@ -340,7 +338,8 @@ export async function runBuy({
     // Una corrida anterior murió con un pago en vuelo: primero se resuelve eso.
     const pev = fresco.pagoEnVuelo;
     if (pev && !comprados.has(pev.tramo)) {
-      const v = await verificar(pev);
+      // Los marcadores viejos no traían la ruta: sale del tramo del pedido.
+      const v = await verificar({ from: order.tramos[pev.tramo]?.from, to: order.tramos[pev.tramo]?.to, ...pev });
       if (v?.reservado) {
         const t = order.tramos[pev.tramo];
         await registrar(pev.tramo, { code: pev.code, from: t.from, to: t.to, departsAt: pev.departsAt, arrivesAt: pev.arrivesAt, seats: 1 }, v.pnr, pev.tasas ?? null);

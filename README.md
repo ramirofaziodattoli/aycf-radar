@@ -244,24 +244,27 @@ Sin Redis el estado va a `.state.json`. Un cron del sistema a las 00:01, sin lí
 
 ## Compra automática (opcional, sólo el dueño)
 
-Si dejás un pedido confirmado (cualquier fecha futura, con N tramos encadenados), el bot lo **compra solo** cuando
-se libera el inventario, con tu tarjeta y tu pase. Es sólo para el dueño del deploy: los demás
+Si dejás un pedido confirmado (cualquier fecha futura, con N tramos encadenados), el bot lo **compra solo**
+apenas aparece cupo, con tu tarjeta y tu pase. Es sólo para el dueño del deploy: los demás
 usuarios siguen con el radar de siempre.
 
-La noche, en hora argentina:
+**Se intenta en cada pasada desde que confirmás**: el inventario suele verse 2-3 días antes (medido
+el 05/11: D+2 y D+3 con 6 asientos, y la compra de D+2 entró). Cada pasada prueba todos los pedidos
+confirmados con vuelo de mañana en adelante, el más cercano primero. En hora argentina:
 
-- **23:55** el precalentado te manda cada pedido de la noche con un botón para cancelarlo.
+- **23:55** el precalentado te manda cada pedido pendiente con un botón para cancelarlo.
 - **00:00** arranca el loop de compra y sigue hasta las **00:12**.
 - **00:13** pasada de rescate hasta las **00:20**; espera el lock de la anterior por si sigue viva.
-- **00:30 y cada hora** pasadas cortas (~1 min) para lo que haya quedado pendiente.
+- **00:30 y cada hora** pasadas cortas (~1 min por pedido) para lo que haya quedado pendiente.
 
-Sin cupo al final de una ventana el pedido **sigue confirmado**: las corridas de las 00:00 y 00:13
-te avisan «⏳ Sin cupo hasta las HH:MM, sigo intentando en los rescates» y las pasadas horarias
-callan salvo que compren algo. Recién la pasada de las **23:00** del día anterior al vuelo lo cierra:
+Sin cupo al final de una ventana el pedido **sigue confirmado**. Si el vuelo es mañana, las corridas
+de las 00:00 y 00:13 te avisan «⏳ Sin cupo hasta las HH:MM, sigo intentando en los rescates»; los
+vuelos más lejanos y las pasadas horarias callan salvo que compren algo. Recién la pasada de las **23:00** del día anterior al vuelo lo cierra:
 `fallido` (sin cupo) o `parcial` si compró algunos tramos y el resto nunca apareció.
 
 Si el pago no da una respuesta clara (timeout, 5xx, una página que no se entiende), el pedido queda
-**dudoso** y no se reintenta: mirá el mail de JetSMART. Cancelar desde el botón o `/pedidos` corta
+**dudoso** y no se reintenta: mirá el mail de JetSMART. Cuando el pago sale bien (Caravelo responde con
+un redirect a `payment-summary`), el PNR se lee de ese resumen; si no se puede, el aviso dice «PNR en el mail». Cancelar desde el botón o `/pedidos` corta
 el loop aunque esté a punto de pagar.
 
 En esas noches el radar del dueño se saltea (`compra-en-curso`): dos procesos pegándole a Caravelo
@@ -273,7 +276,7 @@ con la misma cuenta se pisan.
 | `AYCF_CARD` | JSON `{"number","month","year","cvv","holder"}`. Marcala **Sensitive** y cargala vos en Vercel: nunca por Telegram. Si falta y hay pedidos, el bot te avisa. |
 | `ANTHROPIC_API_KEY` | Para armar el pedido escribiéndole en lenguaje natural. |
 | `CRON_SECRET` | **Obligatoria con `AUTO_BUY=on`**: sin ella `/api/buy` responde 500 y no compra (si no, la URL quedaría pública). |
-| `AYCF_BOOKINGS_CALIBRADO` | `on` cuando el parser de «Mis reservas» esté validado con una compra real. Con `on`, un pago ambiguo espera 15 s, mira las reservas y reintenta una vez si no está; apagado (default) queda `dudoso` sin reintentar. |
+| `AYCF_BOOKINGS_CALIBRADO` | `on` cuando veas andar la verificación en producción. Las compras del pase salen de `payment-summary` (`content.pass.eventsLog`, forma medida en la compra real del 05/11) y se cruzan por ruta + hora de salida. Con `on`, un pago ambiguo espera 15 s, mira las compras y reintenta una vez si no está; apagado (default) queda `dudoso` sin reintentar. |
 
 `/api/buy?order=<id>` re-corre un pedido confirmado (para probar). No fuerza nada: un pedido en
 otro estado (dudoso, fallido, cancelado…) vuelve tal cual.

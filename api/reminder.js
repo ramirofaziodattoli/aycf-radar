@@ -17,7 +17,7 @@ import { tieneCredenciales } from '../src/login.js';
 import { resolveWatches } from '../src/config.js';
 import { reply } from '../src/notify.js';
 import { scoped, listUsers, usaSemilla, envUser } from '../src/users.js';
-import { ordersDueTonight, formatPedido } from '../src/orders.js';
+import { ordersPendientes, formatPedido } from '../src/orders.js';
 import { tomorrowInAR } from '../src/radar.js';
 
 export default async function handler(req, res) {
@@ -54,17 +54,18 @@ export default async function handler(req, res) {
     resultados.push({ chatId: user.chatId, viva });
   }
 
-  // Último aviso antes de comprar: a las 00:00 el bot paga solo, así que acá es
-  // donde todavía se puede cancelar. Son las 23:55, o sea que "mañana" de ahora
-  // es el día del vuelo de ESTA noche sólo sumando los minutos que faltan.
+  // Repaso de lo que el bot va a pagar solo: TODOS los pedidos confirmados con
+  // vuelo de mañana (de la noche que arranca) en adelante, porque cada pasada los
+  // intenta. Son las 23:55, o sea que "mañana" de la noche que arranca sale sólo
+  // sumando los minutos que faltan.
   if (process.env.AUTO_BUY === 'on') {
     const dueno = envUser();
     if (dueno) {
       const date = tomorrowInAR(new Date(Date.now() + 10 * 60 * 1000));
-      const pedidos = await ordersDueTonight(scoped(base, dueno.chatId), date).catch(() => []);
+      const pedidos = await ordersPendientes(scoped(base, dueno.chatId), { desde: date }).catch(() => []);
       for (const order of pedidos) {
         await reply(
-          formatPedido(order) + '\n\n_Lo compro solo a las 00:00. Si ya no lo querés, cancelalo ahora._',
+          formatPedido(order) + '\n\n_Lo compro solo apenas aparezca cupo (la próxima pasada es a las 00:00). Si ya no lo querés, cancelalo ahora._',
           undefined,
           { buttons: [[{ text: '❌ Cancelar', data: `ord:no:${order.id}` }]] }
         ).catch((err) => console.error(`recordatorio ${order.id}: ${err.message}`));

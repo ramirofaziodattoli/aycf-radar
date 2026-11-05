@@ -11,7 +11,7 @@ import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, sc
 import { haySecreto } from './crypto.js';
 import { cmdPedido, cmdPedidos, pedidosVivos } from './intake.js';
 import { runBuy } from './buy.js';
-import { getOrder, setEstado, cancelOrder, nocheDeCompra, esDeMañana, hoyEnAR } from './orders.js';
+import { getOrder, setEstado, cancelOrder } from './orders.js';
 
 const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
 
@@ -49,7 +49,7 @@ const AYUDA_ADMIN = `/usuarios — quiénes usan el bot (solo vos)
 /pedidos — mis pedidos de compra automática
 /ensayo [N] — ensayo de compra sin pagar del último pedido o del N de /pedidos (sólo vos)
 
-También podés contarme qué pasaje necesitás y lo compro solo a las 00:00.`;
+También podés contarme qué pasaje necesitás y lo compro solo apenas aparezca cupo.`;
 
 /**
  * Acepta códigos ("BRC") o nombres ("bariloche"). Los nombres pueden traer varias
@@ -311,18 +311,15 @@ async function botonesDestino(store, from, accion = 'a') {
  * botón viejo en el historial no puede resucitar un cancelado ni "cancelar" algo
  * que ya se compró.
  */
-async function callbackPedido(store, chatId, accion, id, hoy) {
+async function callbackPedido(store, chatId, accion, id) {
   if (!esDueno(chatId)) return { text: 'Ese botón ya no vale.' };
   const o = await getOrder(store, id);
   if (!o) return { text: 'Ese pedido ya no existe.' };
   if (accion === 'ok') {
     if (o.estado !== 'borrador') return { text: `Ese pedido ya está *${o.estado}*. Mirá /pedidos.` };
     await setEstado(store, id, 'confirmado');
-    return {
-      text: esDeMañana(o, hoy)
-        ? '✅ Listo, lo busco en la próxima pasada horaria. Te aviso con el PNR.'
-        : `✅ Listo, lo compro el ${nocheDeCompra(o)} a las 00:00. Te aviso con el PNR.`,
-    };
+    // Sea cual sea la fecha: el inventario se ve 2-3 días antes y cada pasada lo intenta.
+    return { text: '✅ Listo, lo busco en la próxima pasada horaria. Te aviso con el PNR.' };
   }
   if (!['borrador', 'confirmado', 'dudoso'].includes(o.estado)) {
     return { text: `Ese pedido ya está *${o.estado}*, no hay nada que cancelar.` };
@@ -333,11 +330,11 @@ async function callbackPedido(store, chatId, accion, id, hoy) {
 }
 
 /** Un toque de botón. Devuelve { text, buttons } para reemplazar el mensaje. */
-export async function handleCallback(data, { store, session, user, chatId, hoy = hoyEnAR() }) {
+export async function handleCallback(data, { store, session, user, chatId }) {
   const perfil = user ?? (chatId ? { chatId: String(chatId) } : null);
   const [accion, from, to] = String(data).split(':');
   try {
-    if (accion === 'ord') return await callbackPedido(store, chatId, from, to, hoy);
+    if (accion === 'ord') return await callbackPedido(store, chatId, from, to);
     if (accion === 'menu') {
       return (await botonesOrigen(store, '¿Desde dónde volás?')) ??
         { text: 'Todavía no tengo el mapa de la red. Probá `/vigilar bariloche salta`.' };

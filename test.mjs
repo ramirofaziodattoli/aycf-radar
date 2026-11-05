@@ -686,7 +686,7 @@ const memStore = () => {
 // --- pedidos: modelo, store y lock ---
 {
   const { rm } = await import('node:fs/promises');
-  const { newOrder, validateOrder, saveOrder, getOrder, listOrders, setEstado, ordersDueTonight, lockOrder, unlockOrder, formatPedido } = await import('./src/orders.js');
+  const { newOrder, validateOrder, saveOrder, getOrder, listOrders, setEstado, ordersDueTonight, ordersPendientes, lockOrder, unlockOrder, formatPedido } = await import('./src/orders.js');
   const { createStore } = await import('./src/store.js');
   const { scoped } = await import('./src/users.js');
   const limpio = { ...process.env };
@@ -700,7 +700,7 @@ const memStore = () => {
   const o = newOrder({ chatId: '1', fechaVuelo: '2026-11-08', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }] });
   assert.match(o.id, /^ord_[0-9a-f]{10}$/); assert.equal(o.estado, 'borrador');
   assert.equal(o.escalaMinimaHoras, 2.5); assert.equal(o.topeTasasPorTramoARS, 40000);
-  assert.equal(formatPedido(o, { hoy: '2026-11-05' }), '📌 *Pedido* · domingo 08/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco el sábado 07/11 a las 00:00');
+  assert.equal(formatPedido(o), '📌 *Pedido* · domingo 08/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco en la próxima pasada (cada hora hasta las 23:00)');
 
   await saveOrder(store, o);
   assert.equal((await getOrder(store, o.id)).fechaVuelo, '2026-11-08');
@@ -708,6 +708,15 @@ const memStore = () => {
   await setEstado(store, o.id, 'confirmado');
   assert.equal((await ordersDueTonight(store, '2026-11-08')).length, 1);
   assert.equal((await ordersDueTonight(store, '2026-11-09')).length, 0);
+  // ordersPendientes: todo lo confirmado desde `desde`, el vuelo más cercano primero.
+  const lejos = await saveOrder(store, { ...newOrder({ chatId: '1', fechaVuelo: '2026-11-10', tramos: [{ from: 'AEP', to: 'COR' }] }), estado: 'confirmado' });
+  const cerca = await saveOrder(store, { ...newOrder({ chatId: '1', fechaVuelo: '2026-11-07', tramos: [{ from: 'AEP', to: 'COR' }] }), estado: 'confirmado' });
+  const viejo = await saveOrder(store, { ...newOrder({ chatId: '1', fechaVuelo: '2026-11-05', tramos: [{ from: 'AEP', to: 'COR' }] }), estado: 'confirmado' });
+  const borrador = await saveOrder(store, newOrder({ chatId: '1', fechaVuelo: '2026-11-09', tramos: [{ from: 'AEP', to: 'COR' }] }));
+  assert.deepEqual((await ordersPendientes(store, { desde: '2026-11-06' })).map((x) => x.id), [cerca.id, o.id, lejos.id],
+    'confirmados desde mañana, ordenados por fecha; ni el vuelo pasado ni el borrador');
+  assert.deepEqual((await ordersPendientes(store, { desde: '2026-11-08' })).map((x) => x.id), [o.id, lejos.id], 'desde es inclusivo');
+  for (const x of [lejos, cerca, viejo, borrador]) await setEstado(store, x.id, 'cancelado');
   await setEstado(store, o.id, 'fallido', { intento: { hora: 'x', paso: 'quotation', error: 'boom' } });
   assert.equal((await getOrder(store, o.id)).intentos.length, 1);
   assert.equal((await listOrders(store, { estados: ['fallido'] })).length, 1);
@@ -791,9 +800,10 @@ const memStore = () => {
   assert.equal(margen.tramos[1].code, 'JA3024', 'cualquier horario con varios tramos: más margen total');
 }
 
-// --- compra: requests a Caravelo y Spreedly con la forma relevada ---
+// --- compra: requests a Caravelo y Spreedly con la forma de la compra real (W7F5SS, 05/11) ---
 {
-  const { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva } = await import('./src/purchase.js');
+  const { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva, paymentSummary } = await import('./src/purchase.js');
+  const { UA } = await import('./src/login.js');
   const session = { passId: 'PASS', header: () => 'laravel_session=S', absorb: async () => false };
   const calls = []; const json = (b, status = 200) => ({ ok: status < 400, status, headers: { get: () => 'application/json', getSetCookie: () => [] }, text: async () => JSON.stringify(b) });
   const f = (resp) => async (url, opt = {}) => { calls.push({ url: String(url), method: opt.method ?? 'GET', headers: opt.headers, body: opt.body }); return resp; };
@@ -816,33 +826,102 @@ const memStore = () => {
   assert.equal(errTok.message, 'tokenización: Spreedly respondió 422 (errors.invalid)');
   assert.ok(!/411111|1111|RAMIRO/.test(errTok.message));
   assert.equal((await tokenizeCard(card, init, { _fetch: f(json({ first_six: '411111' }, 500)) }).catch((e) => e)).message, 'tokenización: Spreedly respondió 500');
-  const tok = await tokenizeCard(card, init, { _fetch: f(json({ transaction: { payment_method: { token: 'TOK' } } })) });
-  assert.equal(tok, 'TOK');
-  assert.match(calls.at(-1).url, /core\.spreedly\.com\/v1\/payment_methods\.json$/);
-  const sp = JSON.parse(calls.at(-1).body);
-  assert.equal(sp.payment_method.credit_card.number, card.number); assert.equal(sp.certificate_token, 'C'); assert.equal(sp.signature, 'S');
+  const TOKEN = '99a9a99a9a9a9aaaaaaaaaaaa9';
+  const tok = await tokenizeCard(card, init, { _fetch: f(json({ transaction: { succeeded: true, payment_method: { token: TOKEN, last_four_digits: '1111' } } })) });
+  assert.equal(tok, TOKEN);
+  assert.equal(calls.at(-1).url, 'https://core.spreedly.com/v1/payment_methods/restricted.json?from=iframe&v=1.193');
+  assert.equal(calls.at(-1).method, 'POST');
+  assert.equal(calls.at(-1).headers['content-type'], 'application/json');
   assert.ok(!calls.at(-1).headers.cookie, 'a Spreedly no va la cookie de Caravelo');
+  assert.ok(!Object.keys(calls.at(-1).headers).some((k) => /environment/i.test(k)), 'flujo con certificado: sin environment key');
+  const sp = JSON.parse(calls.at(-1).body);
+  assert.deepEqual(Object.keys(sp), ['certificate_token', 'nonce', 'timestamp', 'signature', 'payment_method']);
+  assert.deepEqual(sp, {
+    certificate_token: 'C', nonce: 'N', timestamp: '1', signature: 'S',
+    payment_method: { credit_card: { full_name: 'RAMIRO FAZIO', number: card.number, month: '12', year: '2030', verification_value: '123' } },
+  });
 
-  const ok = await doPurchase(session, { token: 'TOK', card, quotation: q }, { _fetch: f({ ok: true, status: 200, headers: { get: () => 'text/html', getSetCookie: () => [] }, text: async () => '<h1>Compra confirmada</h1> PNR ABC123' }) });
-  assert.equal(ok.ok, true);
-  assert.match(calls.at(-1).url, /\/PASS\/do-purchase$/);
-  assert.match(calls.at(-1).body, /payment-method-token=TOK/); assert.match(calls.at(-1).body, /txvariant=card/);
-  assert.ok(!calls.at(-1).body.includes(card.number), 'el número de tarjeta nunca va a Caravelo');
+  // do-purchase: JSON con las claves del vuelo y el token; éxito = redirectUri a payment-summary.
+  const EXITO = { content: [], errors: [], redirectUri: ['https://go.jetsmart.com/es-ar/ja/subscriptions/availability/PASS/payment-summary'], redirectCode: 302, exceptionMessage: null };
+  const RESUMEN = { content: { booking: { recordLocator: 'W7F5SS' }, pass: { eventsLog: [] } } };
+  const secuencia = (...resps) => async (url, opt = {}) => { calls.push({ url: String(url), method: opt.method ?? 'GET', headers: opt.headers, body: opt.body }); return resps.shift(); };
+  calls.length = 0;
+  const ok = await doPurchase(session, { token: TOKEN, flight, quotation: q }, { _fetch: secuencia(json(EXITO), json(RESUMEN)) });
+  assert.deepEqual([ok.ok, ok.pnr], [true, 'W7F5SS'], 'el PNR sale de payment-summary');
+  assert.match(calls[0].url, /\/subscriptions\/PASS\/do-purchase$/); assert.equal(calls[0].method, 'POST');
+  assert.equal(calls[0].headers['content-type'], 'application/json');
+  assert.equal(calls[0].headers.accept, 'application/vnd.cvo.subs.frontend+json');
+  assert.equal(calls[0].headers.cookie, 'laravel_session=S');
+  const dp = JSON.parse(calls[0].body);
+  assert.deepEqual(Object.keys(dp).sort(), ['browserInfo', 'currency', 'lang', 'outboundFareSellKey', 'outboundKey', 'paymentGateway', 'token']);
+  assert.deepEqual([dp.paymentGateway, dp.lang, dp.currency, dp.outboundKey, dp.outboundFareSellKey, dp.token], ['spreedly', 'es-ar', 'ARS', 'K', 'FK', TOKEN]);
+  assert.deepEqual(dp.browserInfo, { browserData: {
+    userAgent: UA, javaEnabled: false, javascriptEnabled: true, language: 'es-419', colorDepth: 24,
+    screenHeight: 1080, screenWidth: 1920, tz: '180',
+    acceptHeader: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  } });
+  for (const x of [card.number, card.cvv, 'RAMIRO', '"month"', '"year"']) assert.ok(!calls[0].body.includes(x), `${x} no va a Caravelo`);
+  assert.match(calls[1].url, /\/subscriptions\/availability\/PASS\/payment-summary$/); assert.equal(calls[1].method, 'GET');
+  assert.equal(calls[1].headers.accept, 'application/vnd.cvo.subs.frontend+json');
+  // redirectUri como string también vale.
+  assert.equal((await doPurchase(session, { token: TOKEN, flight }, { _fetch: secuencia(json({ ...EXITO, redirectUri: EXITO.redirectUri[0] }), json(RESUMEN)) })).ok, true);
+  // El resumen falla: igual compró, el PNR llega por mail.
+  const sinResumen = await doPurchase(session, { token: TOKEN, flight }, { _fetch: secuencia(json(EXITO), json({ error: 'x' }, 500)) });
+  assert.deepEqual([sinResumen.ok, sinResumen.pnr], [true, null]);
+  const resumenRoto = await doPurchase(session, { token: TOKEN, flight }, { _fetch: secuencia(json(EXITO), { ok: true, status: 200, headers: { get: () => 'text/html', getSetCookie: () => [] }, text: async () => '<html>' }) });
+  assert.deepEqual([resumenRoto.ok, resumenRoto.pnr], [true, null]);
 
-  const rechazo = await doPurchase(session, { token: 'TOK', card, quotation: q }, { _fetch: f(json({ content: { exceptionMessage: 'payment.declined' } }, 402)) });
+  const rechazo = await doPurchase(session, { token: TOKEN, flight }, { _fetch: f(json({ content: { exceptionMessage: 'payment.declined' } }, 402)) });
   assert.equal(rechazo.ok, false); assert.equal(rechazo.motivo, 'rechazada');
+  const rechazo200 = await doPurchase(session, { token: TOKEN, flight }, { _fetch: f(json({ ...EXITO, redirectUri: [], exceptionMessage: 'payment.declined' })) });
+  assert.equal(rechazo200.motivo, 'rechazada', 'exceptionMessage de rechazo en un 2xx');
+  assert.equal((await doPurchase(session, { token: TOKEN, flight }, { _fetch: f(json({ ...EXITO, exceptionMessage: 'algo.raro' })) })).motivo, 'desconocido',
+    'payment-summary con exceptionMessage no es éxito');
+  assert.equal((await doPurchase(session, { token: TOKEN, flight }, { _fetch: f(json({ ...EXITO, redirectUri: ['https://go.jetsmart.com/es-ar/ja/subscriptions/availability/PASS'] })) })).motivo, 'desconocido',
+    'otro redirectUri no es éxito');
 
   await assert.rejects(() => quote(session, flight, { _fetch: f(json({ redirectUri: '/login' })) }), /sesión/);
+  await assert.rejects(() => doPurchase(session, { token: TOKEN, flight }, { _fetch: f(json({ redirectUri: ['https://go.jetsmart.com/auth/realms/x/protocol/openid-connect/auth'] })) }), /sesión/);
 
-  const bk = await listBookings(session, { _fetch: f(json({ content: { content: [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-06', from: 'SLA', to: 'EZE' }] } })) });
-  assert.equal(bk[0].pnr, 'ABC123');
-  assert.equal(hayReserva(bk, { code: 'JA3021', departsAt: '2026-11-06 22:04:00' }), true);
-  assert.equal(hayReserva(bk, { code: 'JA3100', departsAt: '2026-11-06 06:00:00' }), false);
+  // payment-summary: las compras del pase salen de content.pass.eventsLog.
+  const evento = (pnr, from, to, flightDate, extra = {}) => ({
+    eventType: 'FLIGHT_PURCHASE', timestamp: 1794000000000, recordLocator: pnr,
+    route: [{ departure: from, arrival: to, flightDate }], status: 'Confirmed',
+    amountPaid: { currency: 'ARS', qty: 15103.85, text: 'ARS 15.103,85' }, quotaConsumed: 1, ...extra,
+  });
+  const SUMMARY = { content: {
+    booking: { recordLocator: 'W7F5SS' },
+    pass: { eventsLog: [
+      evento('W7F5SS', 'BRC', 'AEP', 1794095340000), // 2026-11-07 20:49 ART
+      evento('ZZZ111', 'AEP', 'COR', 1794100000000, { status: 'Cancelled' }),
+      { eventType: 'PASS_RENEWAL', timestamp: 1, status: 'Confirmed' },
+      evento('YYY222', 'AEP', 'BRC', 1793000000000),
+    ] },
+  } };
+  calls.length = 0;
+  const bk = await listBookings(session, { _fetch: f(json(SUMMARY)) });
+  assert.match(calls[0].url, /\/availability\/PASS\/payment-summary$/);
+  assert.ok(!calls.some((c) => /profile\/.*\/bookings/.test(c.url)), 'el endpoint viejo de reservas no se usa');
+  assert.deepEqual(bk[0], { pnr: 'W7F5SS', from: 'BRC', to: 'AEP', departsAt: '2026-11-07 20:49:00', status: 'Confirmed', timestamp: 1794000000000 });
+  assert.deepEqual(bk.map((b) => b.pnr), ['W7F5SS', 'YYY222'], 'sólo FLIGHT_PURCHASE confirmadas');
+  const brc = { from: 'BRC', to: 'AEP', code: 'JA3050', departsAt: '2026-11-07 20:49:00' };
+  assert.equal(hayReserva(bk, brc), true);
+  assert.equal(hayReserva(bk, { ...brc, code: 'JA9999' }), true, 'el código de vuelo no hace falta');
+  assert.equal(hayReserva(bk, { ...brc, departsAt: '2026-11-07 06:00:00' }), false, 'otra salida de la misma ruta');
+  assert.equal(hayReserva(bk, { ...brc, departsAt: '2026-11-08 20:49:00' }), false, 'mismo horario, otro día');
+  assert.equal(hayReserva(bk, { ...brc, to: 'EZE' }), false);
+  assert.equal(hayReserva(bk, { ...brc, departsAt: undefined }), false);
+  assert.deepEqual(await paymentSummary(session, { _fetch: f(json(SUMMARY)) }).then((r) => r.pnr), 'W7F5SS');
+  assert.equal((await paymentSummary(session, { _fetch: f(json({ content: { pass: { eventsLog: [] } } })) })).pnr, null);
+  assert.deepEqual(await listBookings(session, { _fetch: f(json({ content: { pass: { eventsLog: [] } } })) }), [], 'log vacío = sin compras');
+  await assert.rejects(() => listBookings(session, { _fetch: f(json({ content: { booking: {} } })) }), /bookings-unavailable/, 'sin eventsLog no se sabe');
+  await assert.rejects(() => listBookings(session, { _fetch: f(json({ error: 'x' }, 500)) }), /bookings-unavailable/);
+  await assert.rejects(() => listBookings(session, { _fetch: f({ ok: true, status: 200, headers: { get: () => 'text/html', getSetCookie: () => [] }, text: async () => '<h2>Mis reservas</h2>' }) }), /bookings-unavailable/, 'HTML no es una lista');
 }
 
 // --- compra: arreglos de la revisión (éxito positivo, redirects, total, reservas) ---
 {
-  const { quote, doPurchase, listBookings, hayReserva } = await import('./src/purchase.js');
+  const { quote, doPurchase, listBookings } = await import('./src/purchase.js');
   const { SessionExpiredError } = await import('./src/session.js');
   const seen = [];
   const session = { passId: 'PASS', header: () => 'laravel_session=S', absorb: async () => false };
@@ -850,8 +929,8 @@ const memStore = () => {
     seen.push({ url: String(url), opt });
     return { ok: status < 400, status, headers: { get: (k) => headers[k.toLowerCase()] ?? null, getSetCookie: () => [] }, text: async () => (typeof text === 'string' ? text : JSON.stringify(text)) };
   };
-  const card = { number: '4111111111111111', month: '12', year: '2030', cvv: '987', holder: 'RAMIRO FAZIO' };
-  const buy = (fetcher) => doPurchase(session, { token: 'TOK', card, quotation: {} }, { _fetch: fetcher });
+  const flight = { key: 'K', fareSellKey: 'FK', from: 'SLA', to: 'EZE', departsAt: '2026-11-06 22:04:00', code: 'JA3021' };
+  const buy = (fetcher) => doPurchase(session, { token: 'TOK', flight, quotation: {} }, { _fetch: fetcher });
 
   assert.equal((await buy(R(200, { success: false }))).motivo, 'desconocido', '2xx sin señal positiva no es éxito');
   assert.equal((await buy(R(200, '<p>No hay asientos disponibles</p>'))).motivo, 'desconocido', '2xx nunca es sin-cupo');
@@ -864,17 +943,12 @@ const memStore = () => {
   assert.equal((await buy(R(409, { exceptionMessage: 'flight.no.seats' }))).motivo, 'sin-cupo', 'código explícito en 4xx');
   assert.equal((await buy(R(409, { exceptionMessage: 'Seat map temporarily unavailable, retry' }))).motivo, 'desconocido', 'prosa no es código');
   assert.equal((await buy(R(400, '<p>Service unavailable</p>'))).motivo, 'desconocido', 'sin `availab` suelto');
-  // I6 final: una fila sin fecha legible no prueba la reserva.
-  assert.equal(hayReserva([{ pnr: 'ABC123', flightCode: 'JA3021' }], { code: 'JA3021', departsAt: '2026-11-06 22:04:00' }), false);
-  assert.equal(hayReserva([{ pnr: 'ABC123', flightCode: 'JA3021', date: 'mañana' }], { code: 'JA3021', departsAt: '2026-11-06 22:04:00' }), false);
-  const conScript = await buy(R(200, '<script>var e="payment declined"</script><h1>Compra confirmada</h1> PNR ABC123'));
-  assert.equal(conScript.ok, true); assert.equal(conScript.pnr, 'ABC123');
-  assert.equal((await buy(R(200, '<p>Vuelo JA3021 confirmado. PNR ABC123</p>'))).pnr, 'ABC123');
-  assert.equal((await buy(R(200, 'COMPRA CONFIRMADA ... ABC123'))).pnr, 'ABC123');
-  assert.equal((await buy(R(200, 'compra no confirmada JA3021'))).motivo, 'desconocido');
-  const conf = await buy(R(200, '<h1>Reserva confirmada</h1> Código ABC123'));
-  assert.equal(conf.ok, true); assert.equal(conf.pnr, 'ABC123');
-  assert.equal((await buy(R(200, { pnr: 'XYZ789' }))).pnr, 'XYZ789');
+  // Éxito sólo con la señal medida (redirect a payment-summary): el HTML «confirmado» ya no cuenta.
+  assert.equal((await buy(R(200, '<h1>Compra confirmada</h1> PNR ABC123'))).motivo, 'desconocido', 'HTML no es éxito');
+  assert.equal((await buy(R(200, { pnr: 'XYZ789' }))).motivo, 'desconocido', 'un pnr suelto no es éxito');
+  assert.equal((await buy(R(200, { status: 'confirmed' }))).motivo, 'desconocido');
+  // redirectUri a payment-summary en un 4xx tampoco.
+  assert.equal((await buy(R(409, { redirectUri: ['https://go.jetsmart.com/es-ar/ja/subscriptions/availability/PASS/payment-summary'], exceptionMessage: null }))).ok, false);
   await assert.rejects(() => buy(R(302, '', { location: 'https://go.jetsmart.com/auth/realms/x/protocol/openid-connect/auth' })), SessionExpiredError);
   const bank = await buy(R(302, '', { location: 'https://acs.bank.com/challenge' }));
   assert.equal(bank.motivo, '3ds'); assert.match(bank.raw, /acs\.bank\.com/);
@@ -882,22 +956,17 @@ const memStore = () => {
   // redirectUri que no es login no es sesión muerta
   assert.equal((await buy(R(200, { redirectUri: '/es-ar/ja/subscriptions/thanks' }))).motivo, 'desconocido');
 
-  const flight = { key: 'K', fareSellKey: 'FK', from: 'SLA', to: 'EZE', departsAt: '2026-11-06 22:04:00', code: 'JA3021' };
   assert.equal((await quote(session, flight, { _fetch: R(200, { total: { qty: 15103.85 } }) })).total, 15103.85);
   await assert.rejects(() => quote(session, flight, { _fetch: R(200, { total: { text: '' } }) }), /cotización sin total/);
 
   await assert.rejects(() => listBookings(session, { _fetch: R(200, '<html><form>Ingresá tu usuario</form></html>', {}) }), /bookings-unavailable/);
-  const filas = await listBookings(session, { _fetch: R(200, '<table><tr><td>ABC123</td><td>JA3021</td><td>06/11/2026</td></tr></table>') });
-  assert.deepEqual(filas, [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-06' }]);
-  assert.equal(hayReserva(filas, { code: 'JA3021', departsAt: '2026-11-06 22:04:00' }), true);
-  assert.deepEqual(await listBookings(session, { _fetch: R(200, '<h2>Mis reservas</h2><p>Nada</p>') }), []);
+  await assert.rejects(() => listBookings(session, { _fetch: R(302, '', { location: '/auth/login' }) }), /bookings-unavailable/, 'un 3xx no es la lista');
 
   seen.length = 0;
   await buy(R(200, { success: false }));
   const c = seen.at(-1);
-  for (const k of ['month=12', 'year=2030', 'full_name=RAMIRO', 'payment_method_reference=']) assert.ok(c.opt.body.includes(k), k);
-  assert.ok(!c.opt.body.includes('987'), 'el cvv no va a Caravelo');
   assert.ok(c.opt.headers['user-agent'] && c.opt.headers.cookie && c.opt.signal, 'UA, cookie y timeout');
+  assert.equal(c.opt.redirect, 'manual', 'un 3xx al banco es la señal de 3DS');
 }
 
 // --- buy: loop 00:00–00:15, parcial, dudoso, tope ---
@@ -921,6 +990,8 @@ const memStore = () => {
   const VUELTA = v('JA3024', 'AEP', 'COR', '15:00', '16:20', 3);
   const SLA = { ...v('JA3021', 'SLA', 'EZE', '22:04', '00:11', 4), arrivesAt: '2026-11-09 00:11:00' };
   const card = { number: '4111111111111111', month: '12', year: '2030', cvv: '987', holder: 'RAMIRO FAZIO' };
+  // Una compra del pase como la devuelve listBookings (payment-summary): ruta + salida, sin código de vuelo.
+  const RESERVA = [{ pnr: 'ABC123', from: 'SLA', to: 'EZE', departsAt: SLA.departsAt, status: 'Confirmed', timestamp: 1 }];
 
   // Pedido nuevo y confirmado en el store; dos tramos BRC→AEP→COR o uno SLA→EZE.
   const pedido = async (tramos = [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }]) => {
@@ -1015,7 +1086,7 @@ const memStore = () => {
     const { r, msgs, calls } = await correr(order, {
       search: [SLA],
       doPurchase: new Error('The operation was aborted due to timeout'),
-      listBookings: [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-08' }],
+      listBookings: RESERVA,
     });
     assert.equal(r.estado, 'comprado');
     assert.equal(calls.doPurchase.length, 1, 'con la reserva a la vista no se vuelve a pagar');
@@ -1118,7 +1189,7 @@ const memStore = () => {
     const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
     const { r, calls } = await correr(order, {
       search: [SLA], doPurchase: { ok: false, motivo: 'sin-cupo', raw: '' },
-      listBookings: [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-08' }],
+      listBookings: RESERVA,
     });
     assert.equal(r.estado, 'comprado'); assert.equal(calls.doPurchase.length, 1); assert.equal(calls.search.length, 1);
   }
@@ -1156,7 +1227,6 @@ const memStore = () => {
   }
 
   // --- fix ronda 1 ---
-  const RESERVA = [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-08' }];
 
   // C1a/b) Antes de pagar queda marcado el pago en vuelo; al comprar, el tramo se persiste y el marcador se limpia.
   {
@@ -1167,6 +1237,7 @@ const memStore = () => {
       doPurchase: async ([, { quotation }]) => {
         const o = await getOrder(store, order.id);
         vistos.push([o.pagoEnVuelo?.code, o.pagoEnVuelo?.tramo, (o.resultado?.tramos ?? []).map((x) => x.code)]);
+        assert.deepEqual([o.pagoEnVuelo.from, o.pagoEnVuelo.to], quotation.code === 'JA3100' ? ['BRC', 'AEP'] : ['AEP', 'COR'], 'el marcador guarda la ruta');
         return { ok: true, pnr: quotation.code === 'JA3100' ? 'ABC123' : 'DEF456', raw: '' };
       },
     });
@@ -1469,12 +1540,30 @@ const memStore = () => {
     assert.equal(r.estado, 'cancelado'); assert.equal(g.estado, 'cancelado'); assert.equal(g.pagoEnVuelo ?? null, null);
   }
 
-  // I6) Recuperación de un pago en vuelo con reservas todas sin fecha: no se sabe ⇒ dudoso.
+  // Recuperación: una compra de la misma ruta a otra hora (u otro día) no es la del pago en vuelo ⇒ dudoso.
   {
     const order = await conPagoEnVuelo();
-    const { r, calls } = await correr(order, { search: [SLA], listBookings: [{ pnr: 'ABC123', flightCode: 'JA3021' }] });
+    const { r, calls } = await correr(order, { search: [SLA], listBookings: [
+      { ...RESERVA[0], departsAt: '2026-11-08 06:00:00' }, { ...RESERVA[0], departsAt: '2026-11-07 22:04:00' },
+    ] });
     assert.equal(r.estado, 'dudoso'); assert.equal(calls.doPurchase.length, 0);
-    assert.match(r.intentos.at(-1).error, /sin fecha legible/);
+    assert.match(r.intentos.at(-1).error, /sin reserva a la vista/);
+  }
+  // Recuperación con un marcador nuevo (trae la ruta): la verificación cruza por ruta + salida.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    await setEstado(store, order.id, 'confirmado', { pagoEnVuelo: { tramo: 0, code: 'JA3021', from: 'SLA', to: 'EZE', departsAt: SLA.departsAt, arrivesAt: SLA.arrivesAt, hora: 'x' } });
+    const { r, calls } = await correr(order, { search: [SLA], listBookings: RESERVA });
+    assert.equal(r.estado, 'comprado'); assert.equal(r.resultado.tramos[0].pnr, 'ABC123'); assert.equal(calls.doPurchase.length, 0);
+  }
+  // Pago ok sin PNR (payment-summary no respondió): comprado y el aviso dice «PNR en el mail».
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, msgs, calls } = await correr(order, { search: [SLA], doPurchase: { ok: true, pnr: null, raw: '' } });
+    assert.equal(r.estado, 'comprado'); assert.equal(r.resultado.tramos[0].pnr, null);
+    assert.match(msgs[0].text, /PNR en el mail/); assert.equal(calls.listBookings.length, 0);
+    // A doPurchase le llega el vuelo (claves de Caravelo), nunca la tarjeta.
+    assert.equal(calls.doPurchase[0][1].flight.code, 'JA3021'); assert.ok(!('card' in calls.doPurchase[0][1]));
   }
   process.env = limpio;
 }
@@ -1673,16 +1762,23 @@ const memStore = () => {
     await saveOrder(duenoStore, { ...o2, estado: 'confirmado' });
     const fallido = newOrder({ chatId: '1', fechaVuelo: '2030-01-01', tramos: [{ from: 'COR', to: 'AEP' }] });
     await saveOrder(duenoStore, { ...fallido, estado: 'fallido' });
+    // El inventario se ve 2-3 días antes: un pedido para pasado mañana también entra en cada pasada, después de los de mañana.
+    const enDias = (n) => new Date(Date.parse(tomorrowInAR()) + n * 86_400_000).toISOString().slice(0, 10);
+    const lejano = newOrder({ chatId: '1', fechaVuelo: enDias(2), tramos: [{ from: 'COR', to: 'AEP' }] });
+    await saveOrder(duenoStore, { ...lejano, estado: 'confirmado' });
+    const pasado = newOrder({ chatId: '1', fechaVuelo: enDias(-2), tramos: [{ from: 'COR', to: 'AEP' }] });
+    await saveOrder(duenoStore, { ...pasado, estado: 'confirmado' });
     const sesion = (_s, fn) => fn({ fake: true });
     const llamadas = [];
     const ok = async (a) => { llamadas.push(a); return { estado: 'comprado' }; };
 
     const r1 = await buy({ headers: AUTH, query: {} }, res(), { _runBuy: ok, _withSession: sesion });
     assert.equal(r1.code, 200);
-    assert.deepEqual(llamadas.map((a) => a.order.id).sort(), [pedido.id, o2.id].sort());
+    assert.deepEqual(llamadas.slice(0, 2).map((a) => a.order.id).sort(), [pedido.id, o2.id].sort(), 'primero los de mañana');
+    assert.equal(llamadas[2].order.id, lejano.id, 'el de pasado mañana también, al final');
     assert.deepEqual(r1.body.orders.map((o) => o.id), llamadas.map((a) => a.order.id), 'en el orden en que se procesaron');
-    assert.equal(llamadas.length, 2);
-    assert.deepEqual(r1.body.orders.map((o) => o.estado), ['comprado', 'comprado']);
+    assert.equal(llamadas.length, 3, 'ni el vuelo pasado ni el fallido');
+    assert.deepEqual(r1.body.orders.map((o) => o.estado), ['comprado', 'comprado', 'comprado']);
     assert.deepEqual(llamadas[0].card, CARD, 'la tarjeta llega entera a runBuy');
     assert.ok(!JSON.stringify(r1.body).includes(CARD.number) && !JSON.stringify(r1.body).includes('cvv'));
 
@@ -1690,12 +1786,35 @@ const memStore = () => {
     let n = 0;
     const rompe = async (a) => { llamadas.push(a); if (++n === 1) throw new Error(`boom ${CARD.number}`); return { estado: 'comprado' }; };
     const r2 = await buy({ headers: AUTH, query: {} }, res(), { _runBuy: rompe, _withSession: sesion });
-    assert.equal(r2.code, 200); assert.equal(llamadas.length, 2, 'el segundo corre igual');
+    assert.equal(r2.code, 200); assert.equal(llamadas.length, 3, 'los demás corren igual');
     assert.deepEqual(r2.body.orders[0], { id: llamadas[0].order.id, error: 'interno' });
     assert.equal(r2.body.orders[1].estado, 'comprado');
 
     const r3 = await buy({ headers: AUTH, query: {} }, res(), { _runBuy: async () => { throw new Error('x'); }, _withSession: sesion });
-    assert.equal(r3.code, 500); assert.equal(r3.body.orders.length, 2);
+    assert.equal(r3.code, 500); assert.equal(r3.body.orders.length, 3);
+
+    // 00:02: el «⏳ sin cupo» sólo para el vuelo de mañana; los lejanos callan.
+    const hoy0 = Date.now() - ((Date.now() - 3 * 3600_000) % 86_400_000);
+    const a0002 = new Date(hoy0 + 2 * 60_000);
+    llamadas.length = 0;
+    await buy({ headers: AUTH, query: {} }, res(), { _runBuy: ok, _withSession: sesion, now: a0002 });
+    assert.equal(llamadas.length, 3);
+    for (const a of llamadas) {
+      assert.equal(a.avisarSinCupo, a.order.fechaVuelo === tomorrowInAR(a0002), `avisarSinCupo de ${a.order.fechaVuelo}`);
+      assert.equal(a.deadline, ventanaDe(a0002).deadline, 'la ventana de las 00:00 es una sola');
+    }
+    assert.ok(llamadas.some((a) => a.avisarSinCupo) && llamadas.some((a) => !a.avisarSinCupo));
+
+    // Pasada horaria: un minuto por pedido contado desde que arranca cada uno.
+    const a14 = new Date(hoy0 + 14 * 3600_000);
+    const realNow = Date.now; let reloj = realNow();
+    Date.now = () => reloj;
+    llamadas.length = 0;
+    try {
+      await buy({ headers: AUTH, query: {} }, res(), { _runBuy: async (a) => { reloj += 120_000; return ok(a); }, _withSession: sesion, now: a14 });
+    } finally { Date.now = realNow; }
+    assert.deepEqual(llamadas.map((a) => a.deadline - a14.getTime()), [60_000, 180_000, 300_000], 'el segundo no hereda un deadline vencido');
+    assert.ok(llamadas.every((a) => a.avisarSinCupo === false && a.cierre === false));
 
     llamadas.length = 0;
     const r4 = await buy({ headers: AUTH, query: { order: [fallido.id, 'otro'] } }, res(), { _runBuy: ok, _withSession: sesion });
@@ -1745,16 +1864,21 @@ const memStore = () => {
   process.env.AUTO_BUY = 'on';
   msgs.length = 0;
 
-  // Recordatorio de las 23:55: un mensaje por pedido de LA NOCHE (vuelo pasado mañana de hoy ART), con botón de cancelar.
+  // Recordatorio de las 23:55: un mensaje por cada pedido pendiente (vuelo de la noche que arranca en adelante), con botón de cancelar.
   const real = Date.now;
+  const noche = newOrder({ chatId: '1', fechaVuelo: '2026-11-07', tramos: [{ from: 'BRC', to: 'AEP' }] });
+  const lejana = newOrder({ chatId: '1', fechaVuelo: '2026-11-09', tramos: [{ from: 'BRC', to: 'AEP' }] });
+  const ayer = newOrder({ chatId: '1', fechaVuelo: '2026-11-05', tramos: [{ from: 'BRC', to: 'AEP' }] });
   Date.now = () => Date.UTC(2026, 10, 6, 2, 55); // 23:55 ART del 5/11
   try {
-    const noche = newOrder({ chatId: '1', fechaVuelo: '2026-11-07', tramos: [{ from: 'BRC', to: 'AEP' }] });
-    await saveOrder(duenoStore, { ...noche, estado: 'confirmado' });
+    for (const x of [noche, lejana, ayer]) await saveOrder(duenoStore, { ...x, estado: 'confirmado' });
     await recordatorio({ headers: AUTH }, res());
   } finally { Date.now = real; }
-  const rec = msgs.filter((m) => /Lo compro solo a las 00:00/.test(m.text));
-  assert.equal(rec.length, 1, 'sólo el pedido de esta noche');
+  const rec = msgs.filter((m) => /Lo compro solo apenas aparezca cupo/.test(m.text));
+  const ids = rec.map((m) => m.reply_markup.inline_keyboard[0][0].callback_data.slice('ord:no:'.length));
+  assert.ok(ids.includes(noche.id) && ids.includes(lejana.id), 'el de esta noche y el lejano');
+  assert.ok(!ids.includes(ayer.id), 'un vuelo que ya pasó no');
+  assert.ok(rec.every((m) => /próxima pasada/.test(m.text)));
   assert.equal(JSON.parse(JSON.stringify(rec[0].reply_markup)).inline_keyboard[0][0].text, '❌ Cancelar');
   assert.match(rec[0].reply_markup.inline_keyboard[0][0].callback_data, /^ord:no:/);
 
@@ -1841,13 +1965,13 @@ const memStore = () => {
   assert.equal(borrador.fechaVuelo, '2026-11-07', 'el próximo sábado respecto de hoy');
   assert.equal(borrador.tramos.length, 2);
   assert.equal(borrador.escalaMinimaHoras, 2.5, 'null del modelo = el default');
-  assert.equal(out.text, formatPedido(borrador, { hoy: HOY }) + `\n\`${id}\` · /ensayo para probarlo sin pagar\n\n¿Lo confirmo?`);
-  assert.equal(formatPedido(borrador, { hoy: HOY }),
-    '📌 *Pedido* · sábado 07/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco el viernes 06/11 a las 00:00');
-  assert.equal(formatPedido({ ...borrador, tramos: [{ from: 'BRC', to: 'AEP', ventana: ['06:00', '12:00'] }] }, { hoy: HOY }),
-    '📌 *Pedido* · sábado 07/11 · BRC → AEP (06:00–12:00) · lo busco el viernes 06/11 a las 00:00');
-  // Vuelo de mañana: el inventario ya salió a las 00:01 de hoy y lo levantan las pasadas horarias.
-  assert.equal(formatPedido({ ...borrador, fechaVuelo: '2026-11-06' }, { hoy: HOY }),
+  assert.equal(out.text, formatPedido(borrador) + `\n\`${id}\` · /ensayo para probarlo sin pagar\n\n¿Lo confirmo?`);
+  // Cualquier fecha futura: el inventario se ve 2-3 días antes y cada pasada lo intenta.
+  assert.equal(formatPedido(borrador),
+    '📌 *Pedido* · sábado 07/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco en la próxima pasada (cada hora hasta las 23:00)');
+  assert.equal(formatPedido({ ...borrador, tramos: [{ from: 'BRC', to: 'AEP', ventana: ['06:00', '12:00'] }] }),
+    '📌 *Pedido* · sábado 07/11 · BRC → AEP (06:00–12:00) · lo busco en la próxima pasada (cada hora hasta las 23:00)');
+  assert.equal(formatPedido({ ...borrador, fechaVuelo: '2026-11-06' }),
     '📌 *Pedido* · viernes 06/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco en la próxima pasada (cada hora hasta las 23:00)');
 
   // (c) los botones: confirmar, cancelar, id que no existe, y sólo para el dueño.
@@ -1856,7 +1980,7 @@ const memStore = () => {
   assert.ok(!/Listo/.test(noDueno.text));
   const conf = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '1', hoy: HOY });
   assert.equal((await getOrder(store, id)).estado, 'confirmado');
-  assert.equal(conf.text, '✅ Listo, lo compro el viernes 06/11 a las 00:00. Te aviso con el PNR.');
+  assert.equal(conf.text, '✅ Listo, lo busco en la próxima pasada horaria. Te aviso con el PNR.', 'aunque el vuelo sea pasado mañana');
   const canc = await handleCallback(`ord:no:${id}`, { store, user: null, chatId: '1' });
   assert.equal((await getOrder(store, id)).estado, 'cancelado');
   assert.equal(canc.text, '❌ Pedido cancelado.');
@@ -2013,7 +2137,7 @@ const memStore = () => {
   assert.equal(porComando.buttons.length, 2);
   const ayuda = await handleCommand('/ayuda', { store, session: null, user: dueno, chatId: '1' });
   assert.match(ayuda, /\/pedidos — mis pedidos de compra automática/);
-  assert.match(ayuda, /lo compro solo a las 00:00/);
+  assert.match(ayuda, /lo compro solo apenas aparezca cupo/);
   const { NECESITA_SESION } = await import('./src/commands.js');
   assert.ok(!NECESITA_SESION.includes('/pedido') && !NECESITA_SESION.includes('/pedidos'));
 

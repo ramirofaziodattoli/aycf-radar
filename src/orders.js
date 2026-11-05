@@ -1,4 +1,4 @@
-// Pedidos de compra automática: "quiero este vuelo, comprámelo a las 00:00".
+// Pedidos de compra automática: "quiero este vuelo, comprámelo apenas haya cupo".
 //
 // Un pedido vive en el store del usuario (scoped) y recorre estados:
 // borrador → confirmado → comprado | parcial | dudoso | fallido (o cancelado). Acá solo está el
@@ -107,9 +107,24 @@ export async function cancelOrder(store, id) {
 /** ¿El usuario canceló este pedido? Lee sólo la clave aparte (ver `cancelOrder`). */
 export const fueCancelado = async (store, id) => Boolean(await store.get(cancelKey(id)));
 
-/** Los que hay que comprar esta noche: confirmados y para el vuelo de `date`. */
+/**
+ * Los confirmados para el vuelo de `date`. Lo usan el salteo del radar del dueño
+ * (noche de compra) y nada más: la compra mira `ordersPendientes`.
+ */
 export async function ordersDueTonight(store, date = tomorrowInAR()) {
   return (await listOrders(store, { estados: ['confirmado'] })).filter((o) => o.fechaVuelo === date);
+}
+
+/**
+ * Todo lo confirmado con vuelo desde `desde` (mañana por defecto), el más cercano
+ * primero. El inventario se ve 2-3 días antes (medido el 05/11: D+2 y D+3 con 6
+ * asientos, y la compra de D+2 entró), así que cada pasada intenta todos.
+ * Comparar 'YYYY-MM-DD' como string ordena igual que las fechas.
+ */
+export async function ordersPendientes(store, { desde = tomorrowInAR() } = {}) {
+  return (await listOrders(store, { estados: ['confirmado'] }))
+    .filter((o) => o.fechaVuelo >= desde)
+    .sort((a, b) => a.fechaVuelo.localeCompare(b.fechaVuelo));
 }
 
 /**
@@ -140,18 +155,6 @@ export async function renovarLock(store, id, owner, ttlSeconds) {
 /** Hoy en Argentina (UTC-3 fijo, sin DST): a las 22 h ART en UTC ya es mañana. */
 export const hoyEnAR = (now = new Date()) => new Date(now.getTime() - 3 * 3600 * 1000).toISOString().slice(0, 10);
 
-const sumarDias = (iso, n) => {
-  const [y, m, d] = iso.split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
-};
-
-/**
- * ¿Lo compra una pasada horaria de hoy? El inventario de mañana ya se liberó a las
- * 00:01 de hoy y las pasadas (cada hora hasta las 23:00 ART) lo levantan; el resto
- * espera a la corrida de las 00:00 del día anterior al vuelo.
- */
-export const esDeMañana = (o, hoy = hoyEnAR()) => o.fechaVuelo === sumarDias(hoy, 1);
-
 const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
 
 /** "2026-11-07" → "sábado 07/11". UTC a propósito: es una fecha de calendario, no un instante. */
@@ -162,30 +165,20 @@ export function fechaLarga(iso) {
 }
 
 /**
- * El día de la corrida que lo compra. El inventario de D+1 se libera a las 00:00
- * de D, así que un vuelo del sábado se compra al arrancar el viernes.
- */
-export function nocheDeCompra(o) {
-  return fechaLarga(sumarDias(o.fechaVuelo, -1));
-}
-
-/**
  * Una línea Markdown con todo lo que se va a pagar, para leerla antes de
  * confirmar: «📌 *Pedido* · sábado 07/11 · BRC → AEP (cualquier horario) · AEP → COR,
- * escala ≥ 2,5 h · lo busco el viernes 06/11 a las 00:00». El horario del primer
- * tramo es la ventana o, sin ventana, la preferencia; los siguientes dependen de
- * la escala, así que muestran eso (y su ventana si la tienen). Un vuelo de mañana
- * no espera a las 00:00: lo busca la próxima pasada horaria.
+ * escala ≥ 2,5 h · lo busco en la próxima pasada (cada hora hasta las 23:00)». El
+ * horario del primer tramo es la ventana o, sin ventana, la preferencia; los
+ * siguientes dependen de la escala, así que muestran eso (y su ventana si la
+ * tienen). Sea cual sea la fecha, lo intenta la próxima pasada: el inventario
+ * suele verse 2-3 días antes.
  */
-export function formatPedido(o, { hoy = hoyEnAR() } = {}) {
+export function formatPedido(o) {
   const tramos = o.tramos.map((t, i) => {
     const horario = t.ventana ? ` (${t.ventana[0]}–${t.ventana[1]})`
       : i === 0 ? ` (${o.preferencia ?? 'cualquier horario'})` : '';
     const escala = i > 0 ? `, escala ≥ ${String(o.escalaMinimaHoras).replace('.', ',')} h` : '';
     return `${t.from} → ${t.to}${horario}${escala}`;
   });
-  const cuando = esDeMañana(o, hoy)
-    ? 'lo busco en la próxima pasada (cada hora hasta las 23:00)'
-    : `lo busco el ${nocheDeCompra(o)} a las 00:00`;
-  return ['📌 *Pedido*', fechaLarga(o.fechaVuelo), ...tramos, cuando].join(' · ');
+  return ['📌 *Pedido*', fechaLarga(o.fechaVuelo), ...tramos, 'lo busco en la próxima pasada (cada hora hasta las 23:00)'].join(' · ');
 }

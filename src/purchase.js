@@ -2,7 +2,8 @@
 //
 // Es lo que hace el navegador cuando un socio canjea un vuelo: cotización →
 // INIT del orquestador de pagos → tokenización de la tarjeta en Spreedly →
-// do-purchase. La tarjeta SOLO viaja a Spreedly (PCI): a Caravelo le llega el
+// do-purchase → payment-summary (PNR). Formas calibradas con la compra real del
+// 05/11 (W7F5SS). La tarjeta SOLO viaja a Spreedly (PCI): a Caravelo le llega el
 // token. Cada función recibe `{ _fetch }` al final para poder testear sin red.
 //
 // Regla de logs: jamás un body (lleva tarjeta o datos de la cuenta). Si algo
@@ -16,7 +17,7 @@ import { UA } from './login.js';
 import { BASE, parseAmount } from './jetsmart.js';
 
 const LOGIN_RE = /\/auth\/login|\/auth\/realms\/|openid-connect|\/login/i;
-const SPREEDLY_URL = 'https://core.spreedly.com/v1/payment_methods.json';
+const SPREEDLY_URL = 'https://core.spreedly.com/v1/payment_methods/restricted.json?from=iframe&v=1.193';
 
 function exigirPase(session) {
   if (!session.passId) throw new Error('no hay pase AYCF para comprar');
@@ -112,26 +113,25 @@ export async function initPayment(session, { _fetch = fetch } = {}) {
 }
 
 /**
- * Tokeniza la tarjeta directo en Spreedly. SIN cookie de Caravelo y fuera del
- * mapeo de sesión: es otro host y otro contrato.
+ * Tokeniza la tarjeta directo en Spreedly, como el iframe (number-frame-1.193):
+ * flujo con certificado de Caravelo, así que no hay environment key ni cookie.
+ * Es otro host y otro contrato: fuera del mapeo de sesión.
  */
-// CALIBRAR: esta forma de body es la relevada del frontend pero no está confirmada;
-// se ajusta con la compra de calibración real (Task 8).
 export async function tokenizeCard(card, init, { _fetch = fetch } = {}) {
   const res = await _fetch(SPREEDLY_URL, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json', 'user-agent': UA },
+    headers: { 'content-type': 'application/json', 'user-agent': UA },
     body: JSON.stringify({
+      certificate_token: init.certificateToken,
+      nonce: init.nonce,
+      timestamp: init.timestamp,
+      signature: init.signature,
       payment_method: {
         credit_card: {
           full_name: card.holder, number: card.number,
           month: card.month, year: card.year, verification_value: card.cvv,
         },
       },
-      certificate_token: init.certificateToken,
-      nonce: init.nonce,
-      timestamp: init.timestamp,
-      signature: init.signature,
     }),
     signal: AbortSignal.timeout(30_000),
   });
@@ -139,7 +139,7 @@ export async function tokenizeCard(card, init, { _fetch = fetch } = {}) {
   let json = null;
   try { json = JSON.parse(text); } catch { /* se informa abajo */ }
   const token = json?.transaction?.payment_method?.token;
-  if (!res.ok || !token) throw fallaSpreedly(res, json);
+  if (!res.ok || typeof token !== 'string' || !token) throw fallaSpreedly(res, json);
   return token;
 }
 
@@ -151,27 +151,36 @@ function fallaSpreedly(res, json) {
   return new Error(`tokenización: Spreedly respondió ${res.status}${claves.length ? ` (${claves.join(', ')})` : ''}`);
 }
 
+// Lo que manda el navegador en `browserInfo` (datos para el 3DS del banco). Fijo:
+// es el mismo UA del login y una pantalla de escritorio común.
+const BROWSER_DATA = {
+  userAgent: UA, javaEnabled: false, javascriptEnabled: true, language: 'es-419',
+  colorDepth: 24, screenHeight: 1080, screenWidth: 1920, tz: '180',
+  acceptHeader: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+};
+
+const redirects = (json) => [json?.redirectUri].flat().filter((u) => typeof u === 'string');
+
 /**
- * Ejecuta la compra con el token. Clasifica el fallo para que el caller sepa si
+ * Ejecuta la compra con el token. Forma relevada de la compra real del 05/11
+ * (W7F5SS): JSON con las claves del vuelo y el token; la tarjeta nunca va a
+ * Caravelo. Éxito = 2xx JSON con un `redirectUri` a `payment-summary`; de ahí
+ * sale el PNR (`paymentSummary`). Clasifica el fallo para que el caller sepa si
  * reintentar (sin-cupo), pedir al usuario (3ds) o frenar (rechazada).
  */
-// CALIBRAR: body form-urlencoded y parseo de la respuesta son provisorios; se
-// confirman con la compra de calibración real (Task 8).
-export async function doPurchase(session, { token, card, quotation }, { _fetch = fetch } = {}) {
+export async function doPurchase(session, { token, flight }, { _fetch = fetch } = {}) {
   const passId = exigirPase(session);
-  const form = new URLSearchParams({
-    'payment-method-token': token,
-    month: card.month,
-    year: card.year,
-    full_name: card.holder,
-    payment_method_reference: '',
-    txvariant: 'card',
-  });
+  const body = {
+    paymentGateway: 'spreedly', lang: 'es-ar', currency: 'ARS',
+    outboundKey: flight.key, outboundFareSellKey: flight.fareSellKey,
+    browserInfo: { browserData: BROWSER_DATA },
+    token,
+  };
   // `redirect: manual` porque un 3xx hacia el ACS del banco ES la señal de 3DS.
   const { res, text, json } = await pedir(session, `${BASE}/${passId}/do-purchase`, {
     method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json, text/html' },
-    body: form.toString(),
+    headers: { 'content-type': 'application/json', accept: 'application/vnd.cvo.subs.frontend+json' },
+    body: JSON.stringify(body),
     redirect: 'manual',
   }, { _fetch });
 
@@ -186,21 +195,23 @@ export async function doPurchase(session, { token, card, quotation }, { _fetch =
   // NO es sin cupo (leerlo así habilitaba pagar otro vuelo). Siempre desconocido.
   if (res.status >= 500) return { ok: false, motivo: 'desconocido', raw };
 
+  // Éxito SOLO con la señal medida: 2xx JSON, sin exceptionMessage y con el
+  // redirect a payment-summary. Un 2xx con otra cosa no prueba nada → 'desconocido'
+  // y el loop verifica contra las reservas antes de reintentar.
+  if (es2xx && json && !msg && redirects(json).some((u) => /payment-summary/.test(u))) {
+    let pnr = null;
+    try { pnr = (await paymentSummary(session, { _fetch })).pnr; } catch { /* el PNR llega por mail */ }
+    return { ok: true, pnr, raw };
+  }
+
   // En un 2xx el texto NUNCA decide un fallo: si el cobro pasó, reintentar por un
   // "sin cupo" falso cobraría dos veces. Solo el exceptionMessage JSON es confiable.
   if (/declin|rechaz/i.test(es2xx ? (msg ?? '') : marcador)) return { ok: false, motivo: 'rechazada', raw };
 
-  // Éxito SOLO con señal positiva: un 2xx pelado no prueba nada (Caravelo devuelve
-  // 200 con {"success":false} o con páginas de error). Sin señal → 'desconocido' y
-  // el loop verifica contra las reservas antes de reintentar.
-  if (es2xx && !msg) {
-    const pnr = señalDeExito(json, visible);
-    if (pnr !== null) return { ok: true, pnr: pnr || undefined, raw };
-  }
-
-  // CALIBRAR: sin-cupo sólo en un 4xx y con señal inequívoca: un exceptionMessage
-  // que es un CÓDIGO (sin espacios) y nombra asientos/cupo/availability, o una frase
-  // explícita en el texto visible. Nada de `availab` suelto: matchea «unavailable».
+  // Sin-cupo sólo en un 4xx y con señal inequívoca: un exceptionMessage que es un
+  // CÓDIGO (sin espacios) y nombra asientos/cupo/availability, o una frase explícita
+  // en el texto visible. Nada de `availab` suelto: matchea «unavailable».
+  // (No se vio ningún sin-cupo real todavía: estas reglas siguen siendo las de la revisión.)
   const es4xx = res.status >= 400 && res.status < 500;
   const codigoSinCupo = typeof msg === 'string' && /^[\w.:-]+$/.test(msg) && /seat|cupo|availability/i.test(msg);
   if (es4xx && (codigoSinCupo || /no hay asientos|sin cupo|no seats available/i.test(marcador))) {
@@ -221,104 +232,65 @@ export async function doPurchase(session, { token, card, quotation }, { _fetch =
   return { ok: false, motivo: 'desconocido', raw };
 }
 
-// CALIBRAR: reglas de éxito positivo provisorias; se confirman con la compra real.
-// Devuelve el PNR ('' si hay éxito sin PNR legible) o null si no hay señal de éxito.
-function señalDeExito(json, text) {
-  const j = json?.content ?? json;
-  const pnr = j?.pnr ?? j?.bookingReference ?? j?.recordLocator;
-  if (typeof pnr === 'string' && pnr) return pnr;
-  if (/^(ok|confirmed|success)$/i.test(String(json?.status ?? j?.status ?? ''))) return '';
-  const plano = text.replace(/<[^>]+>/g, ' ');
-  // "no confirmada" / "unconfirmed" no son confirmación.
-  const m = /(?<!\bno\s)(?<!\bun)(?:confirmad|confirmed)|éxito|exitosa/i.exec(plano);
-  if (!m) return null;
-  const cerca = plano.slice(Math.max(0, m.index - 120), m.index + 120);
-  // El PNR lleva al menos un dígito y no es un código de vuelo (JA3021 también tiene 6).
-  const code = [...cerca.matchAll(/\b[A-Z0-9]{6}\b/g)].map((x) => x[0])
-    .find((c) => /\d/.test(c) && !/^JA\d{3,4}$/.test(c));
-  return code ?? null;
+/**
+ * La página de resumen después de pagar (~75 KB de JSON). Trae el PNR de la
+ * última compra en `content.booking.recordLocator` y el historial del pase en
+ * `content.pass.eventsLog`. Tira si no es un 2xx JSON con `content`.
+ */
+async function leerResumen(session, _fetch) {
+  const passId = exigirPase(session);
+  const { res, text, json } = await pedir(session, `${BASE}/availability/${passId}/payment-summary`, {
+    method: 'GET',
+    headers: { accept: 'application/vnd.cvo.subs.frontend+json' },
+  }, { _fetch });
+  if (!(res.status >= 200 && res.status < 300) || !json?.content) {
+    console.log(`payment-summary: status ${res.status} ${text.slice(0, 120)}`);
+    throw new Error('bookings-unavailable');
+  }
+  return json;
 }
 
-const ok2xx = (res) => res.status >= 200 && res.status < 300;
-
-function fechaISO(t) {
-  let m = /\b(\d{4})-(\d{2})-(\d{2})\b/.exec(t);
-  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  m = /\b(\d{2})\/(\d{2})\/(\d{4})\b/.exec(t);
-  return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
+/** PNR de la última compra según payment-summary (null si no viene). */
+export async function paymentSummary(session, { _fetch = fetch } = {}) {
+  const json = await leerResumen(session, _fetch);
+  const pnr = json.content.booking?.recordLocator;
+  return { pnr: typeof pnr === 'string' && pnr ? pnr : null, raw: json };
 }
+
+/** Epoch ms → 'YYYY-MM-DD HH:MM:SS' en hora argentina (UTC-3 fijo), como `departsAt` de la búsqueda. */
+const enAR = (ms) => new Date(ms - 3 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
 
 /**
- * Reservas del pase, para verificar después de comprar (o ante un timeout).
- * PROVISORIO (CALIBRAR): no sabemos si el endpoint responde JSON o solo HTML.
- * `[]` solo si hay prueba positiva de "lista vacía"; ante un body que no
- * reconocemos (login, error con 200) tiramos, porque un [] falso haría recomprar.
+ * Compras del pase, para verificar después de pagar (o ante un timeout). Sale del
+ * `eventsLog` de payment-summary: sólo FLIGHT_PURCHASE confirmadas, una fila por
+ * evento con el primer tramo de su ruta. Si el endpoint no responde o el log no
+ * está, tira `bookings-unavailable`: un [] falso haría recomprar.
+ * (`profile/{passId}/bookings` no sirve: 500 con el pase, `bookings: []` con la billetera.)
  */
 export async function listBookings(session, { _fetch = fetch } = {}) {
-  const passId = exigirPase(session);
-  const url = `${BASE}/profile/${passId}/bookings`;
-  const intentar = async (accept) => {
-    try {
-      return await pedir(session, url, { method: 'GET', headers: { accept } }, { _fetch });
-    } catch (e) {
-      if (e instanceof SessionExpiredError) throw e;
-      return null; // red caída o timeout: probamos la otra variante
-    }
-  };
-
-  let ult = null;
-  for (const accept of ['application/vnd.cvo.subs.frontend+json', 'application/json']) {
-    const r = await intentar(accept);
-    if (r) ult = r;
-    const lista = r && ok2xx(r.res) ? (r.json?.content?.content ?? (Array.isArray(r.json) ? r.json : null)) : null;
-    if (Array.isArray(lista)) {
-      return lista.map((b) => ({
-        pnr: b.pnr ?? b.recordLocator ?? b.code,
-        flightCode: b.flightCode ?? b.code,
-        date: b.date ?? b.departureDate ?? null,
-        from: b.from ?? b.origin ?? null,
-        to: b.to ?? b.destination ?? null,
-      }));
-    }
-  }
-
-  const h = await intentar('text/html');
-  if (h) ult = h;
-  if (h && ok2xx(h.res)) {
-    const html = h.text.replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ');
-    const filas = [];
-    for (const m of html.matchAll(/<(tr|li)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
-      const t = m[2].replace(/<[^>]+>/g, ' ');
-      const flightCode = /\bJA\d{3,4}\b/.exec(t)?.[0];
-      if (!flightCode) continue; // sin código de vuelo la fila no sirve para hayReserva
-      const pnr = [...t.matchAll(/\b[A-Z0-9]{6}\b/g)].map((x) => x[0]).find((c) => c !== flightCode);
-      if (!pnr) continue;
-      const date = fechaISO(t);
-      filas.push(date ? { pnr, flightCode, date } : { pnr, flightCode });
-    }
-    if (filas.length) return filas;
-    // Sin filas: vacío solo si la página dice ser la de reservas.
-    if (/<h[1-6][^>]*>[^<]*(reserva|booking)/i.test(html)) return [];
-  }
-
-  if (ult) console.log(`bookings: status ${ult.res.status} ${ult.text.slice(0, 120)}`);
-  throw new Error('bookings-unavailable');
-}
-
-/** Día YYYY-MM-DD de una fila de reservas, o null si no trae una fecha legible. */
-export function diaDeReserva(b) {
-  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(b?.date ?? ''));
-  return m ? m[1] : null;
+  const json = await leerResumen(session, _fetch);
+  const log = json.content.pass?.eventsLog;
+  if (!Array.isArray(log)) throw new Error('bookings-unavailable');
+  return log
+    .filter((e) => e?.eventType === 'FLIGHT_PURCHASE' && /^confirmed$/i.test(String(e.status ?? '')))
+    .filter((e) => e.route?.[0]?.departure && Number.isFinite(e.route[0].flightDate))
+    .map((e) => ({
+      pnr: e.recordLocator ?? null,
+      from: e.route[0].departure,
+      to: e.route[0].arrival,
+      departsAt: enAR(e.route[0].flightDate),
+      status: e.status,
+      timestamp: e.timestamp ?? null,
+    }));
 }
 
 /**
- * ¿Ya hay una reserva de este vuelo (mismo código y mismo día)?
- * Una fila sin fecha legible no prueba nada: el mismo número de vuelo sale todos
- * los días, así que no cuenta (quien verifica decide qué hacer si TODAS vienen sin fecha).
+ * ¿Ya hay una reserva de este vuelo? Misma ruta y misma salida al minuto: el
+ * eventsLog no trae el número de vuelo, y dos vuelos de la misma ruta no salen
+ * a la misma hora.
  */
-// CALIBRAR: el parser de reservas no se validó con una compra real; hasta entonces
-// este match es la única prueba de «compró» y por eso exige código + día.
 export function hayReserva(bookings, flight) {
-  const dia = String(flight.departsAt ?? '').slice(0, 10);
-  return bookings.some((b) => (b.flightCode ?? b.code) === flight.code && diaDeReserva(b) === dia);
+  const salida = String(flight.departsAt ?? '').slice(0, 16);
+  if (salida.length < 16) return false;
+  return bookings.some((b) => b.from === flight.from && b.to === flight.to && String(b.departsAt ?? '').slice(0, 16) === salida);
 }
