@@ -875,6 +875,7 @@ const memStore = () => {
 {
   const { rm } = await import('node:fs/promises');
   const { runBuy, deadlineAR, formatCompra } = await import('./src/buy.js');
+  const { unlockOrder } = await import('./src/orders.js');
   const { newOrder, saveOrder, setEstado, getOrder, lockOrder } = await import('./src/orders.js');
   const { createStore } = await import('./src/store.js');
   const { scoped } = await import('./src/users.js');
@@ -906,7 +907,7 @@ const memStore = () => {
       api[k] = async (...args) => {
         calls[k].push(args);
         const p = prog[k];
-        const r = typeof p === 'function' ? p(args, calls[k].length) : p;
+        const r = await (typeof p === 'function' ? p(args, calls[k].length) : p);
         if (r instanceof Error) throw r;
         return r;
       };
@@ -1049,6 +1050,8 @@ const memStore = () => {
     assert.equal(r.estado, 'comprado');
     assert.deepEqual(orden, ['pay', 'check', 'pay'], 'entre dos pagos siempre hay una verificación');
     assert.equal(calls.doPurchase.length, 2);
+    assert.equal(calls.tokenizeCard.length, 2, 'el token de Spreedly es de un solo uso: el reintento tokeniza de nuevo');
+    assert.equal(calls.initPayment.length, 2);
   }
 
   // 9) Dos desconocidos seguidos: no hay tercer pago, queda dudoso.
@@ -1118,6 +1121,146 @@ const memStore = () => {
     });
     assert.equal(r.estado, 'comprado'); assert.equal(calls.initPayment.length, 2);
     assert.equal(r.intentos.at(-1).paso, 'initPayment');
+  }
+
+  // --- fix ronda 1 ---
+  const RESERVA = [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-08' }];
+
+  // C1a/b) Antes de pagar queda marcado el pago en vuelo; al comprar, el tramo se persiste y el marcador se limpia.
+  {
+    const order = await pedido();
+    const vistos = [];
+    const { r } = await correr(order, {
+      search: ([, t]) => (t.from === 'BRC' ? [IDA] : [VUELTA]),
+      doPurchase: async ([, { quotation }]) => {
+        const o = await getOrder(store, order.id);
+        vistos.push([o.pagoEnVuelo?.code, o.pagoEnVuelo?.tramo, (o.resultado?.tramos ?? []).map((x) => x.code)]);
+        return { ok: true, pnr: quotation.code === 'JA3100' ? 'ABC123' : 'DEF456', raw: '' };
+      },
+    });
+    assert.equal(r.estado, 'comprado');
+    assert.deepEqual(vistos, [['JA3100', 0, []], ['JA3024', 1, ['JA3100']]], 'marcador antes de cada pago y lo comprado ya persistido');
+    assert.equal((await getOrder(store, order.id)).pagoEnVuelo ?? null, null);
+  }
+
+  // C1c) Un proceso anterior murió con un pago en vuelo: primero se verifica.
+  const conPagoEnVuelo = async () => {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    return setEstado(store, order.id, 'confirmado', { pagoEnVuelo: { tramo: 0, code: 'JA3021', departsAt: SLA.departsAt, arrivesAt: SLA.arrivesAt, hora: 'x' } });
+  };
+  {
+    const order = await conPagoEnVuelo();
+    const { r, calls, msgs } = await correr(order, { search: [SLA], listBookings: RESERVA });
+    assert.equal(r.estado, 'comprado'); assert.equal(r.resultado.tramos[0].pnr, 'ABC123');
+    assert.equal(calls.doPurchase.length, 0); assert.equal(calls.search.length, 0);
+    assert.match(msgs[0].text, /ABC123/);
+  }
+  {
+    const order = await conPagoEnVuelo();
+    const { r, calls } = await correr(order, { search: [SLA], listBookings: [] });
+    assert.equal(r.estado, 'dudoso', 'pago en vuelo sin reserva a la vista: no se sabe, no se repaga');
+    assert.equal(calls.doPurchase.length, 0); assert.equal(calls.search.length, 0);
+  }
+  {
+    const order = await conPagoEnVuelo();
+    const { r, calls } = await correr(order, { search: [], listBookings: new Error('bookings-unavailable') });
+    assert.equal(r.estado, 'dudoso', 'nunca fallido sin-cupo con un pago en vuelo sin resolver');
+    assert.equal(calls.doPurchase.length, 0);
+  }
+  // C1c) Un pedido que ya no está confirmado (lo terminó otra corrida) no se toca.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    await setEstado(store, order.id, 'comprado');
+    const { r, calls, msgs } = await correr(order, { search: [SLA] });
+    assert.equal(r.estado, 'comprado'); assert.equal(calls.search.length, 0); assert.equal(msgs.length, 0);
+  }
+
+  // C1d) esperarLockMs: reintenta el lock cada 10 s.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    await lockOrder(store, order.id, 60);
+    const { r, sleeps, calls } = await correr(order, { search: [SLA] }, { esperarLockMs: 30000 });
+    assert.deepEqual(r, { estado: 'confirmado' }); assert.deepEqual(sleeps, [10000, 10000, 10000]); assert.equal(calls.search.length, 0);
+    const o2 = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    await lockOrder(store, o2.id, 60);
+    let t = T0; const sl = [];
+    const { api } = fakeApi({ ...base, search: [SLA], doPurchase: { ok: true, pnr: 'ABC123', raw: '' } });
+    const r2 = await runBuy({
+      order: o2, store, session: { relogin: async () => {} }, chatId: '1', card, deadline: Date.parse('2026-11-08T03:15:00Z'),
+      now: () => t, sleep: async (ms) => { sl.push(ms); t += ms; if (sl.length === 1) await unlockOrder(store, o2.id); },
+      api, notify: async () => true, esperarLockMs: 60000,
+    });
+    assert.equal(r2.estado, 'comprado'); assert.deepEqual(sl, [10000]);
+  }
+
+  // C2) desconocido → sin reserva → reintento sin-cupo → sin reserva: dudoso, sin buscar otro vuelo.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const otro = { ...SLA, code: 'JA3023', departsAt: '2026-11-08 23:00:00' };
+    const { r, calls } = await correr(order, {
+      search: (_, n) => (n === 1 ? [SLA] : [otro]),
+      doPurchase: (_, n) => (n === 1 ? { ok: false, motivo: 'desconocido', raw: '' } : { ok: false, motivo: 'sin-cupo', raw: '' }),
+      listBookings: [],
+    });
+    assert.equal(r.estado, 'dudoso');
+    assert.equal(calls.doPurchase.length, 2); assert.equal(calls.search.length, 1, 'no hay tercer search-y-pago');
+  }
+
+  // I1) Reintento que da rechazada sin reserva a la vista: dudoso, nunca fallido.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls } = await correr(order, {
+      search: [SLA],
+      doPurchase: (_, n) => (n === 1 ? new Error('timeout') : { ok: false, motivo: 'rechazada', raw: '' }),
+      listBookings: [],
+    });
+    assert.equal(r.estado, 'dudoso');
+    assert.equal(calls.listBookings.length, 2, 'el resultado del reintento también se verifica');
+    assert.equal(calls.tokenizeCard.length, 2);
+  }
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r } = await correr(order, {
+      search: [SLA],
+      doPurchase: (_, n) => (n === 1 ? new Error('timeout') : { ok: false, motivo: '3ds', raw: '' }),
+      listBookings: (_, n) => (n === 1 ? [] : RESERVA),
+    });
+    assert.equal(r.estado, 'comprado', 'si el reintento dice 3ds pero la reserva está, se compró');
+  }
+
+  // I2) Parcial por 3DS en el segundo tramo: el mensaje dice por qué falta.
+  {
+    const order = await pedido();
+    const { r, msgs } = await correr(order, {
+      search: ([, t]) => (t.from === 'BRC' ? [IDA] : [VUELTA]),
+      doPurchase: ([, { quotation }]) => (quotation.code === 'JA3100' ? { ok: true, pnr: 'ABC123', raw: '' } : { ok: false, motivo: '3ds', raw: '' }),
+    });
+    assert.equal(r.estado, 'parcial'); assert.equal(r.motivo, '3ds');
+    assert.match(msgs[0].text, /ABC123/); assert.match(msgs[0].text, /3DS/); assert.match(msgs[0].text, /a mano/);
+  }
+
+  // I3) Cancelado a mitad del loop: no paga y no se pisa el estado.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls, msgs } = await correr(order, {
+      search: async () => { await setEstado(store, order.id, 'cancelado'); return [SLA]; },
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    });
+    assert.equal(calls.quote.length, 0); assert.equal(calls.doPurchase.length, 0);
+    assert.equal(r.estado, 'cancelado');
+    assert.equal((await getOrder(store, order.id)).estado, 'cancelado');
+    assert.equal(msgs.length, 1); assert.match(msgs[0].text, /cancelado/);
+  }
+  {
+    // Cancelado mientras pagaba el último tramo: el estado final no pisa el cancelado.
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r } = await correr(order, {
+      search: [SLA],
+      doPurchase: async () => { await setEstado(store, order.id, 'cancelado'); return { ok: true, pnr: 'ABC123', raw: '' }; },
+    });
+    const g = await getOrder(store, order.id);
+    assert.equal(g.estado, 'cancelado'); assert.equal(r.estado, 'cancelado');
+    assert.equal(g.resultado.tramos[0].pnr, 'ABC123', 'lo comprado queda registrado igual');
   }
   process.env = limpio;
 }

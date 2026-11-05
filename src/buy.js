@@ -11,7 +11,7 @@
 // env ni loguea bodies. Los errores que se anotan pasan por `limpiar()`.
 
 import { chooseItinerary, ordenDeCompra, superaTope } from './itinerary.js';
-import { setEstado, lockOrder, unlockOrder } from './orders.js';
+import { setEstado, getOrder, lockOrder, unlockOrder } from './orders.js';
 import { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva } from './purchase.js';
 import { search } from './jetsmart.js';
 import { reply } from './notify.js';
@@ -21,6 +21,11 @@ import { SessionExpiredError } from './session.js';
 const PAUSA_VACIA = 10_000;
 const PAUSA_ERROR = 20_000;
 const FALLO = Symbol('fallo');
+// Margen del lock sobre la ventana: corto a propósito. Si Vercel mata la función
+// (maxDuration), la corrida de rescate tiene que poder entrar poco después.
+const LOCK_MARGEN_S = 60;
+const ESPERA_LOCK = 10_000;
+const DUDOSO = { tipo: 'fin', estado: 'dudoso', motivo: 'dudoso' };
 
 /** Epoch ms de HOY (en Argentina) a las `hhmm` ART. Si ya pasó, el mismo instante: no rueda a mañana. */
 export function deadlineAR(hhmm = '00:15', now = new Date()) {
@@ -43,7 +48,7 @@ export function formatCompra(order, resultado) {
     return [
       '✅ *Comprado*',
       `${t.code} ${t.from} ${hhmm(t.departsAt)} → ${t.to}${llega ? ` ${llega}` : ''}`,
-      `tasas ${ars(t.tasas)}`,
+      `tasas ${t.tasas != null ? ars(t.tasas) : 'en el mail'}`,
       t.pnr ? `PNR ${t.pnr}` : 'PNR en el mail de JetSMART',
     ].join(' · ');
   });
@@ -59,23 +64,26 @@ const MOTIVOS = {
   // El desafío del banco queda atado a la sesión del bot: nadie más lo puede completar.
   '3ds': () => 'el banco pidió validar la compra (3DS) y ese paso no lo puedo hacer: comprala a mano en el portal',
   rechazada: () => 'el banco rechazó la tarjeta',
-  'sin-cupo': () => 'no apareció cupo hasta las 00:15',
+  'sin-cupo': () => 'no apareció cupo hasta el cierre de la ventana',
 };
+
+/** Por qué no se compró, en una frase. */
+export const motivoTexto = (motivo, detalle) => (MOTIVOS[motivo] ?? (() => motivo ?? 'error'))(detalle);
 
 /** Mensaje de fallo (o de duda) con el motivo y el último error. Corto. */
 export function formatFallo(order, intentos = []) {
   const rutas = order.tramos.map(ruta).join(' · ');
   const cabeza = order.estado === 'dudoso'
     ? `🟡 *No sé si compré* ${rutas}: el pago no dio una respuesta clara y no pude confirmar la reserva. Mirá el mail de JetSMART antes de reintentar.`
-    : `🔴 *No pude comprar* ${rutas}: ${(MOTIVOS[order.motivo] ?? (() => order.motivo ?? 'error'))(order.detalle)}.`;
+    : `🔴 *No pude comprar* ${rutas}: ${motivoTexto(order.motivo, order.detalle)}.`;
   const ult = intentos.at(-1);
   return ult ? `${cabeza}\n${intentos.length} intento(s) · último: ${ult.paso}: ${ult.error}` : cabeza;
 }
 
 /**
  * Corre el loop hasta `deadline` y deja el pedido en su estado final.
- * Devuelve { estado, resultado, intentos, motivo } o { estado: 'confirmado' } si
- * otro proceso tiene el lock.
+ * Devuelve { estado, resultado, intentos, motivo }, o { estado: 'confirmado' } si
+ * otro proceso tiene el lock (y no se liberó en `esperarLockMs`).
  */
 export async function runBuy({
   order, store, session, chatId, card, deadline,
@@ -83,100 +91,163 @@ export async function runBuy({
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   api = { search, quote, initPayment, tokenizeCard, doPurchase, listBookings },
   notify = reply,
+  esperarLockMs = 0,
 }) {
-  // El TTL cubre el loop entero y un margen: si el proceso muere, el lock se cae solo,
-  // pero nunca antes de que termine la ventana (otro cron entraría a pagar de nuevo).
-  const ttl = Math.max(60, Math.ceil((deadline - now()) / 1000) + 300);
-  if (!(await lockOrder(store, order.id, ttl))) return { estado: 'confirmado' };
+  // El rescate de las 00:13 espera a que la corrida anterior suelte el lock (o
+  // a que venza su TTL si la mató el maxDuration) en vez de rendirse al toque.
+  const ttl = () => Math.max(60, Math.ceil((deadline - now()) / 1000) + LOCK_MARGEN_S);
+  const inicio = now();
+  let tengo = await lockOrder(store, order.id, ttl());
+  while (!tengo && now() - inicio < esperarLockMs) {
+    await sleep(ESPERA_LOCK);
+    tengo = await lockOrder(store, order.id, ttl());
+  }
+  if (!tengo) return { estado: 'confirmado' };
 
-  const n = order.tramos.length;
-  const nuevos = [];
-  const comprados = new Map(); // índice de tramo → { flight, pnr, tasas }
-
-  const limpiar = (e) => {
-    let msg = String(e?.message ?? e ?? '');
-    // Defensa en profundidad: ningún error debería traer la tarjeta, pero si un
-    // body ajeno la refleja, no llega ni al store ni a Telegram.
-    for (const s of [card?.number, card?.cvv]) if (s) msg = msg.split(s).join('***');
-    return msg.replace(/[*_`[\]]/g, '').slice(0, 160);
-  };
-  const anotar = (paso, e) => nuevos.push({ hora: new Date(now()).toISOString(), paso, error: limpiar(e) });
-
-  const relogin = async () => {
-    try { await session.relogin(); return true; } catch (e) { anotar('relogin', e); return false; }
-  };
-
-  // Pasos previos al pago: no cobran, así que un reintento inmediato es inocuo.
-  const paso = async (nombre, fn) => {
-    try { return await fn(); } catch (e) {
-      anotar(nombre, e);
-      if (e instanceof SessionExpiredError && !(await relogin())) return FALLO;
-    }
-    try { return await fn(); } catch (e) { anotar(nombre, e); return FALLO; }
-  };
-
-  // ¿Quedó reservado? null = no se pudo saber (y entonces no se paga de nuevo).
-  const verificar = async (flight) => {
-    for (let k = 0; k < 2; k++) {
-      try {
-        const bookings = await api.listBookings(session);
-        const fila = bookings.find((b) => hayReserva([b], flight));
-        return { reservado: hayReserva(bookings, flight), pnr: fila?.pnr ?? null };
-      } catch (e) {
-        anotar('listBookings', e);
-        // Relogin no cobra nada: vale la pena una vez antes de rendirse.
-        if (!(e instanceof SessionExpiredError) || k > 0 || !(await relogin())) return null;
-      }
-    }
-    return null;
-  };
-
-  // El único lugar donde se llama a doPurchase. Entre dos llamadas SIEMPRE hay
-  // un `verificar` que devolvió "no reservado".
-  const pagar = async (flight, args) => {
-    const intento = async () => {
-      try { return await api.doPurchase(session, args); } catch (e) {
-        anotar('doPurchase', e);
-        return { ok: false, motivo: 'desconocido', lanzo: true };
-      }
-    };
-    let r = await intento();
-    for (let k = 0; ; k++) {
-      if (r.ok) return { tipo: 'comprado', pnr: r.pnr ?? null };
-      if (!r.lanzo) anotar('doPurchase', r.motivo);
-      if (r.motivo === 'rechazada' || r.motivo === '3ds') return { tipo: 'fin', estado: 'fallido', motivo: r.motivo };
-      // sin-cupo o desconocido: antes de buscar otro vuelo o repagar, ¿ya está reservado?
-      const v = await verificar(flight);
-      if (!v) return { tipo: 'fin', estado: 'dudoso', motivo: 'dudoso' };
-      if (v.reservado) return { tipo: 'comprado', pnr: v.pnr };
-      if (r.motivo === 'sin-cupo') return { tipo: 'sin-cupo' };
-      // Dos respuestas sin señal y ninguna reserva a la vista: no hay tercer pago.
-      if (k > 0) return { tipo: 'fin', estado: 'dudoso', motivo: 'dudoso' };
-      r = await intento();
-    }
-  };
-
-  const comprarTramo = async (flight) => {
-    const q = await paso('quote', () => api.quote(session, flight));
-    if (q === FALLO) return { tipo: 'error' };
-    // El tope se mide contra lo cotizado, que es lo que se cobra (no lo que dijo la búsqueda).
-    if (superaTope({ ...flight, taxes: q.total }, order)) {
-      anotar('quote', `tasas ${q.total} superan el tope ${order.topeTasasPorTramoARS}`);
-      return { tipo: 'fin', estado: 'fallido', motivo: 'tope',
-        detalle: { ruta: ruta(flight), monto: q.total, tope: order.topeTasasPorTramoARS } };
-    }
-    const init = await paso('initPayment', () => api.initPayment(session));
-    if (init === FALLO) return { tipo: 'error' };
-    const token = await paso('tokenizeCard', () => api.tokenizeCard(card, init));
-    if (token === FALLO) return { tipo: 'error' };
-    const r = await pagar(flight, { token, card, quotation: q });
-    return r.tipo === 'comprado' ? { ...r, tasas: q.total } : r;
-  };
-
-  let final = null;
   try {
+    // El `order` que nos pasaron puede estar viejo: lo que manda es el store.
+    const fresco = (await getOrder(store, order.id)) ?? order;
+    if (fresco.estado !== 'confirmado') {
+      return { estado: fresco.estado, resultado: fresco.resultado ?? null, intentos: fresco.intentos ?? [], motivo: fresco.motivo ?? null };
+    }
+
+    const n = order.tramos.length;
+    const nuevos = [];
+    let persistidos = 0;
+    const comprados = new Map(); // índice de tramo → { flight, pnr, tasas }
+    // Lo que una corrida anterior ya pagó no se vuelve a comprar.
+    for (const t of fresco.resultado?.tramos ?? []) {
+      const i = order.tramos.findIndex((x) => x.from === t.from && x.to === t.to);
+      if (i >= 0) comprados.set(i, { flight: { ...t, seats: 1 }, pnr: t.pnr, tasas: t.tasas });
+    }
+
+    const limpiar = (e) => {
+      let msg = String(e?.message ?? e ?? '');
+      // Defensa en profundidad: ningún error debería traer la tarjeta, pero si un
+      // body ajeno la refleja, no llega ni al store ni a Telegram.
+      for (const s of [card?.number, card?.cvv]) if (s) msg = msg.split(s).join('***');
+      return msg.replace(/[*_`[\]]/g, '').slice(0, 160);
+    };
+    const anotar = (paso, e) => nuevos.push({ hora: new Date(now()).toISOString(), paso, error: limpiar(e) });
+
+    const armarResultado = () => ({
+      tramos: [...comprados.keys()].sort((a, b) => a - b).map((i) => {
+        const { flight: f, pnr, tasas } = comprados.get(i);
+        return { code: f.code, from: f.from, to: f.to, departsAt: f.departsAt, arrivesAt: f.arrivesAt, pnr, tasas };
+      }),
+    });
+
+    // Persiste sin pisar un estado que no pusimos nosotros (un `cancelado` del
+    // usuario a mitad del loop gana). Los intentos pendientes van primero, de a uno.
+    const guardar = async (extra = {}, estado = 'confirmado') => {
+      const actual = await getOrder(store, order.id);
+      const e = actual?.estado === 'confirmado' ? estado : actual?.estado ?? estado;
+      while (persistidos < nuevos.length) await setEstado(store, order.id, e, { intento: nuevos[persistidos++] });
+      return setEstado(store, order.id, e, extra);
+    };
+
+    // Lo pagado se escribe apenas se sabe: si el proceso muere, el rescate lo ve.
+    const registrar = async (i, flight, pnr, tasas) => {
+      comprados.set(i, { flight, pnr: pnr ?? null, tasas });
+      await guardar({ resultado: armarResultado(), pagoEnVuelo: null });
+    };
+
+    const relogin = async () => {
+      try { await session.relogin(); return true; } catch (e) { anotar('relogin', e); return false; }
+    };
+
+    // Pasos previos al pago: no cobran, así que un reintento inmediato es inocuo.
+    const paso = async (nombre, fn) => {
+      try { return await fn(); } catch (e) {
+        anotar(nombre, e);
+        if (e instanceof SessionExpiredError && !(await relogin())) return FALLO;
+      }
+      try { return await fn(); } catch (e) { anotar(nombre, e); return FALLO; }
+    };
+
+    // ¿Quedó reservado? null = no se pudo saber (y entonces no se paga de nuevo).
+    const verificar = async (flight) => {
+      for (let k = 0; k < 2; k++) {
+        try {
+          const bookings = await api.listBookings(session);
+          const fila = bookings.find((b) => hayReserva([b], flight));
+          return { reservado: hayReserva(bookings, flight), pnr: fila?.pnr ?? null };
+        } catch (e) {
+          anotar('listBookings', e);
+          // Relogin no cobra nada: vale la pena una vez antes de rendirse.
+          if (!(e instanceof SessionExpiredError) || k > 0 || !(await relogin())) return null;
+        }
+      }
+      return null;
+    };
+
+    // El único lugar donde se llama a doPurchase. Reglas:
+    // - entre dos pagos SIEMPRE hay un `verificar` legible sin la reserva;
+    // - un intento ambiguo (desconocido o timeout sin reserva a la vista) deja el
+    //   tramo "en duda": desde ahí, cualquier resultado que no sea ok es `dudoso`,
+    //   nunca otro vuelo ni `fallido` (el primer pago pudo haber cobrado);
+    // - el reintento tokeniza de nuevo: el token de Spreedly es de un solo uso.
+    const comprarTramo = async (i, flight) => {
+      const q = await paso('quote', () => api.quote(session, flight));
+      if (q === FALLO) return { tipo: 'error' };
+      // El tope se mide contra lo cotizado, que es lo que se cobra (no lo que dijo la búsqueda).
+      if (superaTope({ ...flight, taxes: q.total }, order)) {
+        anotar('quote', `tasas ${q.total} superan el tope ${order.topeTasasPorTramoARS}`);
+        return { tipo: 'fin', estado: 'fallido', motivo: 'tope',
+          detalle: { ruta: ruta(flight), monto: q.total, tope: order.topeTasasPorTramoARS } };
+      }
+      let ambiguo = false;
+      for (let k = 0; k < 2; k++) {
+        const init = await paso('initPayment', () => api.initPayment(session));
+        const token = init === FALLO ? FALLO : await paso('tokenizeCard', () => api.tokenizeCard(card, init));
+        if (token === FALLO) return ambiguo ? DUDOSO : { tipo: 'error' };
+
+        // Marcador ANTES de pagar: si el proceso muere acá, el rescate verifica en vez de repagar.
+        const g = await guardar({ pagoEnVuelo: {
+          tramo: i, code: flight.code, departsAt: flight.departsAt, arrivesAt: flight.arrivesAt,
+          tasas: q.total, hora: new Date(now()).toISOString(),
+        } });
+        if (g.estado !== 'confirmado') return ambiguo ? DUDOSO : { tipo: 'fin', estado: 'cancelado' };
+
+        let r;
+        try { r = await api.doPurchase(session, { token, card, quotation: q }); } catch (e) {
+          anotar('doPurchase', e);
+          r = { ok: false, motivo: 'desconocido', lanzo: true };
+        }
+        if (r.ok) return { tipo: 'comprado', pnr: r.pnr ?? null, tasas: q.total };
+        if (!r.lanzo) anotar('doPurchase', r.motivo);
+        if (!ambiguo && (r.motivo === 'rechazada' || r.motivo === '3ds')) {
+          await guardar({ pagoEnVuelo: null });
+          return { tipo: 'fin', estado: 'fallido', motivo: r.motivo };
+        }
+        const v = await verificar(flight);
+        if (!v) return DUDOSO;
+        if (v.reservado) return { tipo: 'comprado', pnr: v.pnr, tasas: q.total };
+        if (ambiguo) return DUDOSO;
+        if (r.motivo === 'sin-cupo') { await guardar({ pagoEnVuelo: null }); return { tipo: 'sin-cupo' }; }
+        ambiguo = true; // desconocido sin reserva a la vista: un solo reintento
+      }
+      return DUDOSO;
+    };
+
+    let final = null;
+
+    // Una corrida anterior murió con un pago en vuelo: primero se resuelve eso.
+    const pev = fresco.pagoEnVuelo;
+    if (pev && !comprados.has(pev.tramo)) {
+      const v = await verificar(pev);
+      if (v?.reservado) {
+        const t = order.tramos[pev.tramo];
+        await registrar(pev.tramo, { code: pev.code, from: t.from, to: t.to, departsAt: pev.departsAt, arrivesAt: pev.arrivesAt, seats: 1 }, v.pnr, pev.tasas ?? null);
+      } else {
+        if (v) anotar('recuperacion', `pago en vuelo de ${pev.code} sin reserva a la vista`);
+        final = { estado: 'dudoso', motivo: 'dudoso' };
+      }
+    }
+    if (!final && comprados.size === n) final = { estado: 'comprado' };
+
     let pausa = 0;
-    for (let vuelta = 0; ; vuelta++) {
+    for (let vuelta = 0; !final; vuelta++) {
       if (vuelta > 0) await sleep(pausa);
       if (now() >= deadline) break;
       pausa = PAUSA_VACIA;
@@ -212,16 +283,17 @@ export async function runBuy({
       if (aComprar.length === 0) {
         // Ya hay algo comprado y lo que falta no aparece: parcial, no se persigue.
         if (comprados.size) final = { estado: 'parcial' };
-        if (final) break;
         continue;
       }
 
       // 3) Comprar, primero el tramo más escaso.
       let reBuscar = false;
       for (const i of aComprar) {
+        // El usuario pudo cancelar mientras buscábamos: se mira justo antes de cotizar.
+        if ((await getOrder(store, order.id))?.estado !== 'confirmado') { final = { estado: 'cancelado' }; break; }
         const flight = it.tramos[i];
-        const r = await comprarTramo(flight);
-        if (r.tipo === 'comprado') { comprados.set(i, { flight, pnr: r.pnr, tasas: r.tasas }); continue; }
+        const r = await comprarTramo(i, flight);
+        if (r.tipo === 'comprado') { await registrar(i, flight, r.pnr, r.tasas); continue; }
         if (r.tipo === 'error') pausa = PAUSA_ERROR;
         if (r.tipo === 'fin') final = { estado: r.estado, motivo: r.motivo, detalle: r.detalle };
         reBuscar = true;
@@ -229,7 +301,7 @@ export async function runBuy({
       }
       if (final) break;
       if (comprados.size === n) { final = { estado: 'comprado' }; break; }
-      if (!reBuscar && it.faltan?.length && comprados.size) { final = { estado: 'parcial' }; break; }
+      if (!reBuscar && it.faltan?.length && comprados.size) final = { estado: 'parcial' };
     }
 
     if (!final) {
@@ -240,25 +312,21 @@ export async function runBuy({
     // Un fallo después de haber comprado algún tramo es un parcial: hay plata gastada.
     if (final.estado === 'fallido' && comprados.size) final = { ...final, estado: 'parcial' };
 
-    const resultado = {
-      tramos: [...comprados.keys()].sort((a, b) => a - b).map((i) => {
-        const { flight: f, pnr, tasas } = comprados.get(i);
-        return { code: f.code, from: f.from, to: f.to, departsAt: f.departsAt, arrivesAt: f.arrivesAt, pnr, tasas };
-      }),
-    };
+    const resultado = armarResultado();
     if (final.estado === 'parcial') resultado.faltan = order.tramos.map((_, i) => i).filter((i) => !comprados.has(i));
 
-    // setEstado suma de a un intento: los previos van primero, el último con el resultado.
-    let guardado = order;
-    for (const intento of nuevos.slice(0, -1)) guardado = await setEstado(store, order.id, final.estado, { intento });
-    guardado = await setEstado(store, order.id, final.estado, {
+    // `guardar` relee: un `cancelado` del usuario no se pisa, pero lo comprado queda registrado.
+    const guardado = await guardar({
       resultado, motivo: final.motivo ?? null, detalle: final.detalle ?? null,
-      ...(nuevos.length ? { intento: nuevos.at(-1) } : {}),
-    });
+      ...(final.estado === 'dudoso' ? {} : { pagoEnVuelo: null }),
+    }, final.estado === 'cancelado' ? 'confirmado' : final.estado);
 
     const partes = [];
     if (comprados.size) partes.push(formatCompra(order, resultado));
-    if (final.estado === 'dudoso' || final.estado === 'fallido') partes.push(formatFallo(guardado, nuevos));
+    if (final.estado === 'dudoso') partes.push(formatFallo({ ...guardado, estado: 'dudoso' }, nuevos));
+    else if (guardado.estado === 'cancelado') partes.push('⏹️ Pedido cancelado, no compré nada más.');
+    else if (final.estado === 'fallido') partes.push(formatFallo(guardado, nuevos));
+    else if (final.estado === 'parcial' && final.motivo) partes.push(`🔴 No compré el resto: ${motivoTexto(final.motivo, final.detalle)}.`);
     try { await notify(partes.join('\n\n'), chatId); } catch (e) { console.error(`buy: no pude avisar: ${limpiar(e)}`); }
 
     return { estado: guardado.estado, resultado, intentos: guardado.intentos, motivo: final.motivo ?? null };
