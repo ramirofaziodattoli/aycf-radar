@@ -86,6 +86,7 @@ function reglas(hoy, aeropuertos) {
     '- "No me importa el horario" o sin horario → ventana: null. Un rango ("a la mañana", "entre las 6 y las 12") → ventana ["HH:MM","HH:MM"].',
     '- Dos tramos el mismo día ("a aeroparque y después a córdoba") son tramos encadenados: el segundo sale de donde llega el primero.',
     '- Un mensaje que sólo nombra dos lugares, sin fecha ni intención de comprar, es tipo "busqueda".',
+    '- Un mensaje que pide VER qué hay sin comprar ("fijate", "buscá", "mostrame", "qué hay", "hay algo") es tipo "busqueda", con fechaVuelo (null si no la dice) y sus tramos; aclaracion siempre null.',
     '- Si hay mensajes anteriores, son parte del mismo pedido: completá con ellos lo que falte.',
     '- Si falta algo esencial (la fecha o el destino), tipo "pedido" con aclaracion = UNA sola pregunta corta; si no falta nada, aclaracion: null.',
     '- escalaMinimaHoras: null salvo que el mensaje la diga.',
@@ -168,7 +169,17 @@ export async function cmdPedido(store, chatId, texto, { _fetch = fetch, hoy = ho
   if (p && previos.length) await borrarCtx(store);
   if (!p || p.tipo === 'otro') return { text: AYUDA_ESTRICTA };
   if (p.tipo === 'busqueda') {
-    return { text: 'Parece una búsqueda. Mandame `/buscar <origen> <destino>` o los dos nombres sueltos.' };
+    // La búsqueda la corre quien tiene sesión (commands.js): acá sólo se normaliza.
+    const tramos = (p.tramos ?? [])
+      .map((t) => ({ from: String(t.from ?? '').toUpperCase(), to: String(t.to ?? '').toUpperCase() }))
+      .filter((t) => /^[A-Z]{3}$/.test(t.from) && /^[A-Z]{3}$/.test(t.to) && t.from !== t.to);
+    if (!tramos.length) {
+      return { text: 'Parece una búsqueda. Mandame `/buscar <origen> <destino>` o los dos nombres sueltos.' };
+    }
+    if (p.fechaVuelo && p.fechaVuelo < hoy) {
+      return { text: `⚠️ El ${fechaLarga(p.fechaVuelo)} ya pasó.` };
+    }
+    return { busqueda: { fechaVuelo: p.fechaVuelo ?? null, tramos } };
   }
 
   let order;

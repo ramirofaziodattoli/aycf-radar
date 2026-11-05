@@ -285,6 +285,12 @@ sí cuentan los errores de búsqueda, los pasos de pago y el resumen de las vent
 | `CRON_SECRET` | **Obligatoria con `AUTO_BUY=on`**: sin ella `/api/buy` responde 500 y no compra (si no, la URL quedaría pública). |
 | `AYCF_BOOKINGS_CALIBRADO` | `on` cuando veas andar la verificación en producción. Las compras del pase salen de `payment-summary` (`content.pass.eventsLog`, forma medida en la compra real del 05/11) y se cruzan por ruta + hora de salida. Con `on`, un pago ambiguo espera 15 s, mira las compras y reintenta una vez si no está; apagado (default) queda `dudoso` sin reintentar. |
 
+**Buscar cualquier fecha, sin comprar.** El calendario del portal sólo deja hoy y mañana, pero el
+backend contesta cualquier día desde hoy. Para el dueño, `/buscar 2026-11-09 aeroparque córdoba` (la
+fecha puede ir en cualquier posición) o en lenguaje natural: «fijate qué hay el domingo de aeroparque
+a córdoba» devuelve el listado de ese día, tramo por tramo, y no crea ningún pedido. Sin fecha busca
+mañana, como siempre. Para los demás usuarios `/buscar` sigue siendo sólo mañana.
+
 `/api/buy?order=<id>` re-corre un pedido confirmado (para probar). No fuerza nada: un pedido en
 otro estado (dudoso, fallido, cancelado…) vuelve tal cual.
 

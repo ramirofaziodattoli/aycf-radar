@@ -3,9 +3,10 @@
 //   POST /es-ar/ja/subscriptions/availability/{passId}
 //   Accept: application/vnd.cvo.subs.frontend+json
 //
-// Horizonte: D+1 y nada más. Los T&C fijan la ventana de canje entre 24h y 120min
-// antes de la salida, y el inventario se libera a las 00:01 por día calendario.
-// Consultar D+2 devuelve vacío siempre.
+// Horizonte: el inventario nuevo sale a las 00:01 por día calendario, pero desde el
+// 05/11/2026 está medido que D+2 y D+3 ya devuelven vuelos con cupo y se pueden
+// comprar: la restricción a «mañana» vive en el calendario del portal, no acá.
+// Los T&C cierran el canje 120 min antes de la salida.
 
 import { SessionExpiredError, TOKEN_MISMATCH } from './session.js';
 import { UA } from './login.js';

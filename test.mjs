@@ -2112,8 +2112,58 @@ const memStore = () => {
     hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'pedido', fechaVuelo: null, tramos: [], aclaracion: '¿Qué día y a dónde?' }),
   });
   assert.deepEqual(pregunta, { text: '¿Qué día y a dónde?' });
-  const busq = await cmdPedido(store, '1', 'bariloche a córdoba', { hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'busqueda' }) });
-  assert.match(busq.text, /\/buscar/);
+  // Búsqueda: con tramos sale estructurada (la corre commands.js con sesión); sin tramos, la pista.
+  const busq = await cmdPedido(store, '1', 'fijate qué hay el sábado', { hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'busqueda' }) });
+  assert.deepEqual(busq, { busqueda: { fechaVuelo: '2026-11-07', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }] } });
+  const busqSinFecha = await cmdPedido(store, '1', 'bariloche a córdoba', { hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'busqueda', fechaVuelo: null, tramos: [{ from: 'brc', to: 'cor', ventana: null }] }) });
+  assert.deepEqual(busqSinFecha, { busqueda: { fechaVuelo: null, tramos: [{ from: 'BRC', to: 'COR' }] } });
+  const busqVacia = await cmdPedido(store, '1', 'qué hay', { hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'busqueda', tramos: [] }) });
+  assert.match(busqVacia.text, /\/buscar/);
+  const busqPasada = await cmdPedido(store, '1', 'x', { hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'busqueda', fechaVuelo: '2026-11-01' }) });
+  assert.match(busqPasada.text, /ya pasó/);
+  assert.equal((await listOrders(store)).length, antes + 1, 'una búsqueda no crea pedidos');
+
+  // La búsqueda con fecha, de punta a punta: handleCommand la corre con la sesión.
+  {
+    const V = { code: 'JA3102', from: 'AEP', to: 'COR', departsAt: '2026-11-09T12:04:00', departsHHMM: '12:04', arrivesHHMM: '13:25', duration: '1h 21m', seats: 6 };
+    const pedidas = [];
+    const _search = async (session, q, st) => { pedidas.push(q); assert.ok(st, 'guarda el catálogo'); return q.to === 'COR' ? [V] : []; };
+    const ctx = { store, user: { chatId: '1' }, chatId: '1', session: {}, _search };
+    // cmdPedido usa fetch real: acá se simula el modelo pisando el fetch global.
+    const fetchReal = globalThis.fetch;
+    globalThis.fetch = async () => respuesta({ ...PEDIDO, tipo: 'busqueda', fechaVuelo: '2026-11-09' });
+    try {
+      const out = await handleCommand('fijate qué hay el lunes de bariloche a aeroparque y de ahí a córdoba', ctx);
+      assert.deepEqual(pedidas, [{ from: 'BRC', to: 'AEP', date: '2026-11-09' }, { from: 'AEP', to: 'COR', date: '2026-11-09' }]);
+      assert.match(out, /❌ \*Bariloche → Aeroparque\* — sin cupo para el 2026-11-09/);
+      assert.match(out, /✅ \*Aeroparque → Córdoba\* — 1 vuelo\(s\) el 2026-11-09\n   • JA3102 · 12:04→13:25/);
+      pedidas.length = 0;
+      globalThis.fetch = async () => respuesta({ ...PEDIDO, tipo: 'busqueda', fechaVuelo: null, tramos: [{ from: 'AEP', to: 'COR', ventana: null }] });
+      await handleCommand('aeroparque a córdoba qué hay', ctx);
+      assert.equal(pedidas[0].date, tomorrowInAR(), 'sin fecha, mañana como siempre');
+    } finally {
+      globalThis.fetch = fetchReal;
+    }
+
+    // `/buscar` con fecha: el dueño sí, los demás no; una fecha pasada, tampoco.
+    pedidas.length = 0;
+    const conFecha = await handleCommand('/buscar 2026-11-09 aeroparque córdoba', ctx);
+    assert.deepEqual(pedidas, [{ from: 'AEP', to: 'COR', date: '2026-11-09' }]);
+    assert.match(conFecha, /1 vuelo\(s\) el 2026-11-09/);
+    pedidas.length = 0;
+    await handleCommand('/buscar AEP COR 2026-11-10', ctx);
+    assert.equal(pedidas[0].date, '2026-11-10', 'la fecha puede ir al final');
+    pedidas.length = 0;
+    const otro = await handleCommand('/buscar 2026-11-09 AEP COR', { ...ctx, user: { chatId: '2' }, chatId: '2' });
+    assert.equal(pedidas.length, 0, 'para otro chat no se busca nada');
+    assert.match(otro, /Sólo puedo buscar el día siguiente/);
+    assert.match(await handleCommand('/buscar 2020-01-01 AEP COR', ctx), /ya pasó/);
+    pedidas.length = 0;
+    await handleCommand('/buscar AEP COR', ctx);
+    assert.equal(pedidas[0].date, tomorrowInAR(), 'sin fecha, mañana');
+    assert.ok((await import('./src/commands.js')).NECESITA_SESION.includes('/pedido'), 'una frase del dueño puede ser una búsqueda y necesita sesión');
+    assert.match(await handleCommand('/ayuda', ctx), /\/buscar `AAAA-MM-DD` origen destino/);
+  }
   const desencadenado = await cmdPedido(store, '1', 'x', {
     hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tramos: [{ from: 'BRC', to: 'AEP', ventana: null }, { from: 'EZE', to: 'COR', ventana: null }] }),
   });
@@ -2215,7 +2265,9 @@ const memStore = () => {
   assert.match(ayuda, /\/pedidos — mis pedidos de compra automática/);
   assert.match(ayuda, /lo compro solo apenas aparezca cupo/);
   const { NECESITA_SESION } = await import('./src/commands.js');
-  assert.ok(!NECESITA_SESION.includes('/pedido') && !NECESITA_SESION.includes('/pedidos'));
+  // Una frase del dueño puede ser una búsqueda («fijate qué hay el domingo»): /pedido abre
+  // sesión (leer el store; el login sólo si venció). /pedidos sigue sin tocar JetSmart.
+  assert.ok(NECESITA_SESION.includes('/pedido') && !NECESITA_SESION.includes('/pedidos'));
 
   process.env = limpio;
 }

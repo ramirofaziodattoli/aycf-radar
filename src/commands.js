@@ -11,7 +11,7 @@ import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, sc
 import { haySecreto } from './crypto.js';
 import { cmdPedido, cmdPedidos, pedidosVivos } from './intake.js';
 import { runBuy } from './buy.js';
-import { getOrder, setEstado, cancelOrder } from './orders.js';
+import { getOrder, setEstado, cancelOrder, hoyEnAR, fechaLarga } from './orders.js';
 
 const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
 
@@ -48,8 +48,10 @@ y no existe inventario más allá de eso._`;
 const AYUDA_ADMIN = `/usuarios — quiénes usan el bot (solo vos)
 /pedidos — mis pedidos de compra automática
 /ensayo [N] — ensayo de compra sin pagar del último pedido o del N de /pedidos (sólo vos)
+/buscar \`AAAA-MM-DD\` origen destino — busco cualquier fecha, no sólo mañana (sólo vos)
 
-También podés contarme qué pasaje necesitás y lo compro solo apenas aparezca cupo.`;
+También podés contarme qué pasaje necesitás y lo compro solo apenas aparezca cupo,
+o pedirme «fijate qué hay el domingo de aeroparque a córdoba» y te muestro el listado.`;
 
 /**
  * Acepta códigos ("BRC") o nombres ("bariloche"). Los nombres pueden traer varias
@@ -133,7 +135,34 @@ async function cmdRutas(store, user) {
   return `📋 *Vigilando ${watches.length} ruta(s)*\n\n${lineas.join('\n')}`;
 }
 
-async function cmdBuscar(store, session, user, args) {
+const ES_FECHA = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Una ruta en una fecha → el listado. El inventario se ve 2-3 días antes (medido
+ * el 05/11), así que `date` puede ser cualquier día desde hoy; el calendario del
+ * portal lo tapa, el backend no.
+ */
+async function buscarRuta(store, session, { from, to, date, cat }, _search = search) {
+  const nombre = rutaLegible(from, to, cat);
+  if (cat && !routeExists(from, to, cat.rutas)) {
+    return `⚠️ *${nombre}* no existe como vuelo directo en la red de JetSMART.\n\n` +
+      `Probá /aeropuertos ${from} para ver los destinos desde ahí.`;
+  }
+  const flights = await _search(session, { from, to, date }, store);
+  if (!flights.length) return `❌ *${nombre}* — sin cupo para el ${date}.`;
+  const lineas = flights
+    .sort((a, b) => String(a.departsAt).localeCompare(String(b.departsAt)))
+    .map((f) => `   • ${formatFlight(f)}`)
+    .join('\n');
+  return `✅ *${nombre}* — ${flights.length} vuelo(s) el ${date}\n${lineas}`;
+}
+
+/**
+ * `/buscar [AAAA-MM-DD] origen destino`. Sin fecha, mañana (lo único que el portal
+ * deja ver). Con fecha, cualquier día desde hoy: sólo el dueño, porque el que
+ * confía en «mañana» no tiene por qué saber que el backend da más.
+ */
+async function cmdBuscar(store, session, user, args, { chatId, _search = search, hoy = hoyEnAR() } = {}) {
   if (!args.length) {
     const watches = await resolveWatches(store, undefined, { seed: usaSemilla(user) });
     if (watches.length) {
@@ -144,20 +173,21 @@ async function cmdBuscar(store, session, user, args) {
     }
     return (await botonesOrigen(store, '¿Desde dónde volás?')) ?? 'Decime la ruta: `/buscar bariloche salta`';
   }
-  const { from, to, cat } = await parseRuta(args, store);
-  const nombre = rutaLegible(from, to, cat);
-  if (cat && !routeExists(from, to, cat.rutas)) {
-    return `⚠️ *${nombre}* no existe como vuelo directo en la red de JetSMART.\n\n` +
-      `Probá /aeropuertos ${from} para ver los destinos desde ahí.`;
-  }
-  const date = tomorrowInAR();
-  const flights = await search(session, { from, to, date }, store);
-  if (!flights.length) return `❌ *${nombre}* — sin cupo para el ${date}.`;
-  const lineas = flights
-    .sort((a, b) => String(a.departsAt).localeCompare(String(b.departsAt)))
-    .map((f) => `   • ${formatFlight(f)}`)
-    .join('\n');
-  return `✅ *${nombre}* — ${flights.length} vuelo(s) el ${date}\n${lineas}`;
+  const fecha = args.find((a) => ES_FECHA.test(a)) ?? null;
+  const resto = args.filter((a) => a !== fecha);
+  if (fecha && !esDueno(chatId)) return 'Sólo puedo buscar el día siguiente: el pase libera los cupos a las 00:01.';
+  if (fecha && fecha < hoy) return `⚠️ El ${fechaLarga(fecha)} ya pasó.`;
+  const { from, to, cat } = await parseRuta(resto, store);
+  return buscarRuta(store, session, { from, to, date: fecha ?? tomorrowInAR(), cat }, _search);
+}
+
+/** La búsqueda que salió del lenguaje natural (`cmdPedido` → `busqueda`): un listado por tramo. */
+async function buscarPedida(store, session, { fechaVuelo, tramos }, _search) {
+  const cat = await getCatalog(store);
+  const date = fechaVuelo ?? tomorrowInAR();
+  const partes = [];
+  for (const { from, to } of tramos) partes.push(await buscarRuta(store, session, { from, to, date, cat }, _search));
+  return partes.join('\n\n');
 }
 
 async function cmdVigilar(store, user, args) {
@@ -511,7 +541,7 @@ export function comandoDe(text, user, { chatId, enDialogo = false } = {}) {
   return { cmd: '/start', args: [] };
 }
 
-export async function handleCommand(text, { store, session, user, chatId, from, enDialogo, _runBuy }) {
+export async function handleCommand(text, { store, session, user, chatId, from, enDialogo, _runBuy, _search }) {
   const { cmd, args } = comandoDe(text, user, { chatId, enDialogo });
 
   // Un chat sin cuenta conectada igual es un chat: sin el chatId, `usaSemilla`
@@ -519,7 +549,7 @@ export async function handleCommand(text, { store, session, user, chatId, from, 
   const perfil = user ?? (chatId ? { chatId: String(chatId) } : null);
 
   try {
-    return await dispatch(cmd, args, { store, session, user: perfil, chatId, from, _runBuy });
+    return await dispatch(cmd, args, { store, session, user: perfil, chatId, from, _runBuy, _search });
   } catch (err) {
     // Un error de tipeo se contesta; los de sesión suben para que el webhook
     // dé la instrucción concreta de reconectar.
@@ -566,9 +596,11 @@ export async function cmdEnsayo(store, session, chatId, args, { _runBuy = runBuy
 }
 
 /** Los que le pegan a JetSmart: sin cuenta conectada no hay nada que consultar. */
-export const NECESITA_SESION = ['/buscar', '/estado', '/pase', '/ensayo'];
+// `/pedido` entra porque una frase del dueño puede ser una búsqueda («fijate qué hay el
+// domingo»): abrir la sesión es leer el store, el login sólo pasa si venció.
+export const NECESITA_SESION = ['/buscar', '/estado', '/pase', '/ensayo', '/pedido'];
 
-async function dispatch(cmd, args, { store, session, user, chatId, from, _runBuy }) {
+async function dispatch(cmd, args, { store, session, user, chatId, from, _runBuy, _search }) {
   const ayuda = esDueno(chatId) ? `${AYUDA}\n${AYUDA_ADMIN}` : AYUDA;
   switch (cmd) {
     case '/start':
@@ -586,7 +618,10 @@ async function dispatch(cmd, args, { store, session, user, chatId, from, _runBuy
     // Compra automática: del dueño y sin sesión (sólo arma el pedido; paga el cron).
     case '/pedido':
       if (!esDueno(chatId) || process.env.AUTO_BUY !== 'on') break;
-      return cmdPedido(store, chatId, args.join(' '));
+      {
+        const r = await cmdPedido(store, chatId, args.join(' '));
+        return r.busqueda ? buscarPedida(store, session, r.busqueda, _search) : r;
+      }
     case '/pedidos':
       if (!esDueno(chatId)) break;
       return cmdPedidos(store);
@@ -601,7 +636,7 @@ async function dispatch(cmd, args, { store, session, user, chatId, from, _runBuy
     case '/rutas':
       return cmdRutas(store, user);
     case '/buscar':
-      return cmdBuscar(store, session, user, args);
+      return cmdBuscar(store, session, user, args, { chatId, _search });
     case '/vigilar':
       return cmdVigilar(store, user, args);
     case '/borrar':
