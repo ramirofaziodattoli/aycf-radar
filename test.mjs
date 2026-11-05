@@ -768,9 +768,19 @@ const memStore = () => {
 
 // --- itinerario: ventana, escala, escasez y tope ---
 {
-  const { chooseItinerary, ordenDeCompra, superaTope, enVentana, escalaMinima } = await import('./src/itinerary.js');
+  const { chooseItinerary, ordenDeCompra, superaTope, enVentana, escalaMinima, esDirecto } = await import('./src/itinerary.js');
+  // Sólo directos: con escala es otro producto (varios segmentos que la verificación no cruza).
+  for (const st of [undefined, null, 0, '0', 'Directo', 'directo', 'Direct']) assert.equal(esDirecto({ stops: st }), true, String(st));
+  for (const st of [1, '1', '1 escala', 'Con escala', 2]) assert.equal(esDirecto({ stops: st }), false, String(st));
   const v = (code, from, to, dep, arr, seats, taxes = 15103.85) => ({ code, from, to, departsAt: `2026-11-08 ${dep}:00`, arrivesAt: `2026-11-08 ${arr}:00`, departsHHMM: dep, seats, taxes });
   const order = { fechaVuelo: '2026-11-08', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }], escalaMinimaHoras: 2.5, preferencia: 'cualquier horario', topeTasasPorTramoARS: 40000 };
+  {
+    const solo = { ...order, tramos: [{ from: 'BRC', to: 'AEP' }] };
+    const conEscala = { ...v('JA3999', 'BRC', 'AEP', '05:00', '09:00', 9), stops: '1 escala' };
+    const directo = { ...v('JA3100', 'BRC', 'AEP', '06:00', '08:10', 2), stops: 'Directo' };
+    assert.deepEqual(chooseItinerary(solo, [[conEscala, directo]]).tramos.map((f) => f.code), ['JA3100'], 'el de escala no se elige');
+    assert.deepEqual(chooseItinerary(solo, [[conEscala]]).tramos, [], 'sólo con escala = no hay vuelo');
+  }
 
   const brc = [v('JA3100', 'BRC', 'AEP', '06:00', '08:10', 2), v('JA3106', 'BRC', 'AEP', '19:40', '21:50', 6)];
   const cor = [v('JA3020', 'AEP', 'COR', '09:30', '10:50', 1), v('JA3024', 'AEP', 'COR', '15:00', '16:20', 3)];
@@ -894,6 +904,7 @@ const memStore = () => {
     route: [{ departure: from, arrival: to, flightDate }], status: 'Confirmed',
     amountPaid: { currency: 'ARS', qty: 15103.85, text: 'ARS 15.103,85' }, quotaConsumed: 1, ...extra,
   });
+  const brcFlight = { from: 'BRC', to: 'AEP', code: 'JA3050', departsAt: '2026-11-07 20:49:00' };
   const SUMMARY = { content: {
     booking: { recordLocator: 'W7F5SS' },
     pass: { eventsLog: [
@@ -908,7 +919,28 @@ const memStore = () => {
   assert.match(calls[0].url, /\/availability\/PASS\/payment-summary$/);
   assert.ok(!calls.some((c) => /profile\/.*\/bookings/.test(c.url)), 'el endpoint viejo de reservas no se usa');
   assert.deepEqual(bk[0], { pnr: 'W7F5SS', from: 'BRC', to: 'AEP', departsAt: '2026-11-07 20:49:00', status: 'Confirmed', timestamp: 1794000000000 });
-  assert.deepEqual(bk.map((b) => b.pnr), ['W7F5SS', 'YYY222'], 'sólo FLIGHT_PURCHASE confirmadas');
+  assert.deepEqual(bk.map((b) => b.pnr), ['W7F5SS', 'YYY222'], 'sólo FLIGHT_PURCHASE no canceladas');
+  // Cualquier estado que no sea cancelada cuenta: una recién hecha en Pending NO es «no está».
+  const conEstados = (status) => ({ content: { pass: { eventsLog: [evento('PEN111', 'BRC', 'AEP', 1794095340000, { status })] } } });
+  assert.deepEqual((await listBookings(session, { _fetch: f(json(conEstados('Pending'))) })).map((b) => b.pnr), ['PEN111']);
+  assert.deepEqual((await listBookings(session, { _fetch: f(json(conEstados(undefined))) })).map((b) => b.pnr), ['PEN111'], 'sin estado también');
+  for (const st of ['Cancelled', 'Canceled', 'CANCELED']) assert.deepEqual(await listBookings(session, { _fetch: f(json(conEstados(st))) }), [], st);
+  // Una compra con flightDate ilegible (o sin ruta) invalida la lista entera.
+  for (const roto of [evento('X1', 'BRC', 'AEP', '2026-11-07'), evento('X2', 'BRC', 'AEP', undefined), { ...evento('X3', 'BRC', 'AEP', 1), route: [] }]) {
+    await assert.rejects(() => listBookings(session, { _fetch: f(json({ content: { pass: { eventsLog: [evento('W7F5SS', 'BRC', 'AEP', 1794095340000), roto] } } })) }),
+      /bookings-unavailable/, `no se confía en la lista con ${roto.recordLocator}`);
+  }
+  // Ruta con escala: origen del primer segmento, destino del último, salida del primero.
+  const escala = { ...evento('ESC123', 'BRC', 'AEP', 1794095340000), route: [
+    { departure: 'BRC', arrival: 'AEP', flightDate: 1794095340000 }, { departure: 'AEP', arrival: 'COR', flightDate: 1794110000000 },
+  ] };
+  assert.deepEqual((await listBookings(session, { _fetch: f(json({ content: { pass: { eventsLog: [escala] } } })) }))[0],
+    { pnr: 'ESC123', from: 'BRC', to: 'COR', departsAt: '2026-11-07 20:49:00', status: 'Confirmed', timestamp: 1794000000000 });
+  // El PNR de la compra recién hecha sale del eventsLog por ruta + salida, no de «la última compra».
+  const dosCompras = { content: { booking: { recordLocator: 'OTRO99' }, pass: { eventsLog: [evento('W7F5SS', 'BRC', 'AEP', 1794095340000), evento('OTRO99', 'AEP', 'COR', 1794110000000)] } } };
+  assert.equal((await paymentSummary(session, { _fetch: f(json(dosCompras)), flight: brcFlight })).pnr, 'W7F5SS');
+  assert.equal((await paymentSummary(session, { _fetch: f(json(dosCompras)), flight: { ...brcFlight, departsAt: '2026-11-07 06:00:00' } })).pnr, 'OTRO99', 'sin match, el de booking');
+  assert.equal((await paymentSummary(session, { _fetch: f(json(dosCompras)) })).pnr, 'OTRO99');
   const brc = { from: 'BRC', to: 'AEP', code: 'JA3050', departsAt: '2026-11-07 20:49:00' };
   assert.equal(hayReserva(bk, brc), true);
   assert.equal(hayReserva(bk, { ...brc, code: 'JA9999' }), true, 'el código de vuelo no hace falta');
@@ -1808,13 +1840,36 @@ const memStore = () => {
     const hoy0 = Date.now() - ((Date.now() - 3 * 3600_000) % 86_400_000);
     const a0002 = new Date(hoy0 + 2 * 60_000);
     llamadas.length = 0;
-    await buy({ headers: AUTH, query: {} }, res(), { _runBuy: ok, _withSession: sesion, now: a0002 });
+    {
+      const realNow = Date.now; const fijo = realNow(); Date.now = () => fijo;
+      try { await buy({ headers: AUTH, query: {} }, res(), { _runBuy: ok, _withSession: sesion, now: a0002 }); } finally { Date.now = realNow; }
+    }
     assert.equal(llamadas.length, 3);
     for (const a of llamadas) {
       assert.equal(a.avisarSinCupo, a.order.fechaVuelo === tomorrowInAR(a0002), `avisarSinCupo de ${a.order.fechaVuelo}`);
-      assert.equal(a.deadline, ventanaDe(a0002).deadline, 'la ventana de las 00:00 es una sola');
+      // Mañana usa la ventana entera; el lejano, lo que queda con tope de 3 min.
+      assert.equal(a.deadline, a.order.fechaVuelo === tomorrowInAR(a0002) ? ventanaDe(a0002).deadline : a0002.getTime() + 180_000, `deadline de ${a.order.fechaVuelo}`);
     }
     assert.ok(llamadas.some((a) => a.avisarSinCupo) && llamadas.some((a) => !a.avisarSinCupo));
+
+    // Con el runBuy real: el de mañana se come la ventana de las 00:00 sin cupo y el
+    // lejano igual tiene su pasada corta después (al menos una búsqueda), no sale en la vuelta 0.
+    {
+      const { runBuy } = await import('./src/buy.js');
+      const realNow = Date.now; let reloj = a0002.getTime();
+      Date.now = () => reloj;
+      const busquedas = {};
+      const api = (id) => ({
+        search: async () => { busquedas[id] = (busquedas[id] ?? 0) + 1; return []; },
+        quote: async () => { throw new Error('no debería cotizar'); }, initPayment: async () => { throw new Error('x'); },
+        tokenizeCard: async () => { throw new Error('x'); }, doPurchase: async () => { throw new Error('x'); }, listBookings: async () => [],
+      });
+      const real = (a) => runBuy({ ...a, api: api(a.order.id), now: () => reloj, sleep: async (ms) => { reloj += ms; }, notify: async () => true });
+      try { await buy({ headers: AUTH, query: {} }, res(), { _runBuy: real, _withSession: sesion, now: a0002 }); } finally { Date.now = realNow; }
+      assert.ok((busquedas[pedido.id] ?? 0) > 30, 'el primero de mañana usa la ventana entera');
+      assert.ok(reloj >= ventanaDe(a0002).deadline, 'la ventana se consumió');
+      assert.ok((busquedas[lejano.id] ?? 0) >= 1, 'el de pasado mañana busca igual después de la ventana');
+    }
 
     // Pasada horaria: un minuto por pedido contado desde que arranca cada uno.
     const a14 = new Date(hoy0 + 14 * 3600_000);

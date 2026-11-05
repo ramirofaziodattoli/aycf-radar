@@ -257,14 +257,18 @@ confirmados con vuelo de mañana en adelante, el más cercano primero. En hora a
 - **00:13** pasada de rescate hasta las **00:20**; espera el lock de la anterior por si sigue viva.
 - **00:30 y cada hora** pasadas cortas (~1 min por pedido) para lo que haya quedado pendiente.
 
+En las ventanas de 00:00 y 00:13 el vuelo de mañana usa la ventana entera; después, cada pedido más
+lejano tiene lo que quede (hasta 3 min) o, si la ventana ya se cerró, una pasada corta de 60 s.
+Sólo se compran vuelos **directos**: uno con escala son varios segmentos que la verificación no cruza.
+
 Sin cupo al final de una ventana el pedido **sigue confirmado**. Si el vuelo es mañana, las corridas
-de las 00:00 y 00:13 te avisan «⏳ Sin cupo hasta las HH:MM, sigo intentando en los rescates»; los
-vuelos más lejanos y las pasadas horarias callan salvo que compren algo. Recién la pasada de las **23:00** del día anterior al vuelo lo cierra:
+de las 00:00 y 00:13 te avisan «⏳ Sin cupo hasta las HH:MM, sigo intentando en los rescates» (y lo
+anotan en los intentos); los vuelos más lejanos y las pasadas horarias no avisan salvo que compren algo. Recién la pasada de las **23:00** del día anterior al vuelo lo cierra:
 `fallido` (sin cupo) o `parcial` si compró algunos tramos y el resto nunca apareció.
 
 Si el pago no da una respuesta clara (timeout, 5xx, una página que no se entiende), el pedido queda
 **dudoso** y no se reintenta: mirá el mail de JetSMART. Cuando el pago sale bien (Caravelo responde con
-un redirect a `payment-summary`), el PNR se lee de ese resumen; si no se puede, el aviso dice «PNR en el mail». Cancelar desde el botón o `/pedidos` corta
+un redirect a `payment-summary`), el PNR se lee de ese resumen (la compra de ese vuelo en el historial del pase); si no se puede, el aviso dice «PNR en el mail». Cancelar desde el botón o `/pedidos` corta
 el loop aunque esté a punto de pagar.
 
 Mientras haya algún pedido confirmado a futuro, el radar del dueño se saltea (`compra-en-curso`): dos

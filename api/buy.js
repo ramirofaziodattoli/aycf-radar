@@ -93,17 +93,26 @@ export default async function handler(req, res, {
     // hasta que el dueño la vea andar y lo prenda, un pago ambiguo queda dudoso.
     const bookingsCalibrado = process.env.AYCF_BOOKINGS_CALIBRADO === 'on';
     const orders = [];
-    // Las pasadas cortas dan un minuto por pedido, contado desde que arranca cada
-    // uno: con varios pedidos, el segundo no puede heredar un deadline ya vencido.
+    // Deadline por pedido, contado desde que arranca cada uno (`ahora`):
+    // - pasadas cortas: un minuto por pedido, así el segundo no hereda uno vencido;
+    // - ventanas de 00:00 y 00:13: el vuelo de mañana usa la ventana entera; los
+    //   más lejanos, lo que quede con un tope de 3 min, y si la ventana ya se cerró,
+    //   una pasada corta de 60 s (si no, saldrían en la vuelta 0 sin buscar nada).
     const corta = !avisarSinCupo && esperarLockMs === 0;
     const t0 = Date.now();
+    const deadlineDe = (order) => {
+      const ahora = now.getTime() + (Date.now() - t0);
+      if (corta) return Math.max(deadline, ahora + 60_000);
+      if (order.fechaVuelo === mañana) return deadline;
+      return ahora < deadline ? Math.min(deadline, ahora + 180_000) : ahora + 60_000;
+    };
     // En serie: un solo Caravelo y una sola tarjeta.
     for (const order of pedidos) {
       // Un pedido que revienta no puede dejar sin compra a los que siguen.
       try {
         const r = await _withSession(store, (session) => _runBuy({
           order, store, session, chatId: undefined, card, esperarLockMs, bookingsCalibrado,
-          deadline: corta ? Math.max(deadline, now.getTime() + (Date.now() - t0) + 60_000) : deadline,
+          deadline: deadlineDe(order),
           // El cierre y el «⏳ sin cupo» son sólo para el vuelo de mañana: los más
           // lejanos tienen más pasadas por delante y callan salvo que compren.
           avisarSinCupo: avisarSinCupo && order.fechaVuelo === mañana,

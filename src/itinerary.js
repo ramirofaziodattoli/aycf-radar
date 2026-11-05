@@ -24,6 +24,18 @@ export function enVentana(flight, ventana) {
   return hhmm >= ventana[0] && hhmm <= ventana[1];
 }
 
+/**
+ * Sólo se compran vuelos directos. Uno con escala es otro producto: la cotización
+ * y el pago son de varios segmentos, la escala mínima entre tramos del pedido no
+ * contempla la conexión interna y la verificación (ruta + salida en el eventsLog)
+ * se diseñó con un segmento. Sin el dato (lo ya comprado entra fijo sin `stops`)
+ * cuenta como directo; cualquier valor explícito que no sea 0/«Directo» queda afuera.
+ */
+export function esDirecto(flight) {
+  const s = flight.stops;
+  return s == null || s === 0 || String(s).trim() === '0' || /^direct[oa]?$/i.test(String(s).trim());
+}
+
 export function superaTope(flight, order) {
   return flight.taxes > order.topeTasasPorTramoARS;
 }
@@ -66,7 +78,7 @@ function mejor(order, combos) {
  */
 export function chooseItinerary(order, flightsPorTramo) {
   const candidatos = order.tramos.map((t, i) =>
-    (flightsPorTramo[i] ?? []).filter((f) => f.seats >= 1 && enVentana(f, t.ventana)));
+    (flightsPorTramo[i] ?? []).filter((f) => f.seats >= 1 && esDirecto(f) && enVentana(f, t.ventana)));
   const n = order.tramos.length;
   for (let k = n; k >= 1; k--) {
     const combos = combinaciones(order, candidatos, k);

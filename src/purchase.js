@@ -200,7 +200,7 @@ export async function doPurchase(session, { token, flight }, { _fetch = fetch } 
   // y el loop verifica contra las reservas antes de reintentar.
   if (es2xx && json && !msg && redirects(json).some((u) => /payment-summary/.test(u))) {
     let pnr = null;
-    try { pnr = (await paymentSummary(session, { _fetch })).pnr; } catch { /* el PNR llega por mail */ }
+    try { pnr = (await paymentSummary(session, { _fetch, flight })).pnr; } catch { /* el PNR llega por mail */ }
     return { ok: true, pnr, raw };
   }
 
@@ -250,38 +250,62 @@ async function leerResumen(session, _fetch) {
   return json;
 }
 
-/** PNR de la última compra según payment-summary (null si no viene). */
-export async function paymentSummary(session, { _fetch = fetch } = {}) {
+/**
+ * PNR según payment-summary. Con `flight`, el de la compra de ESE vuelo en el
+ * eventsLog (ruta + salida); si no aparece o el log no se puede leer, el de
+ * `content.booking.recordLocator` (la última compra). null si no viene ninguno.
+ */
+export async function paymentSummary(session, { _fetch = fetch, flight } = {}) {
   const json = await leerResumen(session, _fetch);
-  const pnr = json.content.booking?.recordLocator;
+  let pnr = null;
+  if (flight) {
+    try { pnr = filasDe(json).find((b) => hayReserva([b], flight))?.pnr ?? null; } catch { /* log ilegible: el de booking */ }
+  }
+  pnr ??= json.content.booking?.recordLocator;
   return { pnr: typeof pnr === 'string' && pnr ? pnr : null, raw: json };
 }
 
 /** Epoch ms → 'YYYY-MM-DD HH:MM:SS' en hora argentina (UTC-3 fijo), como `departsAt` de la búsqueda. */
 const enAR = (ms) => new Date(ms - 3 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
 
+const CANCELADA = /^cancell?ed$/i;
+
 /**
- * Compras del pase, para verificar después de pagar (o ante un timeout). Sale del
- * `eventsLog` de payment-summary: sólo FLIGHT_PURCHASE confirmadas, una fila por
- * evento con el primer tramo de su ruta. Si el endpoint no responde o el log no
- * está, tira `bookings-unavailable`: un [] falso haría recomprar.
- * (`profile/{passId}/bookings` no sirve: 500 con el pase, `bookings: []` con la billetera.)
+ * Las filas de compras de un payment-summary. Cuenta toda FLIGHT_PURCHASE que no
+ * esté cancelada: una recién hecha que aparece `Pending` NO puede leerse como «no
+ * está» (habilitaría repagar). Una compra sin ruta o sin `flightDate` numérico
+ * hace que la lista entera no sea confiable: tira `bookings-unavailable`.
+ * Con escalas, la ruta tiene varios segmentos: origen del primero, destino del
+ * último y la salida del primero.
  */
-export async function listBookings(session, { _fetch = fetch } = {}) {
-  const json = await leerResumen(session, _fetch);
+function filasDe(json) {
   const log = json.content.pass?.eventsLog;
   if (!Array.isArray(log)) throw new Error('bookings-unavailable');
   return log
-    .filter((e) => e?.eventType === 'FLIGHT_PURCHASE' && /^confirmed$/i.test(String(e.status ?? '')))
-    .filter((e) => e.route?.[0]?.departure && Number.isFinite(e.route[0].flightDate))
-    .map((e) => ({
-      pnr: e.recordLocator ?? null,
-      from: e.route[0].departure,
-      to: e.route[0].arrival,
-      departsAt: enAR(e.route[0].flightDate),
-      status: e.status,
-      timestamp: e.timestamp ?? null,
-    }));
+    .filter((e) => e?.eventType === 'FLIGHT_PURCHASE' && !CANCELADA.test(String(e.status ?? '')))
+    .map((e) => {
+      const r = Array.isArray(e.route) ? e.route : [];
+      const ida = r[0], fin = r.at(-1);
+      if (!ida?.departure || !fin?.arrival || !Number.isFinite(ida.flightDate)) throw new Error('bookings-unavailable');
+      return {
+        pnr: e.recordLocator ?? null,
+        from: ida.departure,
+        to: fin.arrival,
+        departsAt: enAR(ida.flightDate),
+        status: e.status ?? null,
+        timestamp: e.timestamp ?? null,
+      };
+    });
+}
+
+/**
+ * Compras del pase, para verificar después de pagar (o ante un timeout). Sale del
+ * `eventsLog` de payment-summary (ver `filasDe`). Si el endpoint no responde o el
+ * log no está o no se entiende, tira `bookings-unavailable`: un [] falso haría recomprar.
+ * (`profile/{passId}/bookings` no sirve: 500 con el pase, `bookings: []` con la billetera.)
+ */
+export async function listBookings(session, { _fetch = fetch } = {}) {
+  return filasDe(await leerResumen(session, _fetch));
 }
 
 /**
