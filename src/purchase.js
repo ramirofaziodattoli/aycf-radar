@@ -12,6 +12,7 @@ import { SessionExpiredError, TOKEN_MISMATCH } from './session.js';
 import { UA } from './login.js';
 import { BASE, parseAmount } from './jetsmart.js';
 
+const LOGIN_RE = /\/auth\/login|\/auth\/realms\/|openid-connect|\/login/i;
 const SPREEDLY_URL = 'https://core.spreedly.com/v1/payment_methods.json';
 
 function exigirPase(session) {
@@ -39,7 +40,8 @@ async function pedir(session, url, init, { _fetch = fetch } = {}) {
   let json = null;
   try { json = JSON.parse(text); } catch { /* no-JSON: lo decide el caller */ }
 
-  if (json?.redirectUri) throw new SessionExpiredError();
+  // Un redirectUri que no apunta a login/auth no es sesión muerta: lo decide el caller.
+  if (json?.redirectUri && LOGIN_RE.test(String(json.redirectUri))) throw new SessionExpiredError();
   const motivo = json?.content?.exceptionMessage ?? json?.exceptionMessage;
   if (motivo === TOKEN_MISMATCH) {
     throw new SessionExpiredError('la cookie quedó superada (error.token.mismatch)');
@@ -80,8 +82,10 @@ export async function quote(session, flight, { _fetch = fetch } = {}) {
 
   if (!res.ok || !json) throw falla('cotización', res, text);
   const c = json.content ?? json;
-  const total = parseAmount(String(c.total?.text ?? '').replace(/[^\d.,]/g, '')) ?? c.total?.qty;
-  if (!Number.isFinite(total)) throw falla('cotización sin total', res, text);
+  // qty manda si es número; el texto ("ARS 15103.85") es respaldo. Vacío NUNCA es 0.
+  const limpio = String(c.total?.text ?? '').replace(/[^\d.,]/g, '');
+  const total = Number.isFinite(c.total?.qty) ? c.total.qty : (limpio ? parseAmount(limpio) : null);
+  if (!Number.isFinite(total)) throw new Error('cotización sin total');
   const breakdown = (c.pricingBreakdown ?? []).map((p) => ({
     description: p.description, amount: p.amount, code: p.code,
   }));
@@ -163,24 +167,63 @@ export async function doPurchase(session, { token, card, quotation }, { _fetch =
   const raw = text.slice(0, 300);
   const msg = json?.content?.exceptionMessage ?? json?.exceptionMessage ?? null;
   const marcador = `${msg ?? ''} ${text}`;
+  const es2xx = res.status >= 200 && res.status < 300;
 
   if (/declin|rechaz/i.test(marcador)) return { ok: false, motivo: 'rechazada', raw };
-  if (res.status >= 300 && res.status < 400) return { ok: false, motivo: '3ds', raw };
-  if (res.status >= 200 && res.status < 300 && !msg) return { ok: true, raw };
 
-  // Fuera del 2xx limpio sí miramos el texto: en una página de éxito, palabras
-  // como "acs" o "availab" podrían aparecer de casualidad y NO deben abortar.
-  if (/no.?seat|sin cupo|availab/i.test(marcador)) return { ok: false, motivo: 'sin-cupo', raw };
-  if (/3ds|three.?d|challenge|acs/i.test(marcador)) return { ok: false, motivo: '3ds', raw };
+  // Éxito SOLO con señal positiva: un 2xx pelado no prueba nada (Caravelo devuelve
+  // 200 con {"success":false} o con páginas de error). Sin señal → 'desconocido' y
+  // el loop verifica contra las reservas antes de reintentar.
+  if (es2xx && !msg) {
+    const pnr = señalDeExito(json, text);
+    if (pnr !== null) return { ok: true, pnr: pnr || undefined, raw };
+  }
+
+  if (/no hay asientos|no.?seat|sin cupo|availab/i.test(marcador)) return { ok: false, motivo: 'sin-cupo', raw };
+
+  if (res.status >= 300 && res.status < 400) {
+    const loc = res.headers?.get?.('location') ?? '';
+    if (LOGIN_RE.test(loc)) throw new SessionExpiredError();
+    let mismoHost = true;
+    try { mismoHost = new URL(loc, BASE).host === new URL(BASE).host; } catch { /* location ilegible */ }
+    // Otro host = ACS del banco (3DS). Mismo host = redirect a una página de
+    // confirmación: no sabemos si compró, que lo resuelva la verificación.
+    return mismoHost ? { ok: false, motivo: 'desconocido', raw: loc.slice(0, 300) || raw }
+                     : { ok: false, motivo: '3ds', raw: loc.slice(0, 300) };
+  }
+  if (!es2xx && /3ds|three.?d|challenge|acs/i.test(marcador)) return { ok: false, motivo: '3ds', raw };
   return { ok: false, motivo: 'desconocido', raw };
+}
+
+// CALIBRAR: reglas de éxito positivo provisorias; se confirman con la compra real.
+// Devuelve el PNR ('' si hay éxito sin PNR legible) o null si no hay señal de éxito.
+function señalDeExito(json, text) {
+  const j = json?.content ?? json;
+  const pnr = j?.pnr ?? j?.bookingReference ?? j?.recordLocator;
+  if (typeof pnr === 'string' && pnr) return pnr;
+  if (/^(ok|confirmed|success)$/i.test(String(json?.status ?? j?.status ?? ''))) return '';
+  const plano = text.replace(/<[^>]+>/g, ' ');
+  const m = /confirmad|confirmed|éxito|exitosa/i.exec(plano);
+  if (!m) return null;
+  const cerca = plano.slice(Math.max(0, m.index - 120), m.index + 120);
+  const code = /\b[A-Z0-9]{6}\b/.exec(cerca);
+  return code ? code[0] : null;
 }
 
 const ok2xx = (res) => res.status >= 200 && res.status < 300;
 
+function fechaISO(t) {
+  let m = /\b(\d{4})-(\d{2})-(\d{2})\b/.exec(t);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = /\b(\d{2})\/(\d{2})\/(\d{4})\b/.exec(t);
+  return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
+}
+
 /**
  * Reservas del pase, para verificar después de comprar (o ante un timeout).
- * PROVISORIO: no sabemos si el endpoint responde JSON o solo HTML; probamos las
- * dos variantes y la de HTML es best effort. Se confirma en la calibración.
+ * PROVISORIO (CALIBRAR): no sabemos si el endpoint responde JSON o solo HTML.
+ * `[]` solo si hay prueba positiva de "lista vacía"; ante un body que no
+ * reconocemos (login, error con 200) tiramos, porque un [] falso haría recomprar.
  */
 export async function listBookings(session, { _fetch = fetch } = {}) {
   const passId = exigirPase(session);
@@ -194,35 +237,41 @@ export async function listBookings(session, { _fetch = fetch } = {}) {
     }
   };
 
-  const a = await intentar('application/vnd.cvo.subs.frontend+json');
-  const lista = a && ok2xx(a.res) ? a.json?.content?.content : null;
-  if (Array.isArray(lista)) {
-    return lista.map((b) => ({
-      pnr: b.pnr ?? b.recordLocator ?? b.code,
-      flightCode: b.flightCode ?? b.code,
-      date: b.date ?? b.departureDate ?? null,
-      from: b.from ?? b.origin ?? null,
-      to: b.to ?? b.destination ?? null,
-    }));
+  let ult = null;
+  for (const accept of ['application/vnd.cvo.subs.frontend+json', 'application/json']) {
+    const r = await intentar(accept);
+    if (r) ult = r;
+    const lista = r && ok2xx(r.res) ? (r.json?.content?.content ?? (Array.isArray(r.json) ? r.json : null)) : null;
+    if (Array.isArray(lista)) {
+      return lista.map((b) => ({
+        pnr: b.pnr ?? b.recordLocator ?? b.code,
+        flightCode: b.flightCode ?? b.code,
+        date: b.date ?? b.departureDate ?? null,
+        from: b.from ?? b.origin ?? null,
+        to: b.to ?? b.destination ?? null,
+      }));
+    }
   }
 
   const h = await intentar('text/html');
+  if (h) ult = h;
   if (h && ok2xx(h.res)) {
-    // Solo miramos líneas que hablan de PNR/Reserva para no confundir con ids ajenos.
-    const lineas = h.text
-      .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
-      .replace(/<\/?(li|tr|div|p|section|article|h\d|td|br)[^>]*>/gi, '\n')
-      .replace(/<[^>]+>/g, ' ')
-      .split('\n');
-    const vistos = new Set();
-    for (const l of lineas) {
-      if (!/PNR|Reserva/.test(l)) continue;
-      for (const m of l.matchAll(/\b[A-Z0-9]{6}\b/g)) vistos.add(m[0]);
+    const html = h.text.replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ');
+    const filas = [];
+    for (const m of html.matchAll(/<(tr|li)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
+      const t = m[2].replace(/<[^>]+>/g, ' ');
+      const flightCode = /\bJA\d{3,4}\b/.exec(t)?.[0];
+      if (!flightCode) continue; // sin código de vuelo la fila no sirve para hayReserva
+      const pnr = [...t.matchAll(/\b[A-Z0-9]{6}\b/g)].map((x) => x[0]).find((c) => c !== flightCode);
+      if (!pnr) continue;
+      const date = fechaISO(t);
+      filas.push(date ? { pnr, flightCode, date } : { pnr, flightCode });
     }
-    return [...vistos].map((pnr) => ({ pnr }));
+    if (filas.length) return filas;
+    // Sin filas: vacío solo si la página dice ser la de reservas.
+    if (/<h[1-6][^>]*>[^<]*(reserva|booking)/i.test(html)) return [];
   }
 
-  const ult = h ?? a;
   if (ult) console.log(`bookings: status ${ult.res.status} ${ult.text.slice(0, 120)}`);
   throw new Error('bookings-unavailable');
 }

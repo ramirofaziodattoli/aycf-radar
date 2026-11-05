@@ -822,4 +822,47 @@ const memStore = () => {
   assert.equal(hayReserva(bk, { code: 'JA3100', departsAt: '2026-11-06 06:00:00' }), false);
 }
 
+// --- compra: arreglos de la revisión (éxito positivo, redirects, total, reservas) ---
+{
+  const { quote, doPurchase, listBookings, hayReserva } = await import('./src/purchase.js');
+  const { SessionExpiredError } = await import('./src/session.js');
+  const seen = [];
+  const session = { passId: 'PASS', header: () => 'laravel_session=S', absorb: async () => false };
+  const R = (status, text, headers = {}) => async (url, opt = {}) => {
+    seen.push({ url: String(url), opt });
+    return { ok: status < 400, status, headers: { get: (k) => headers[k.toLowerCase()] ?? null, getSetCookie: () => [] }, text: async () => (typeof text === 'string' ? text : JSON.stringify(text)) };
+  };
+  const card = { number: '4111111111111111', month: '12', year: '2030', cvv: '987', holder: 'RAMIRO FAZIO' };
+  const buy = (fetcher) => doPurchase(session, { token: 'TOK', card, quotation: {} }, { _fetch: fetcher });
+
+  assert.equal((await buy(R(200, { success: false }))).motivo, 'desconocido', '2xx sin señal positiva no es éxito');
+  assert.equal((await buy(R(200, '<p>No hay asientos disponibles</p>'))).motivo, 'sin-cupo');
+  const conf = await buy(R(200, '<h1>Reserva confirmada</h1> Código ABC123'));
+  assert.equal(conf.ok, true); assert.equal(conf.pnr, 'ABC123');
+  assert.equal((await buy(R(200, { pnr: 'XYZ789' }))).pnr, 'XYZ789');
+  await assert.rejects(() => buy(R(302, '', { location: 'https://go.jetsmart.com/auth/realms/x/protocol/openid-connect/auth' })), SessionExpiredError);
+  const bank = await buy(R(302, '', { location: 'https://acs.bank.com/challenge' }));
+  assert.equal(bank.motivo, '3ds'); assert.match(bank.raw, /acs\.bank\.com/);
+  assert.equal((await buy(R(302, '', { location: '/es-ar/ja/subscriptions/confirmation' }))).motivo, 'desconocido');
+  // redirectUri que no es login no es sesión muerta
+  assert.equal((await buy(R(200, { redirectUri: '/es-ar/ja/subscriptions/thanks' }))).motivo, 'desconocido');
+
+  const flight = { key: 'K', fareSellKey: 'FK', from: 'SLA', to: 'EZE', departsAt: '2026-11-06 22:04:00', code: 'JA3021' };
+  assert.equal((await quote(session, flight, { _fetch: R(200, { total: { qty: 15103.85 } }) })).total, 15103.85);
+  await assert.rejects(() => quote(session, flight, { _fetch: R(200, { total: { text: '' } }) }), /cotización sin total/);
+
+  await assert.rejects(() => listBookings(session, { _fetch: R(200, '<html><form>Ingresá tu usuario</form></html>', {}) }), /bookings-unavailable/);
+  const filas = await listBookings(session, { _fetch: R(200, '<table><tr><td>ABC123</td><td>JA3021</td><td>06/11/2026</td></tr></table>') });
+  assert.deepEqual(filas, [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-06' }]);
+  assert.equal(hayReserva(filas, { code: 'JA3021', departsAt: '2026-11-06 22:04:00' }), true);
+  assert.deepEqual(await listBookings(session, { _fetch: R(200, '<h2>Mis reservas</h2><p>Nada</p>') }), []);
+
+  seen.length = 0;
+  await buy(R(200, { success: false }));
+  const c = seen.at(-1);
+  for (const k of ['month=12', 'year=2030', 'full_name=RAMIRO', 'payment_method_reference=']) assert.ok(c.opt.body.includes(k), k);
+  assert.ok(!c.opt.body.includes('987'), 'el cvv no va a Caravelo');
+  assert.ok(c.opt.headers['user-agent'] && c.opt.headers.cookie && c.opt.signal, 'UA, cookie y timeout');
+}
+
 console.log('✅ todo ok');
