@@ -1395,7 +1395,7 @@ const memStore = () => {
   const mk = (prog) => {
     const calls = { search: 0, quote: 0, initPayment: 0, tokenizeCard: 0, doPurchase: 0, listBookings: 0 };
     const api = {};
-    for (const k of Object.keys(calls)) api[k] = async (...a) => { calls[k]++; const r = await prog[k]?.(...a); if (r instanceof Error) throw r; return r; };
+    for (const k of Object.keys(calls)) api[k] = async (...a) => { calls[k]++; if (k === 'search') assert.equal(a.length, 2, 'el ensayo busca sin store (no guarda el catálogo)'); const r = await prog[k]?.(...a); if (r instanceof Error) throw r; return r; };
     return { api, calls };
   };
   const ok = {

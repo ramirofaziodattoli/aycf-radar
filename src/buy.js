@@ -96,10 +96,11 @@ async function ensayar({ order, store, session, api }) {
   const msg = (e) => String(e?.message ?? e ?? '').replace(/[*_`[\]]/g, '').slice(0, 160);
   const falla = (paso, e, extra) => ({ estado: 'ensayo', paso, error: msg(e), ...extra });
 
+  // Sin `store` en el search: con store, search() guarda el catálogo de aeropuertos.
   const vuelos = [];
   for (let i = 0; i < fresco.tramos.length; i++) {
     try {
-      vuelos[i] = await api.search(session, { from: fresco.tramos[i].from, to: fresco.tramos[i].to, date: fresco.fechaVuelo }, store);
+      vuelos[i] = await api.search(session, { from: fresco.tramos[i].from, to: fresco.tramos[i].to, date: fresco.fechaVuelo });
     } catch (e) { return falla('search', e); }
   }
   const it = chooseItinerary(fresco, vuelos);
