@@ -779,4 +779,47 @@ const memStore = () => {
   assert.equal(margen.tramos[1].code, 'JA3024', 'cualquier horario con varios tramos: más margen total');
 }
 
+// --- compra: requests a Caravelo y Spreedly con la forma relevada ---
+{
+  const { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva } = await import('./src/purchase.js');
+  const session = { passId: 'PASS', header: () => 'laravel_session=S', absorb: async () => false };
+  const calls = []; const json = (b, status = 200) => ({ ok: status < 400, status, headers: { get: () => 'application/json', getSetCookie: () => [] }, text: async () => JSON.stringify(b) });
+  const f = (resp) => async (url, opt = {}) => { calls.push({ url: String(url), method: opt.method ?? 'GET', headers: opt.headers, body: opt.body }); return resp; };
+  const flight = { key: 'K', fareSellKey: 'FK', from: 'SLA', to: 'EZE', departsAt: '2026-11-06 22:04:00', code: 'JA3021' };
+
+  const q = await quote(session, flight, { _fetch: f(json({ pricingBreakdown: [{ description: 'Tasa', amount: '6,500.00', code: 'TQ' }], total: { qty: 15103.85, text: 'ARS 15103.85' } })) });
+  assert.equal(q.total, 15103.85);
+  assert.match(calls.at(-1).url, /\/json\/PASS\/quotation$/);
+  const body = JSON.parse(calls.at(-1).body);
+  assert.equal(body.outboundKey, 'K'); assert.equal(body.referenceOutbound, 'K'); assert.equal(body.outboundFareSellKey, 'FK'); assert.equal(body.departure, '2026-11-06 22:04:00'); assert.equal(body.inboundKey, null);
+
+  const init = await initPayment(session, { _fetch: f(json({ paymentGateway: 'spreedly', additionalData: { certificateToken: 'C', signature: 'S', nonce: 'N', timestamp: '1' } })) });
+  assert.deepEqual(init, { certificateToken: 'C', signature: 'S', nonce: 'N', timestamp: '1' });
+  assert.deepEqual(JSON.parse(calls.at(-1).body), { type: 'INIT', paymentGateway: 'spreedly' });
+
+  const card = { number: '4111111111111111', month: '12', year: '2030', cvv: '123', holder: 'RAMIRO FAZIO' };
+  const tok = await tokenizeCard(card, init, { _fetch: f(json({ transaction: { payment_method: { token: 'TOK' } } })) });
+  assert.equal(tok, 'TOK');
+  assert.match(calls.at(-1).url, /core\.spreedly\.com\/v1\/payment_methods\.json$/);
+  const sp = JSON.parse(calls.at(-1).body);
+  assert.equal(sp.payment_method.credit_card.number, card.number); assert.equal(sp.certificate_token, 'C'); assert.equal(sp.signature, 'S');
+  assert.ok(!calls.at(-1).headers.cookie, 'a Spreedly no va la cookie de Caravelo');
+
+  const ok = await doPurchase(session, { token: 'TOK', card, quotation: q }, { _fetch: f({ ok: true, status: 200, headers: { get: () => 'text/html', getSetCookie: () => [] }, text: async () => '<h1>Compra confirmada</h1> PNR ABC123' }) });
+  assert.equal(ok.ok, true);
+  assert.match(calls.at(-1).url, /\/PASS\/do-purchase$/);
+  assert.match(calls.at(-1).body, /payment-method-token=TOK/); assert.match(calls.at(-1).body, /txvariant=card/);
+  assert.ok(!calls.at(-1).body.includes(card.number), 'el número de tarjeta nunca va a Caravelo');
+
+  const rechazo = await doPurchase(session, { token: 'TOK', card, quotation: q }, { _fetch: f(json({ content: { exceptionMessage: 'payment.declined' } }, 402)) });
+  assert.equal(rechazo.ok, false); assert.equal(rechazo.motivo, 'rechazada');
+
+  await assert.rejects(() => quote(session, flight, { _fetch: f(json({ redirectUri: '/login' })) }), /sesión/);
+
+  const bk = await listBookings(session, { _fetch: f(json({ content: { content: [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-06', from: 'SLA', to: 'EZE' }] } })) });
+  assert.equal(bk[0].pnr, 'ABC123');
+  assert.equal(hayReserva(bk, { code: 'JA3021', departsAt: '2026-11-06 22:04:00' }), true);
+  assert.equal(hayReserva(bk, { code: 'JA3100', departsAt: '2026-11-06 06:00:00' }), false);
+}
+
 console.log('✅ todo ok');

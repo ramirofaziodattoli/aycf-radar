@@ -11,7 +11,7 @@ import { SessionExpiredError, TOKEN_MISMATCH } from './session.js';
 import { UA } from './login.js';
 import { saveCatalog } from './airports.js';
 
-const BASE = process.env.AYCF_BASE_URL || 'https://go.jetsmart.com/es-ar/ja/subscriptions';
+export const BASE = process.env.AYCF_BASE_URL || 'https://go.jetsmart.com/es-ar/ja/subscriptions';
 
 export const REDEMPTION_URL = `${BASE}/spa/private-page/redemption`;
 
