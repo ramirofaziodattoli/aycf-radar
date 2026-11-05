@@ -96,12 +96,20 @@ export function formatFallo(order, intentos = []) {
  * Ensayo de compra (`/ensayo`): una sola pasada de search → elegir → quote por tramo
  * → initPayment, sin lock, sin escribir en el store, sin tokenizar ni pagar.
  * Devuelve el itinerario, lo cotizado y si el INIT de Spreedly anduvo, o el paso
- * que falló. Sin reintentos ni relogin: es para mirar, no para insistir.
+ * que falló. Sin reintentos propios: es para mirar, no para insistir.
+ *
+ * La sesión vencida NO se traga: se re-tira para que `withSession` (el que llama
+ * desde el bot) se reloguee y reintente una vez, igual que /buscar. Antes se
+ * devolvía como «falló en search» y el ensayo quedaba muerto hasta que otro
+ * comando renovara la sesión.
  */
 async function ensayar({ order, store, session, api }) {
   const fresco = (await getOrder(store, order.id)) ?? order;
   const msg = (e) => String(e?.message ?? e ?? '').replace(/[*_`[\]]/g, '').slice(0, 160);
-  const falla = (paso, e, extra) => ({ estado: 'ensayo', paso, error: msg(e), ...extra });
+  const falla = (paso, e, extra) => {
+    if (e instanceof SessionExpiredError) throw e;
+    return { estado: 'ensayo', paso, error: msg(e), ...extra };
+  };
 
   // Sin `store` en el search: con store, search() guarda el catálogo de aeropuertos.
   const vuelos = [];
