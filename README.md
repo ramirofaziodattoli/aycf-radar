@@ -242,6 +242,33 @@ Sin Redis el estado va a `.state.json`. Un cron del sistema a las 00:01, sin lí
 1 0 * * * cd /opt/aycf-radar && /usr/bin/node --env-file=.env run-local.mjs >> radar.log 2>&1
 ```
 
+## Compra automática (opcional, sólo el dueño)
+
+Si dejás un pedido confirmado (vuelo de mañana, hasta dos tramos), el bot lo **compra solo** cuando
+se libera el inventario, con tu tarjeta y tu pase. Es sólo para el dueño del deploy: los demás
+usuarios siguen con el radar de siempre.
+
+La noche, en hora argentina:
+
+- **23:55** el precalentado te manda cada pedido de la noche con un botón para cancelarlo.
+- **00:00** arranca el loop de compra y sigue hasta las **00:12**.
+- **00:13** pasada de rescate hasta las **00:20**; espera el lock de la anterior por si sigue viva.
+- **00:30 y cada hora** pasadas cortas (~1 min) para lo que haya quedado pendiente.
+
+En esas noches el radar del dueño se saltea (`compra-en-curso`): dos procesos pegándole a Caravelo
+con la misma cuenta se pisan.
+
+| Env var | Qué es |
+|---|---|
+| `AUTO_BUY` | `on` lo prende. Cualquier otro valor (o borrarla) es el **kill switch**: `/api/buy` no toca nada. |
+| `AYCF_CARD` | JSON `{"number","month","year","cvv","holder"}`. Marcala **Sensitive** y cargala vos en Vercel: nunca por Telegram. Si falta y hay pedidos, el bot te avisa. |
+| `ANTHROPIC_API_KEY` | Para armar el pedido escribiéndole en lenguaje natural. |
+
+`/api/buy?order=<id>` fuerza un pedido puntual en cualquier estado (rescates y pruebas a mano).
+
+> **Ojo:** automatizar una compra puede ir contra los términos del portal. Es tu cuenta y tu
+> responsabilidad. El bot nunca esquiva CAPTCHA ni 3DS: si aparece uno, no compra y te avisa.
+
 ## Sé buen vecino
 
 Cada corrida hace **un request por ruta distinta**. Con el cron diario y 10 rutas son 10 requests
@@ -256,6 +283,7 @@ recorre en serie, no en paralelo, justamente para no martillar.
 |---|---|
 | `GET /api/cron` | Barrido de todos los usuarios conectados. Acepta `?date=YYYY-MM-DD` |
 | `GET /api/reminder` | Precalentado de las 23:55: loguea a todos de nuevo y avisa solo a quien no puede entrar |
+| `GET /api/buy` | Compra automática del dueño (sólo con `AUTO_BUY=on`). Acepta `?order=<id>` |
 | `POST /api/telegram` | Webhook del bot |
 
 Si el radar estuvo caído más de 30 min, la sesión muere y el store se limpia solo, para que la

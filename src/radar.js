@@ -4,6 +4,7 @@ import { createStore } from './store.js';
 import { withSession, SessionExpiredError } from './session.js';
 import { tieneCredenciales } from './login.js';
 import { scoped, listUsers, envUser, usaSemilla } from './users.js';
+import { ordersDueTonight } from './orders.js';
 import { search } from './jetsmart.js';
 import { appliesTo, matchFlight, watchLabel } from './watches.js';
 import { resolveWatches } from './config.js';
@@ -171,8 +172,9 @@ export async function runRadar({
 }
 
 /** Punto de entrada del cron: todos los usuarios conectados, uno por uno. */
-export async function runAllRadars({ date } = {}) {
-  const users = await listUsers(createStore());
+export async function runAllRadars({ date, _dueTonight } = {}) {
+  const base = createStore();
+  const users = await listUsers(base);
   if (!users.length) return [await runRadar({ date })];
 
   const out = [];
@@ -184,7 +186,20 @@ export async function runAllRadars({ date } = {}) {
   // hace que los últimos entren cuando la estampida de las 00:01 ya pasó.
   // ponytail: ~30 s por usuario con Caravelo saturado; con maxDuration 800 entran
   // ~25 usuarios. Pasado eso, fan-out por usuario (una invocación cada uno).
+  // En noche de compra el dueño no barre: /api/buy ya le pega a Caravelo con su
+  // sesión y cada request extra compite con la compra (y arriesga el bloqueo).
+  // Los demás usuarios siguen igual.
+  let saltearDueno = false;
+  const dueno = envUser();
+  if (process.env.AUTO_BUY === 'on' && dueno) {
+    const due = _dueTonight ?? (() => ordersDueTonight(scoped(base, dueno.chatId)));
+    saltearDueno = (await due()).length > 0;
+  }
   for (const user of users) {
+    if (saltearDueno && String(user.chatId) === String(dueno.chatId)) {
+      out.push({ chatId: user.chatId, skipped: 'compra-en-curso' });
+      continue;
+    }
     const t0 = Date.now();
     try {
       out.push({ chatId: user.chatId, ...(await runRadar({ date, user, release })) });

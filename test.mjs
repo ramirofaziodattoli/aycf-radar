@@ -1372,4 +1372,98 @@ const memStore = () => {
   process.env = limpio;
 }
 
+// --- /api/buy: sólo el dueño, sólo con AUTO_BUY, y el radar del dueño se saltea ---
+{
+  const { default: buy, ventanaDe } = await import('./api/buy.js');
+  const { default: recordatorio } = await import('./api/reminder.js');
+  const { runAllRadars, tomorrowInAR } = await import('./src/radar.js');
+  const { createStore } = await import('./src/store.js');
+  const { saveUser, scoped } = await import('./src/users.js');
+  const { newOrder, saveOrder } = await import('./src/orders.js');
+  const { rm } = await import('node:fs/promises');
+  const limpio = { ...process.env };
+  const orig = globalThis.fetch;
+  process.env.SECRET_KEY = 'clave-de-prueba-larga';
+  process.env.TELEGRAM_TOKEN = 'x'; process.env.TELEGRAM_CHAT_ID = '1';
+  process.env.AYCF_EMAIL = 'dueno@mail.com'; process.env.AYCF_PASSWORD = 'x'; process.env.AYCF_PASS_ID = 'p1';
+  delete process.env.CRON_SECRET; delete process.env.AYCF_CARD; delete process.env.AUTO_BUY;
+  process.env.STATE_FILE = '/tmp/aycf-test-buy.json';
+  await rm(process.env.STATE_FILE, { force: true });
+  const res = () => ({ status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } });
+  const msgs = [];
+  globalThis.fetch = async (url, opt = {}) => {
+    if (String(url).includes('api.telegram.org')) { msgs.push(JSON.parse(opt.body)); return { ok: true, status: 200, text: async () => '{}', headers: { getSetCookie: () => [] } }; }
+    throw new Error(`fetch inesperado: ${url}`);
+  };
+
+  // Ventanas: el reparto de los 20 min en dos invocaciones de ≤ 800 s.
+  const art = (hh, mm, ss = 0) => new Date(Date.UTC(2026, 10, 6, hh + 3, mm, ss));
+  assert.deepEqual(ventanaDe(art(0, 0, 5)), { deadline: Date.UTC(2026, 10, 6, 3, 12), esperarLockMs: 0 });
+  assert.deepEqual(ventanaDe(art(0, 13, 2)), { deadline: Date.UTC(2026, 10, 6, 3, 20), esperarLockMs: 360_000 });
+  const corta = ventanaDe(art(14, 0));
+  assert.equal(corta.deadline, art(14, 0).getTime() + 60_000); assert.equal(corta.esperarLockMs, 0);
+
+  // (a) sin el secreto correcto: 401.
+  process.env.CRON_SECRET = 's3';
+  assert.equal((await buy({ headers: {}, query: {} }, res())).code, 401);
+  assert.equal((await buy({ headers: { authorization: 'Bearer s3' }, query: {} }, res())).code, 200);
+  delete process.env.CRON_SECRET;
+
+  // (b) apagado: ni toca el store.
+  const r0 = await buy({ headers: {}, query: {} }, res());
+  assert.equal(r0.code, 200); assert.deepEqual(r0.body, { ok: true, skipped: 'auto-buy-off' });
+  assert.equal(msgs.length, 0);
+
+  // Prendido y sin pedidos: nada que avisar aunque falte la tarjeta.
+  process.env.AUTO_BUY = 'on';
+  assert.deepEqual((await buy({ headers: {}, query: {} }, res())).body, { ok: true, orders: [] });
+  assert.equal(msgs.length, 0);
+
+  // (c) con un pedido para mañana y sin tarjeta: aviso al dueño y nada más.
+  const base = createStore();
+  const duenoStore = scoped(base, '1');
+  const pedido = newOrder({ chatId: '1', fechaVuelo: tomorrowInAR(), tramos: [{ from: 'BRC', to: 'AEP' }] });
+  await saveOrder(duenoStore, { ...pedido, estado: 'confirmado' });
+  const r1 = await buy({ headers: {}, query: {} }, res());
+  assert.deepEqual(r1.body, { ok: true, skipped: 'sin-tarjeta' });
+  assert.equal(msgs.length, 1); assert.match(msgs[0].text, /AYCF_CARD/);
+  process.env.AYCF_CARD = '{esto no es json 4111111111111111';
+  const r2 = await buy({ headers: {}, query: {} }, res());
+  assert.equal(r2.body.skipped, 'sin-tarjeta', 'JSON roto = tarjeta no cargada');
+  assert.ok(!JSON.stringify(r2.body).includes('4111'), 'la tarjeta no se devuelve');
+  msgs.length = 0;
+
+  // (d) el radar: el dueño se saltea en noche de compra, el otro corre.
+  await saveUser(base, '7', { email: 'ana@mail.com', password: 'x', passId: 'p7' });
+  await scoped(base, '7').set('watches', [{ from: 'AEP', to: 'COR' }]);
+  const out = await runAllRadars({ date: tomorrowInAR() });
+  const dueno = out.find((o) => String(o.chatId) === '1');
+  assert.equal(dueno.skipped, 'compra-en-curso');
+  assert.ok(out.find((o) => String(o.chatId) === '7' && o.skipped !== 'compra-en-curso'), 'Ana sigue con su barrido');
+  // Sin pedidos para esta noche (inyectado) o con AUTO_BUY apagado, el dueño barre como siempre.
+  const sinPedidos = await runAllRadars({ date: tomorrowInAR(), _dueTonight: async () => [] });
+  assert.notEqual(sinPedidos.find((o) => String(o.chatId) === '1').skipped, 'compra-en-curso');
+  process.env.AUTO_BUY = 'off';
+  const apagado = await runAllRadars({ date: tomorrowInAR() });
+  assert.notEqual(apagado.find((o) => String(o.chatId) === '1').skipped, 'compra-en-curso');
+  process.env.AUTO_BUY = 'on';
+  msgs.length = 0;
+
+  // Recordatorio de las 23:55: un mensaje por pedido de LA NOCHE (vuelo pasado mañana de hoy ART), con botón de cancelar.
+  const real = Date.now;
+  Date.now = () => Date.UTC(2026, 10, 6, 2, 55); // 23:55 ART del 5/11
+  try {
+    const noche = newOrder({ chatId: '1', fechaVuelo: '2026-11-07', tramos: [{ from: 'BRC', to: 'AEP' }] });
+    await saveOrder(duenoStore, { ...noche, estado: 'confirmado' });
+    await recordatorio({ headers: {} }, res());
+  } finally { Date.now = real; }
+  const rec = msgs.filter((m) => /Lo compro solo a las 00:00/.test(m.text));
+  assert.equal(rec.length, 1, 'sólo el pedido de esta noche');
+  assert.equal(JSON.parse(JSON.stringify(rec[0].reply_markup)).inline_keyboard[0][0].text, '❌ Cancelar');
+  assert.match(rec[0].reply_markup.inline_keyboard[0][0].callback_data, /^ord:no:/);
+
+  globalThis.fetch = orig;
+  process.env = limpio;
+}
+
 console.log('✅ todo ok');
