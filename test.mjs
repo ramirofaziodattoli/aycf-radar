@@ -740,4 +740,43 @@ const memStore = () => {
   } finally { globalThis.fetch = orig; process.env = limpio; }
 }
 
+// --- itinerario: ventana, escala, escasez y tope ---
+{
+  const { chooseItinerary, ordenDeCompra, superaTope, enVentana, escalaMinima } = await import('./src/itinerary.js');
+  const v = (code, from, to, dep, arr, seats, taxes = 15103.85) => ({ code, from, to, departsAt: `2026-11-08 ${dep}:00`, arrivesAt: `2026-11-08 ${arr}:00`, departsHHMM: dep, seats, taxes });
+  const order = { fechaVuelo: '2026-11-08', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }], escalaMinimaHoras: 2.5, preferencia: 'cualquier horario', topeTasasPorTramoARS: 40000 };
+
+  const brc = [v('JA3100', 'BRC', 'AEP', '06:00', '08:10', 2), v('JA3106', 'BRC', 'AEP', '19:40', '21:50', 6)];
+  const cor = [v('JA3020', 'AEP', 'COR', '09:30', '10:50', 1), v('JA3024', 'AEP', 'COR', '15:00', '16:20', 3)];
+  const it = chooseItinerary(order, [brc, cor]);
+  assert.deepEqual(it.tramos.map((f) => f.code), ['JA3100', 'JA3024'], '06:00+2:10+2,5h > 09:30 → descarta el de las 09:30; el de las 19:40 no deja nada');
+  assert.equal(it.faltan, undefined);
+  assert.deepEqual(ordenDeCompra(it), [0, 1].sort((a, b) => it.tramos[a].seats - it.tramos[b].seats), 'primero el escaso');
+
+  const soloIda = chooseItinerary(order, [brc, []]);
+  assert.deepEqual(soloIda.tramos.map((f) => f.code), ['JA3106'], 'sin segundo tramo, el primero es libre: cualquier horario → el que sale más tarde');
+  assert.deepEqual(soloIda.faltan, [1]);
+
+  assert.equal(chooseItinerary(order, [[], cor]).tramos.length, 0, 'sin el primero no hay parcial: el segundo solo no sirve');
+  assert.equal(enVentana(v('x', 'A', 'B', '08:00', '09:00', 1), ['06:00', '12:00']), true);
+  assert.equal(enVentana(v('x', 'A', 'B', '13:00', '14:00', 1), ['06:00', '12:00']), false);
+  assert.equal(escalaMinima({ ...order, tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'EZE', to: 'COR' }] }, 1), 4, 'AEP→EZE son dos aeropuertos');
+  assert.equal(superaTope(v('x', 'A', 'B', '08:00', '09:00', 1, 133324), order), true);
+  assert.equal(superaTope(v('x', 'A', 'B', '08:00', '09:00', 1, 15103.85), order), false);
+
+  // Extras: sin cupo, preferencias, vuelo que cruza medianoche y escala del tramo 0.
+  assert.equal(escalaMinima(order, 0), 0);
+  const sinCupo = chooseItinerary(order, [[v('Z', 'BRC', 'AEP', '06:00', '08:10', 0)], cor]);
+  assert.deepEqual([sinCupo.tramos.length, sinCupo.faltan], [0, [0, 1]], 'seats 0 no se compra');
+  const todo = chooseItinerary({ ...order, preferencia: 'lo más temprano posible' }, [[...brc, v('JA3102', 'BRC', 'AEP', '05:00', '07:10', 4)], [...cor, v('JA3030', 'AEP', 'COR', '20:00', '21:20', 5)]]);
+  assert.equal(todo.tramos[0].code, 'JA3102', 'más temprano = sale primero el primer tramo');
+  const tarde = chooseItinerary({ ...order, preferencia: 'lo más tarde posible' }, [[...brc, v('JA3104', 'BRC', 'AEP', '12:00', '14:10', 3)], [v('JA3030', 'AEP', 'COR', '23:30', '23:59', 5)]]);
+  assert.equal(tarde.tramos[0].code, 'JA3104', 'más tarde posible: el último primer tramo que todavía conecta (el de las 19:40 ya no)');
+  const noche = { ...v('N', 'BRC', 'AEP', '22:04', '00:11', 2), arrivesAt: '2026-11-09 00:11:00' };
+  const dia = { ...v('D', 'AEP', 'COR', '01:00', '02:00', 2), departsAt: '2026-11-09 01:00:00', arrivesAt: '2026-11-09 02:00:00' };
+  assert.equal(chooseItinerary(order, [[noche], [dia]]).tramos.length, 1, 'llega 00:11 + 2,5 h > 01:00 del día siguiente');
+  const margen = chooseItinerary(order, [[brc[0]], [cor[1], v('JA3026', 'AEP', 'COR', '12:00', '13:20', 2)]]);
+  assert.equal(margen.tramos[1].code, 'JA3024', 'cualquier horario con varios tramos: más margen total');
+}
+
 console.log('✅ todo ok');
