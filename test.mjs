@@ -1683,6 +1683,27 @@ const memStore = () => {
     for (const x of [a, b, c]) { assert.equal(x.r.estado, 'ensayo'); assert.equal(x.calls.tokenizeCard + x.calls.doPurchase, 0); }
     assert.equal(JSON.stringify(await getOrder(store, order.id)), antes, 'ni los errores se anotan en el pedido');
   }
+  // Sesión vencida: NO se informa como «falló en search», se re-tira para que
+  // withSession se reloguee y reintente (bug del 05/11: el ensayo quedaba muerto).
+  {
+    const { SessionExpiredError, withSession } = await import('./src/session.js');
+    for (const paso of ['search', 'quote', 'initPayment']) {
+      await assert.rejects(correr({ ...ok, [paso]: async () => new SessionExpiredError() }), SessionExpiredError, `en ${paso} se re-tira`);
+    }
+    // De punta a punta con withSession: primera pasada vencida, relogin, segunda OK.
+    let pasadas = 0, relogins = 0;
+    const fakeStore = { get: async () => ({ laravel_session: 'vieja' }), set: async () => {} };
+    const { Session } = await import('./src/session.js');
+    const orig = Session.prototype.relogin;
+    Session.prototype.relogin = async function () { relogins++; this.jar = { laravel_session: 'nueva' }; return this; };
+    try {
+      const m = mk({ ...ok, search: async (s, t) => (pasadas++ === 0 ? new SessionExpiredError() : ok.search(s, t)) });
+      const r = await withSession(fakeStore, (session) => runBuy({ order, store, session, chatId: '1', deadline: Date.now() + 60_000, dryRun: true,
+        sleep: async () => {}, notify: async () => {}, api: m.api }), { email: 'a@b.c', password: 'x' });
+      assert.equal(relogins, 1, 'un solo relogin');
+      assert.deepEqual(r.init, { ok: true }, 'el reintento llega hasta INIT');
+    } finally { Session.prototype.relogin = orig; }
+  }
 
   // Comando: sólo dueño, con AUTO_BUY, id conocido.
   const dueno = { store, user: { chatId: '1' }, chatId: '1', session: {} };
