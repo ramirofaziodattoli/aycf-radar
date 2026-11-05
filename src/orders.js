@@ -100,8 +100,26 @@ export async function ordersDueTonight(store, date = tomorrowInAR()) {
  * Un pedido se compra una sola vez aunque lleguen dos crons juntos. El TTL es
  * la red de seguridad: si la función muere sin soltarlo, se libera solo.
  */
-export const lockOrder = (store, id, ttlSeconds = 900) => store.setnx(lockKey(id), 1, ttlSeconds);
-export const unlockOrder = (store, id) => store.del(lockKey(id));
+export const lockOrder = (store, id, ttlSeconds = 900, owner = 1) => store.setnx(lockKey(id), owner, ttlSeconds);
+
+/**
+ * Con `owner`, suelta el lock SOLO si sigue siendo nuestro: una corrida que se
+ * pasó de su TTL no le puede borrar el lock a la que vino después. Leer, comparar
+ * y borrar son tres pasos (no es atómico): la carrera es de milisegundos justo al
+ * vencer el TTL y se acepta. Sin `owner`, borra a secas (uso manual).
+ */
+export async function unlockOrder(store, id, owner) {
+  if (owner !== undefined && (await store.get(lockKey(id))) !== owner) return false;
+  await store.del(lockKey(id));
+  return true;
+}
+
+/** Re-`set` del lock con el mismo dueño y TTL nuevo. false = ya no es nuestro (no pagar). */
+export async function renovarLock(store, id, owner, ttlSeconds) {
+  if ((await store.get(lockKey(id))) !== owner) return false;
+  await store.set(lockKey(id), owner, ttlSeconds);
+  return true;
+}
 
 const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
 

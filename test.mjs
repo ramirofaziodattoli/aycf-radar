@@ -716,6 +716,18 @@ const memStore = () => {
   assert.equal(await lockOrder(store, o.id, 60), false, 'el segundo cron no entra');
   await unlockOrder(store, o.id);
   assert.equal(await lockOrder(store, o.id, 60), true);
+  await unlockOrder(store, o.id);
+
+  // Lock con dueño: otra corrida no lo puede soltar ni renovar.
+  const { renovarLock } = await import('./src/orders.js');
+  assert.equal(await lockOrder(store, o.id, 60, 'run-A'), true);
+  assert.equal(await unlockOrder(store, o.id, 'run-B'), false, 'un dueño ajeno no suelta el lock');
+  assert.equal(await lockOrder(store, o.id, 60, 'run-B'), false, 'el lock sigue puesto');
+  assert.equal(await renovarLock(store, o.id, 'run-B', 60), false);
+  assert.equal(await renovarLock(store, o.id, 'run-A', 900), true);
+  assert.equal(await unlockOrder(store, o.id, 'run-A'), true);
+  assert.equal(await lockOrder(store, o.id, 60, 'run-B'), true, 'el dueño sí lo suelta');
+  await unlockOrder(store, o.id);
 
   await assert.rejects(() => setEstado(store, o.id, 'comprando'), /estado desconocido/);
   await setEstado(store, o.id, 'parcial', { id: 'ord_x', chatId: '9', fechaVuelo: '2030-01-01', resultado: 'ok' });
@@ -920,13 +932,15 @@ const memStore = () => {
     tokenizeCard: 'TOK',
   };
   const T0 = Date.parse('2026-11-08T03:00:05Z');
+  const DEADLINE = Date.parse('2026-11-08T03:15:00Z');
+  // `prog` puede ser una función del reloj, para mover la hora desde adentro de un fake.
   const correr = async (order, prog, extra = {}) => {
-    let t = T0; const sleeps = []; const msgs = [];
+    const reloj = { t: T0 }; const sleeps = []; const msgs = [];
     const session = { relogins: 0, relogin: async function () { this.relogins++; return this; } };
-    const { api, calls } = fakeApi({ ...base, ...prog });
+    const { api, calls } = fakeApi({ ...base, ...(typeof prog === 'function' ? prog(reloj) : prog) });
     const r = await runBuy({
-      order, store, session, chatId: '1', card, deadline: Date.parse('2026-11-08T03:15:00Z'),
-      now: () => t, sleep: async (ms) => { sleeps.push(ms); t += ms; },
+      order, store, session, chatId: '1', card, deadline: DEADLINE,
+      now: () => reloj.t, sleep: async (ms) => { sleeps.push(ms); reloj.t += ms; },
       api, notify: async (text, chatId) => { msgs.push({ text, chatId }); return true; }, ...extra,
     });
     return { r, sleeps, msgs, calls, session };
@@ -1261,6 +1275,99 @@ const memStore = () => {
     const g = await getOrder(store, order.id);
     assert.equal(g.estado, 'cancelado'); assert.equal(r.estado, 'cancelado');
     assert.equal(g.resultado.tramos[0].pnr, 'ABC123', 'lo comprado queda registrado igual');
+  }
+
+  // --- fix ronda 2: dos corridas no pueden pagar a la vez ---
+  const lockKeyDe = (id) => `order-lock:${id}`;
+  // Store espía: registra los TTL y dueños que pide runBuy sin cambiar el comportamiento.
+  const espiar = () => {
+    const log = { setnx: [], set: [] };
+    return { log, store: {
+      get: (k) => store.get(k), del: (k) => store.del(k),
+      set: (k, val, ttl) => { log.set.push([k, val, ttl]); return store.set(k, val, ttl); },
+      setnx: (k, val, ttl) => { log.setnx.push([k, val, ttl]); return store.setnx(k, val, ttl); },
+    } };
+  };
+
+  // TTL que cubre la vida del proceso, dueño propio y renovación antes de pagar.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { log, store: espia } = espiar();
+    let renovadoAntesDePagar = false;
+    const { r } = await correr(order, {
+      search: [SLA],
+      doPurchase: () => { renovadoAntesDePagar = log.set.some(([k]) => k === lockKeyDe(order.id)); return { ok: true, pnr: 'ABC123', raw: '' }; },
+    }, { store: espia });
+    assert.equal(r.estado, 'comprado');
+    const [k, owner, ttl] = log.setnx[0];
+    assert.equal(k, lockKeyDe(order.id));
+    assert.ok(ttl >= 860, `TTL ${ttl} cubre los 800 s del maxDuration + margen`);
+    assert.ok(typeof owner === 'string' && owner.length >= 8, 'el lock lleva un dueño aleatorio');
+    assert.ok(renovadoAntesDePagar, 'renovarLock antes de doPurchase');
+    const renov = log.set.find(([kk]) => kk === lockKeyDe(order.id));
+    assert.equal(renov[1], owner); assert.ok(renov[2] >= 860);
+  }
+
+  // Otra corrida se quedó con el lock: no se paga, no se escribe nada y el finally no se lo borra.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls, msgs } = await correr(order, {
+      search: async () => { await unlockOrder(store, order.id); await lockOrder(store, order.id, 60, 'otra-corrida'); return [SLA]; },
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    });
+    assert.equal(calls.doPurchase.length, 0, 'sin el lock no se paga');
+    assert.equal(msgs.length, 0);
+    assert.equal((await getOrder(store, order.id)).estado, 'confirmado', 'lo resuelve la otra corrida');
+    assert.equal(r.estado, 'confirmado');
+    assert.equal(await lockOrder(store, order.id, 60, 'x'), false, 'el lock ajeno sigue puesto');
+    await unlockOrder(store, order.id);
+  }
+
+  // La ventana se cierra entre la búsqueda y la compra: cero pagos.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls } = await correr(order, (reloj) => ({
+      search: () => { reloj.t = DEADLINE; return [SLA]; },
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    }));
+    assert.equal(calls.doPurchase.length, 0); assert.equal(calls.quote.length, 0);
+    assert.equal(r.estado, 'fallido'); assert.equal(r.motivo, 'sin-cupo');
+  }
+
+  // Un reintento (paso previo que falló) que termina después del cierre en un tramo no ambiguo: no paga.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls } = await correr(order, (reloj) => ({
+      search: [SLA],
+      quote: ([, f], n) => { if (n === 1) { reloj.t = DEADLINE + 1000; return new Error('timeout'); } return { total: 15103.85, breakdown: [], code: f.code }; },
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    }));
+    assert.equal(calls.quote.length, 2); assert.equal(calls.doPurchase.length, 0);
+    assert.equal(r.estado, 'fallido'); assert.equal(r.motivo, 'sin-cupo');
+  }
+
+  // Tramo ambiguo y la ventana se cierra durante la verificación: no hay segundo pago, queda dudoso.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls } = await correr(order, (reloj) => ({
+      search: [SLA],
+      doPurchase: { ok: false, motivo: 'desconocido', raw: '' },
+      listBookings: () => { reloj.t = DEADLINE + 1000; return []; },
+    }));
+    assert.equal(calls.doPurchase.length, 1); assert.equal(calls.listBookings.length, 1);
+    assert.equal(r.estado, 'dudoso');
+  }
+
+  // El pedido pasó a otro estado que no es cancelado: «interrumpido», con el estado en el mensaje.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls, msgs } = await correr(order, {
+      search: async () => { await setEstado(store, order.id, 'fallido'); return [SLA]; },
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    });
+    assert.equal(calls.doPurchase.length, 0); assert.equal(r.estado, 'fallido');
+    assert.equal(msgs.length, 1);
+    assert.match(msgs[0].text, /ya no está confirmado \(estado fallido\), no compré nada más/);
   }
   process.env = limpio;
 }

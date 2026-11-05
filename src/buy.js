@@ -11,7 +11,8 @@
 // env ni loguea bodies. Los errores que se anotan pasan por `limpiar()`.
 
 import { chooseItinerary, ordenDeCompra, superaTope } from './itinerary.js';
-import { setEstado, getOrder, lockOrder, unlockOrder } from './orders.js';
+import { setEstado, getOrder, lockOrder, unlockOrder, renovarLock } from './orders.js';
+import { randomBytes } from 'node:crypto';
 import { quote, initPayment, tokenizeCard, doPurchase, listBookings, hayReserva } from './purchase.js';
 import { search } from './jetsmart.js';
 import { reply } from './notify.js';
@@ -21,9 +22,13 @@ import { SessionExpiredError } from './session.js';
 const PAUSA_VACIA = 10_000;
 const PAUSA_ERROR = 20_000;
 const FALLO = Symbol('fallo');
-// Margen del lock sobre la ventana: corto a propósito. Si Vercel mata la función
-// (maxDuration), la corrida de rescate tiene que poder entrar poco después.
+// El lock tiene que durar lo que puede vivir el proceso, no lo que dura la ventana:
+// la función sigue viva hasta que Vercel la mata (maxDuration 800 s desde SU
+// arranque) y el deadline sólo se mira entre pasos. Con un TTL más corto, el
+// rescate entra mientras la corrida vieja todavía puede pagar. El dueño evita
+// que una corrida le borre el lock a otra.
 const LOCK_MARGEN_S = 60;
+const VIDA_MAXIMA_S = 800;
 const ESPERA_LOCK = 10_000;
 const DUDOSO = { tipo: 'fin', estado: 'dudoso', motivo: 'dudoso' };
 
@@ -95,12 +100,13 @@ export async function runBuy({
 }) {
   // El rescate de las 00:13 espera a que la corrida anterior suelte el lock (o
   // a que venza su TTL si la mató el maxDuration) en vez de rendirse al toque.
-  const ttl = () => Math.max(60, Math.ceil((deadline - now()) / 1000) + LOCK_MARGEN_S);
+  const ttl = () => Math.max(Math.ceil((deadline - now()) / 1000) + LOCK_MARGEN_S, VIDA_MAXIMA_S + LOCK_MARGEN_S);
+  const dueño = `run_${randomBytes(6).toString('hex')}`;
   const inicio = now();
-  let tengo = await lockOrder(store, order.id, ttl());
+  let tengo = await lockOrder(store, order.id, ttl(), dueño);
   while (!tengo && now() - inicio < esperarLockMs) {
     await sleep(ESPERA_LOCK);
-    tengo = await lockOrder(store, order.id, ttl());
+    tengo = await lockOrder(store, order.id, ttl(), dueño);
   }
   if (!tengo) return { estado: 'confirmado' };
 
@@ -201,13 +207,19 @@ export async function runBuy({
         const init = await paso('initPayment', () => api.initPayment(session));
         const token = init === FALLO ? FALLO : await paso('tokenizeCard', () => api.tokenizeCard(card, init));
         if (token === FALLO) return ambiguo ? DUDOSO : { tipo: 'error' };
+        // Pasada la ventana no se paga más: un tramo ya ambiguo queda dudoso (está
+        // verificado y sin reserva a la vista, no hay pago en vuelo sin resolver);
+        // uno limpio cierra como cualquier fin de ventana.
+        if (now() >= deadline) return ambiguo ? DUDOSO : { tipo: 'ventana' };
+        // Sin el lock, otra corrida puede estar pagando este mismo pedido.
+        if (!(await renovarLock(store, order.id, dueño, ttl()))) return ambiguo ? DUDOSO : { tipo: 'sin-lock' };
 
         // Marcador ANTES de pagar: si el proceso muere acá, el rescate verifica en vez de repagar.
         const g = await guardar({ pagoEnVuelo: {
           tramo: i, code: flight.code, departsAt: flight.departsAt, arrivesAt: flight.arrivesAt,
           tasas: q.total, hora: new Date(now()).toISOString(),
         } });
-        if (g.estado !== 'confirmado') return ambiguo ? DUDOSO : { tipo: 'fin', estado: 'cancelado' };
+        if (g.estado !== 'confirmado') return ambiguo ? DUDOSO : { tipo: 'fin', estado: 'interrumpido' };
 
         let r;
         try { r = await api.doPurchase(session, { token, card, quotation: q }); } catch (e) {
@@ -247,7 +259,8 @@ export async function runBuy({
     if (!final && comprados.size === n) final = { estado: 'comprado' };
 
     let pausa = 0;
-    for (let vuelta = 0; !final; vuelta++) {
+    let cerrado = false; // la ventana se cerró a mitad de una vuelta
+    for (let vuelta = 0; !final && !cerrado; vuelta++) {
       if (vuelta > 0) await sleep(pausa);
       if (now() >= deadline) break;
       pausa = PAUSA_VACIA;
@@ -290,18 +303,38 @@ export async function runBuy({
       let reBuscar = false;
       for (const i of aComprar) {
         // El usuario pudo cancelar mientras buscábamos: se mira justo antes de cotizar.
-        if ((await getOrder(store, order.id))?.estado !== 'confirmado') { final = { estado: 'cancelado' }; break; }
+        if ((await getOrder(store, order.id))?.estado !== 'confirmado') { final = { estado: 'interrumpido' }; break; }
+        // La búsqueda pudo comerse lo que quedaba de la ventana.
+        if (now() >= deadline) { cerrado = true; break; }
         const flight = it.tramos[i];
         const r = await comprarTramo(i, flight);
         if (r.tipo === 'comprado') { await registrar(i, flight, r.pnr, r.tasas); continue; }
+        if (r.tipo === 'ventana') { cerrado = true; break; }
+        if (r.tipo === 'sin-lock') { final = { estado: 'sin-lock' }; break; }
         if (r.tipo === 'error') pausa = PAUSA_ERROR;
         if (r.tipo === 'fin') final = { estado: r.estado, motivo: r.motivo, detalle: r.detalle };
         reBuscar = true;
         break;
       }
-      if (final) break;
+      if (final || cerrado) break;
       if (comprados.size === n) { final = { estado: 'comprado' }; break; }
       if (!reBuscar && it.faltan?.length && comprados.size) final = { estado: 'parcial' };
+    }
+
+    // Otra corrida tiene el lock: ella escribe y avisa. Acá no se toca nada.
+    if (final?.estado === 'sin-lock') {
+      const o = await getOrder(store, order.id);
+      return { estado: o?.estado ?? 'confirmado', resultado: o?.resultado ?? null, intentos: o?.intentos ?? [], motivo: null };
+    }
+    // Interrumpido sin nada comprado: el estado y el resultado son de quien lo cambió.
+    if (final?.estado === 'interrumpido' && !comprados.size) {
+      const o = await getOrder(store, order.id);
+      const estado = o?.estado ?? 'desconocido';
+      const texto = estado === 'cancelado'
+        ? '⏹️ Pedido cancelado, no compré nada más.'
+        : `⏹️ El pedido ya no está confirmado (estado ${estado}), no compré nada más.`;
+      try { await notify(texto, chatId); } catch (e) { console.error(`buy: no pude avisar: ${limpiar(e)}`); }
+      return { estado, resultado: o?.resultado ?? null, intentos: o?.intentos ?? [], motivo: null };
     }
 
     if (!final) {
@@ -319,18 +352,20 @@ export async function runBuy({
     const guardado = await guardar({
       resultado, motivo: final.motivo ?? null, detalle: final.detalle ?? null,
       ...(final.estado === 'dudoso' ? {} : { pagoEnVuelo: null }),
-    }, final.estado === 'cancelado' ? 'confirmado' : final.estado);
+    }, final.estado === 'interrumpido' ? 'confirmado' : final.estado);
 
     const partes = [];
     if (comprados.size) partes.push(formatCompra(order, resultado));
     if (final.estado === 'dudoso') partes.push(formatFallo({ ...guardado, estado: 'dudoso' }, nuevos));
     else if (guardado.estado === 'cancelado') partes.push('⏹️ Pedido cancelado, no compré nada más.');
+    else if (final.estado === 'interrumpido') partes.push(`⏹️ El pedido ya no está confirmado (estado ${guardado.estado}), no compré nada más.`);
     else if (final.estado === 'fallido') partes.push(formatFallo(guardado, nuevos));
     else if (final.estado === 'parcial' && final.motivo) partes.push(`🔴 No compré el resto: ${motivoTexto(final.motivo, final.detalle)}.`);
     try { await notify(partes.join('\n\n'), chatId); } catch (e) { console.error(`buy: no pude avisar: ${limpiar(e)}`); }
 
     return { estado: guardado.estado, resultado, intentos: guardado.intentos, motivo: final.motivo ?? null };
   } finally {
-    await unlockOrder(store, order.id);
+    // Sólo el propio: si el TTL venció y otra corrida lo tomó, el suyo queda.
+    await unlockOrder(store, order.id, dueño);
   }
 }
