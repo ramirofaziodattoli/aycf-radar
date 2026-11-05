@@ -871,4 +871,255 @@ const memStore = () => {
   assert.ok(c.opt.headers['user-agent'] && c.opt.headers.cookie && c.opt.signal, 'UA, cookie y timeout');
 }
 
+// --- buy: loop 00:00–00:15, parcial, dudoso, tope ---
+{
+  const { rm } = await import('node:fs/promises');
+  const { runBuy, deadlineAR, formatCompra } = await import('./src/buy.js');
+  const { newOrder, saveOrder, setEstado, getOrder, lockOrder } = await import('./src/orders.js');
+  const { createStore } = await import('./src/store.js');
+  const { scoped } = await import('./src/users.js');
+  const { SessionExpiredError } = await import('./src/session.js');
+  const limpio = { ...process.env };
+  process.env.STATE_FILE = '/tmp/aycf-test-buy.json'; await rm(process.env.STATE_FILE, { force: true });
+  const store = scoped(createStore(), '1');
+
+  assert.equal(deadlineAR('00:15', new Date('2026-11-08T03:00:00Z')), Date.parse('2026-11-08T03:15:00Z'));
+  assert.equal(deadlineAR('00:15', new Date('2026-11-08T03:20:00Z')), Date.parse('2026-11-08T03:15:00Z'), 'si ya pasó, el mismo instante de hoy');
+
+  const v = (code, from, to, dep, arr, seats, taxes = 15103.85) => ({ code, from, to, departsAt: `2026-11-08 ${dep}:00`, arrivesAt: `2026-11-08 ${arr}:00`, departsHHMM: dep, arrivesHHMM: arr, seats, taxes });
+  const IDA = v('JA3100', 'BRC', 'AEP', '06:00', '08:10', 2);
+  const VUELTA = v('JA3024', 'AEP', 'COR', '15:00', '16:20', 3);
+  const SLA = { ...v('JA3021', 'SLA', 'EZE', '22:04', '00:11', 4), arrivesAt: '2026-11-09 00:11:00' };
+  const card = { number: '4111111111111111', month: '12', year: '2030', cvv: '987', holder: 'RAMIRO FAZIO' };
+
+  // Pedido nuevo y confirmado en el store; dos tramos BRC→AEP→COR o uno SLA→EZE.
+  const pedido = async (tramos = [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }]) => {
+    const o = newOrder({ chatId: '1', fechaVuelo: '2026-11-08', tramos });
+    await saveOrder(store, o);
+    return setEstado(store, o.id, 'confirmado');
+  };
+  // api falsa programable por llamada: cada clave es un valor o una función (args, n) → valor | Error.
+  const fakeApi = (prog) => {
+    const calls = { search: [], quote: [], initPayment: [], tokenizeCard: [], doPurchase: [], listBookings: [] };
+    const api = {};
+    for (const k of Object.keys(calls)) {
+      api[k] = async (...args) => {
+        calls[k].push(args);
+        const p = prog[k];
+        const r = typeof p === 'function' ? p(args, calls[k].length) : p;
+        if (r instanceof Error) throw r;
+        return r;
+      };
+    }
+    return { api, calls };
+  };
+  const base = {
+    quote: ([, f]) => ({ total: 15103.85, breakdown: [], code: f.code }),
+    initPayment: { certificateToken: 'C', signature: 'S', nonce: 'N', timestamp: '1' },
+    tokenizeCard: 'TOK',
+  };
+  const T0 = Date.parse('2026-11-08T03:00:05Z');
+  const correr = async (order, prog, extra = {}) => {
+    let t = T0; const sleeps = []; const msgs = [];
+    const session = { relogins: 0, relogin: async function () { this.relogins++; return this; } };
+    const { api, calls } = fakeApi({ ...base, ...prog });
+    const r = await runBuy({
+      order, store, session, chatId: '1', card, deadline: Date.parse('2026-11-08T03:15:00Z'),
+      now: () => t, sleep: async (ms) => { sleeps.push(ms); t += ms; },
+      api, notify: async (text, chatId) => { msgs.push({ text, chatId }); return true; }, ...extra,
+    });
+    return { r, sleeps, msgs, calls, session };
+  };
+  const sinTarjeta = (x) => { const s = JSON.stringify(x); assert.ok(!s.includes(card.number) && !s.includes(card.cvv), 'la tarjeta no aparece en mensajes ni intentos'); };
+
+  // 1) Caravelo muerto 3 vueltas, después hay cupo: compra los dos tramos.
+  {
+    const order = await pedido();
+    let vueltas = 0;
+    const { r, sleeps, msgs, calls } = await correr(order, {
+      search: ([, tramo]) => {
+        if (tramo.from === 'BRC') vueltas++;
+        if (vueltas <= 3) return new Error('timeout');
+        return tramo.from === 'BRC' ? [IDA] : [VUELTA];
+      },
+      doPurchase: ([, { quotation }]) => ({ ok: true, pnr: quotation.code === 'JA3100' ? 'ABC123' : 'DEF456', raw: '' }),
+    });
+    assert.equal(r.estado, 'comprado');
+    assert.deepEqual(r.resultado.tramos.map((x) => [x.code, x.pnr]), [['JA3100', 'ABC123'], ['JA3024', 'DEF456']]);
+    assert.deepEqual(Object.keys(r.resultado.tramos[0]).filter((k) => ['code', 'from', 'to', 'departsAt', 'pnr', 'tasas'].includes(k)).length, 6);
+    assert.equal(r.resultado.tramos[0].tasas, 15103.85);
+    assert.deepEqual(sleeps, [20000, 20000, 20000], 'tres vueltas con error = tres pausas de 20 s');
+    assert.ok(sleeps.every((ms) => ms >= 10000), 'nunca menos de 10 s entre vueltas');
+    assert.equal(calls.search.length, 3 + 2, 'una vuelta con error corta en el primer tramo: no hay ráfagas');
+    assert.equal(calls.listBookings.length, 0);
+    assert.equal(msgs.length, 1); assert.match(msgs[0].text, /ABC123/); assert.match(msgs[0].text, /DEF456/);
+    assert.equal(msgs[0].chatId, '1');
+    assert.equal(r.intentos.length, 3, 'cada timeout queda anotado');
+    assert.deepEqual(Object.keys(r.intentos[0]).sort(), ['error', 'hora', 'paso']);
+    assert.equal((await getOrder(store, order.id)).estado, 'comprado', 'el estado queda persistido');
+    assert.equal(await lockOrder(store, order.id, 60), true, 'al salir suelta el lock');
+    sinTarjeta([msgs, r]);
+  }
+
+  // 2) Sólo el primer tramo tiene cupo: compra ese y queda parcial, sin perseguir el otro.
+  {
+    const order = await pedido();
+    const { r, msgs, calls, sleeps } = await correr(order, {
+      search: ([, tramo]) => (tramo.from === 'BRC' ? [IDA] : []),
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    });
+    assert.equal(r.estado, 'parcial');
+    assert.deepEqual(r.resultado.faltan, [1]);
+    assert.deepEqual(r.resultado.tramos.map((x) => x.code), ['JA3100']);
+    assert.equal(calls.doPurchase.length, 1);
+    assert.equal(sleeps.length, 0, 'el parcial no se persigue');
+    assert.equal(msgs.length, 1);
+    assert.match(msgs[0].text, /AEP → COR/); assert.match(msgs[0].text, /Ramiro/); assert.match(msgs[0].text, /ABC123/);
+  }
+
+  // 3) do-purchase tira timeout y la reserva aparece: comprado, sin repagar.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, msgs, calls } = await correr(order, {
+      search: [SLA],
+      doPurchase: new Error('The operation was aborted due to timeout'),
+      listBookings: [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-08' }],
+    });
+    assert.equal(r.estado, 'comprado');
+    assert.equal(calls.doPurchase.length, 1, 'con la reserva a la vista no se vuelve a pagar');
+    assert.equal(calls.listBookings.length, 1);
+    assert.equal(r.resultado.tramos[0].pnr, 'ABC123', 'el PNR sale de la reserva');
+    assert.equal(msgs[0].text, '✅ *Comprado* · JA3021 SLA 22:04 → EZE 00:11 · tasas ARS 15.103,85 · PNR ABC123');
+    assert.equal(formatCompra(order, r.resultado), msgs[0].text);
+  }
+
+  // 4) do-purchase tira timeout y las reservas no se pueden leer: dudoso, mirar el mail.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, msgs, calls } = await correr(order, {
+      search: [SLA],
+      doPurchase: new Error('timeout'),
+      listBookings: new Error('bookings-unavailable'),
+    });
+    assert.equal(r.estado, 'dudoso');
+    assert.equal(calls.doPurchase.length, 1, 'sin poder verificar, jamás se reintenta el pago');
+    assert.equal(msgs.length, 1); assert.match(msgs[0].text, /mail/);
+    assert.equal((await getOrder(store, order.id)).estado, 'dudoso');
+  }
+
+  // 5) Las tasas cotizadas superan el tope: fallido por tope, sin tocar el pago.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, msgs, calls } = await correr(order, { search: [SLA], quote: { total: 133324, breakdown: [] } });
+    assert.equal(r.estado, 'fallido'); assert.equal(r.motivo, 'tope');
+    assert.equal(calls.initPayment.length, 0); assert.equal(calls.tokenizeCard.length, 0); assert.equal(calls.doPurchase.length, 0);
+    assert.match(msgs[0].text, /No pude comprar/); assert.match(msgs[0].text, /133\.324/); assert.match(msgs[0].text, /40\.000/);
+  }
+
+  // 6) Nunca hay cupo: a las 00:15 se rinde con un solo mensaje.
+  {
+    const order = await pedido();
+    const { r, msgs, sleeps, calls } = await correr(order, { search: [] });
+    assert.equal(r.estado, 'fallido'); assert.equal(r.motivo, 'sin-cupo');
+    assert.ok(r.intentos.length > 0);
+    assert.equal(msgs.length, 1); assert.match(msgs[0].text, /No pude comprar/);
+    assert.ok(sleeps.length > 0 && sleeps.every((ms) => ms === 10000), 'vueltas vacías = 10 s');
+    assert.ok(calls.search.length <= 2 * (sleeps.length + 1), 'un request por tramo por vuelta');
+    assert.equal(calls.doPurchase.length, 0);
+  }
+
+  // 7) Otro proceso tiene el lock: no busca, no compra, no avisa.
+  {
+    const order = await pedido();
+    assert.equal(await lockOrder(store, order.id, 60), true);
+    const { r, msgs, calls } = await correr(order, { search: [IDA] });
+    assert.deepEqual(r, { estado: 'confirmado' });
+    assert.equal(calls.search.length, 0); assert.equal(msgs.length, 0);
+  }
+
+  // 8) Resultado desconocido y sin reserva: un solo reintento, con verificación en el medio.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const orden = [];
+    const { r, calls } = await correr(order, {
+      search: [SLA],
+      doPurchase: (_, n) => { orden.push('pay'); return n === 1 ? { ok: false, motivo: 'desconocido', raw: '' } : { ok: true, pnr: 'ABC123', raw: '' }; },
+      listBookings: () => { orden.push('check'); return []; },
+    });
+    assert.equal(r.estado, 'comprado');
+    assert.deepEqual(orden, ['pay', 'check', 'pay'], 'entre dos pagos siempre hay una verificación');
+    assert.equal(calls.doPurchase.length, 2);
+  }
+
+  // 9) Dos desconocidos seguidos: no hay tercer pago, queda dudoso.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls } = await correr(order, {
+      search: [SLA], doPurchase: { ok: false, motivo: 'desconocido', raw: '' }, listBookings: [],
+    });
+    assert.equal(r.estado, 'dudoso');
+    assert.equal(calls.doPurchase.length, 2);
+    assert.equal(calls.listBookings.length, 2);
+  }
+
+  // 10) sin-cupo al pagar: verifica reservas, espera y busca otro vuelo.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const otro = { ...SLA, code: 'JA3023', departsAt: '2026-11-08 23:00:00' };
+    const orden = [];
+    const { r, sleeps } = await correr(order, {
+      search: (_, n) => (n === 1 ? [SLA] : [otro]),
+      doPurchase: ([, { quotation }]) => { orden.push(`pay ${quotation.code}`); return quotation.code === 'JA3021' ? { ok: false, motivo: 'sin-cupo', raw: '' } : { ok: true, pnr: 'XYZ789', raw: '' }; },
+      listBookings: () => { orden.push('check'); return []; },
+    });
+    assert.equal(r.estado, 'comprado');
+    assert.deepEqual(orden, ['pay JA3021', 'check', 'pay JA3023']);
+    assert.deepEqual(sleeps, [10000], 'después de un sin-cupo, la pausa normal antes de volver a buscar');
+    assert.equal(r.resultado.tramos[0].code, 'JA3023');
+  }
+
+  // 11) sin-cupo pero la reserva sí estaba: comprado, no busca otro.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls } = await correr(order, {
+      search: [SLA], doPurchase: { ok: false, motivo: 'sin-cupo', raw: '' },
+      listBookings: [{ pnr: 'ABC123', flightCode: 'JA3021', date: '2026-11-08' }],
+    });
+    assert.equal(r.estado, 'comprado'); assert.equal(calls.doPurchase.length, 1); assert.equal(calls.search.length, 1);
+  }
+
+  // 12) 3DS: fallido y a mano; rechazada: fallido.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, msgs, calls } = await correr(order, { search: [SLA], doPurchase: { ok: false, motivo: '3ds', raw: '' } });
+    assert.equal(r.estado, 'fallido'); assert.equal(r.motivo, '3ds');
+    assert.equal(calls.doPurchase.length, 1); assert.match(msgs[0].text, /a mano/);
+    const o2 = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const x = await correr(o2, { search: [SLA], doPurchase: { ok: false, motivo: 'rechazada', raw: '' } });
+    assert.equal(x.r.estado, 'fallido'); assert.equal(x.r.motivo, 'rechazada'); assert.equal(x.calls.listBookings.length, 0);
+  }
+
+  // 13) Sesión vencida en la búsqueda: un relogin y sigue en la misma vuelta.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, session, sleeps } = await correr(order, {
+      search: (_, n) => (n === 1 ? new SessionExpiredError() : [SLA]),
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    });
+    assert.equal(r.estado, 'comprado'); assert.equal(session.relogins, 1); assert.equal(sleeps.length, 0);
+  }
+
+  // 14) Un paso previo al pago que falla se reintenta una vez al toque.
+  {
+    const order = await pedido([{ from: 'SLA', to: 'EZE' }]);
+    const { r, calls } = await correr(order, {
+      search: [SLA], initPayment: (_, n) => (n === 1 ? new Error('INIT de pago: 502') : base.initPayment),
+      doPurchase: { ok: true, pnr: 'ABC123', raw: '' },
+    });
+    assert.equal(r.estado, 'comprado'); assert.equal(calls.initPayment.length, 2);
+    assert.equal(r.intentos.at(-1).paso, 'initPayment');
+  }
+  process.env = limpio;
+}
+
 console.log('✅ todo ok');
