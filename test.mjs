@@ -700,7 +700,7 @@ const memStore = () => {
   const o = newOrder({ chatId: '1', fechaVuelo: '2026-11-08', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }] });
   assert.match(o.id, /^ord_[0-9a-f]{10}$/); assert.equal(o.estado, 'borrador');
   assert.equal(o.escalaMinimaHoras, 2.5); assert.equal(o.topeTasasPorTramoARS, 40000);
-  assert.equal(formatPedido(o), 'domingo 08/11 · BRC → AEP · AEP → COR · escala ≥ 2.5 h');
+  assert.equal(formatPedido(o), '📌 *Pedido* · domingo 08/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco el sábado 07/11 a las 00:00');
 
   await saveOrder(store, o);
   assert.equal((await getOrder(store, o.id)).fechaVuelo, '2026-11-08');
@@ -1511,6 +1511,176 @@ const memStore = () => {
   assert.match(rec[0].reply_markup.inline_keyboard[0][0].callback_data, /^ord:no:/);
 
   globalThis.fetch = orig;
+  process.env = limpio;
+}
+
+// --- intake: del texto al pedido, con confirmación ---
+{
+  const { parseOrderText, parseOrderStrict, cmdPedido, cmdPedidos, ORDER_SCHEMA } = await import('./src/intake.js');
+  const { comandoDe, handleCallback, handleCommand } = await import('./src/commands.js');
+  const { getOrder, listOrders, newOrder, saveOrder, formatPedido } = await import('./src/orders.js');
+  const limpio = { ...process.env };
+  process.env.TELEGRAM_CHAT_ID = '1'; process.env.AUTO_BUY = 'on'; process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+  const store = memStore();
+  await store.set('catalog:routes', {
+    aeropuertos: { BRC: 'Bariloche', AEP: 'Aeroparque', COR: 'Córdoba', SLA: 'Salta' },
+    rutas: ['BRC-AEP', 'AEP-COR', 'AEP-SLA'],
+  });
+  const aeropuertos = (await store.get('catalog:routes')).aeropuertos;
+  const HOY = '2026-11-05'; // jueves
+
+  // El schema de structured outputs no admite objetos abiertos ni topes numéricos.
+  const revisar = (n, ruta = 'schema') => {
+    if (!n || typeof n !== 'object') return;
+    if (n.type === 'object' || n.properties) {
+      assert.equal(n.additionalProperties, false, `${ruta} necesita additionalProperties: false`);
+      assert.deepEqual([...(n.required ?? [])].sort(), Object.keys(n.properties).sort(), `${ruta}: todo requerido`);
+    }
+    for (const k of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'minItems', 'maxItems']) {
+      assert.ok(!(k in n), `${ruta} no puede tener ${k}`);
+    }
+    for (const [k, v] of Object.entries(n)) {
+      if (Array.isArray(v)) v.forEach((x, i) => revisar(x, `${ruta}.${k}[${i}]`));
+      else if (typeof v === 'object') revisar(v, `${ruta}.${k}`);
+    }
+  };
+  revisar(ORDER_SCHEMA);
+
+  const respuesta = (obj, stop_reason = 'end_turn') => ({
+    ok: true, status: 200,
+    json: async () => ({ stop_reason, content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj) }] }),
+  });
+  const PEDIDO = {
+    tipo: 'pedido', fechaVuelo: '2026-11-07',
+    tramos: [{ from: 'BRC', to: 'AEP', ventana: null }, { from: 'AEP', to: 'COR', ventana: null }],
+    escalaMinimaHoras: null, preferencia: 'cualquier horario', aclaracion: null,
+  };
+
+  // (a) el request a la API de Claude con la forma de la referencia.
+  let visto;
+  const fakeFetch = async (url, init) => { visto = { url, init, body: JSON.parse(init.body) }; return respuesta(PEDIDO); };
+  const parsed = await parseOrderText('el sábado bariloche a aeroparque', { hoy: HOY, aeropuertos, _fetch: fakeFetch });
+  assert.deepEqual(parsed, PEDIDO);
+  assert.equal(visto.url, 'https://api.anthropic.com/v1/messages');
+  assert.equal(visto.init.method, 'POST');
+  assert.equal(visto.init.headers['x-api-key'], 'sk-ant-test');
+  assert.equal(visto.init.headers['anthropic-version'], '2026-10-21');
+  assert.equal(visto.init.headers['content-type'], 'application/json');
+  assert.ok(visto.init.signal, 'con timeout');
+  assert.equal(visto.body.model, 'claude-opus-5-5');
+  assert.equal(visto.body.max_tokens, 1024);
+  assert.equal(visto.body.output_config.effort, 'low');
+  assert.equal(visto.body.output_config.format.type, 'json_schema');
+  assert.deepEqual(visto.body.output_config.format.schema, ORDER_SCHEMA);
+  assert.deepEqual(visto.body.messages, [{ role: 'user', content: 'el sábado bariloche a aeroparque' }]);
+  assert.match(visto.body.system, /2026-11-05/);
+  assert.match(visto.body.system, /jueves/);
+  assert.match(visto.body.system, /GMT-3/);
+  assert.match(visto.body.system, /BRC — Bariloche/);
+  assert.ok(!visto.body.system.includes('sk-ant-test'), 'la key no viaja en el prompt');
+  await assert.rejects(parseOrderText('x', { hoy: HOY, aeropuertos, _fetch: async () => respuesta(PEDIDO, 'max_tokens') }), /no-entendi/);
+  await assert.rejects(parseOrderText('x', { hoy: HOY, aeropuertos, _fetch: async () => respuesta('{roto') }), /no-entendi/);
+
+  // (b) lenguaje natural → borrador con dos tramos y botones de confirmar/cancelar.
+  const out = await cmdPedido(store, '1', 'el sábado bariloche a aeroparque y después a córdoba, no me importa el horario', { _fetch: fakeFetch, hoy: HOY });
+  const [[ok, no]] = out.buttons;
+  assert.equal(ok.text, '✅ Confirmar'); assert.equal(no.text, '❌ Cancelar');
+  const id = ok.data.replace(/^ord:ok:/, '');
+  assert.equal(no.data, `ord:no:${id}`);
+  assert.ok(Buffer.byteLength(ok.data) <= 64, 'callback_data entra en 64 bytes');
+  const borrador = await getOrder(store, id);
+  assert.equal(borrador.estado, 'borrador');
+  assert.equal(borrador.fechaVuelo, '2026-11-07', 'el próximo sábado respecto de hoy');
+  assert.equal(borrador.tramos.length, 2);
+  assert.equal(borrador.escalaMinimaHoras, 2.5, 'null del modelo = el default');
+  assert.equal(out.text, formatPedido(borrador) + '\n\n¿Lo confirmo?');
+  assert.equal(formatPedido(borrador),
+    '📌 *Pedido* · sábado 07/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco el viernes 06/11 a las 00:00');
+  assert.equal(formatPedido({ ...borrador, tramos: [{ from: 'BRC', to: 'AEP', ventana: ['06:00', '12:00'] }] }),
+    '📌 *Pedido* · sábado 07/11 · BRC → AEP (06:00–12:00) · lo busco el viernes 06/11 a las 00:00');
+
+  // (c) los botones: confirmar, cancelar, id que no existe, y sólo para el dueño.
+  const noDueno = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '2' });
+  assert.equal((await getOrder(store, id)).estado, 'borrador', 'otro chat no confirma nada');
+  assert.ok(!/Listo/.test(noDueno.text));
+  const conf = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '1' });
+  assert.equal((await getOrder(store, id)).estado, 'confirmado');
+  assert.equal(conf.text, '✅ Listo, lo compro el viernes 06/11 a las 00:00. Te aviso con el PNR.');
+  const canc = await handleCallback(`ord:no:${id}`, { store, user: null, chatId: '1' });
+  assert.equal((await getOrder(store, id)).estado, 'cancelado');
+  assert.equal(canc.text, '❌ Pedido cancelado.');
+  const revive = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '1' });
+  assert.equal((await getOrder(store, id)).estado, 'cancelado', 'un botón viejo no resucita un cancelado');
+  assert.ok(!/Listo/.test(revive.text));
+  assert.equal((await handleCallback('ord:ok:ord_nada', { store, user: null, chatId: '1' })).text, 'Ese pedido ya no existe.');
+
+  // (d) y (e) ruteo: dos tokens siguen siendo búsqueda; el resto del dueño, pedido.
+  const dueno = { chatId: '1', email: 'a@b.com', passId: 'x', env: true };
+  assert.equal(comandoDe('bariloche salta', dueno, { chatId: '1' }).cmd, '/buscar', 'Review Focus 5');
+  assert.deepEqual(comandoDe('el lunes necesito ir a aeroparque', dueno, { chatId: '1' }),
+    { cmd: '/pedido', args: ['el lunes necesito ir a aeroparque'] });
+  assert.equal(comandoDe('el lunes necesito ir a aeroparque', { ...dueno, chatId: '2', env: false }, { chatId: '2' }).cmd, '/buscar');
+  assert.equal(comandoDe('/rutas', dueno, { chatId: '1' }).cmd, '/rutas');
+  assert.equal(comandoDe('mia@mail.com mi clave larga', dueno, { chatId: '1' }).cmd, '/conectar');
+  process.env.AUTO_BUY = 'off';
+  assert.equal(comandoDe('el lunes necesito ir a aeroparque', dueno, { chatId: '1' }).cmd, '/buscar', 'sin AUTO_BUY no hay pedidos');
+  process.env.AUTO_BUY = 'on';
+
+  // (f) el formato estricto, el salvavidas cuando la API no está.
+  assert.deepEqual(parseOrderStrict('comprar 2026-11-08 BRC-AEP AEP-COR'), {
+    tipo: 'pedido', fechaVuelo: '2026-11-08',
+    tramos: [{ from: 'BRC', to: 'AEP', ventana: null }, { from: 'AEP', to: 'COR', ventana: null }],
+    escalaMinimaHoras: null, preferencia: 'cualquier horario', aclaracion: null,
+  });
+  assert.equal(parseOrderStrict('Comprar 2026-11-08 brc-aep').tramos.length, 1);
+  assert.equal(parseOrderStrict('el sábado a córdoba'), null);
+
+  // (g) la API se cae: sin formato estricto, ayuda y ningún pedido; con formato, sale igual.
+  const antes = (await listOrders(store)).length;
+  const caida = async () => { throw new Error('ECONNRESET'); };
+  const sinApi = await cmdPedido(store, '1', 'el sábado a córdoba', { _fetch: caida, hoy: HOY });
+  assert.match(sinApi.text, /comprar 2026-11-08 BRC-AEP AEP-COR/);
+  assert.ok(!sinApi.buttons, 'sin botones');
+  assert.equal((await listOrders(store)).length, antes, 'no crea pedido');
+  delete process.env.ANTHROPIC_API_KEY;
+  const estricto = await cmdPedido(store, '1', 'comprar 2026-11-08 BRC-AEP AEP-COR', { _fetch: caida, hoy: HOY });
+  assert.match(estricto.buttons[0][0].data, /^ord:ok:ord_/, 'sin key igual entra por el formato estricto');
+  process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+
+  // Aclaración, búsqueda, validación y vuelo al que ya no se llega.
+  const pregunta = await cmdPedido(store, '1', 'quiero viajar', {
+    hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'pedido', fechaVuelo: null, tramos: [], aclaracion: '¿Qué día y a dónde?' }),
+  });
+  assert.deepEqual(pregunta, { text: '¿Qué día y a dónde?' });
+  const busq = await cmdPedido(store, '1', 'bariloche a córdoba', { hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tipo: 'busqueda' }) });
+  assert.match(busq.text, /\/buscar/);
+  const desencadenado = await cmdPedido(store, '1', 'x', {
+    hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tramos: [{ from: 'BRC', to: 'AEP', ventana: null }, { from: 'EZE', to: 'COR', ventana: null }] }),
+  });
+  assert.match(desencadenado.text, /encaden/);
+  assert.ok(!desencadenado.buttons);
+  const tarde = await cmdPedido(store, '1', 'mañana a aeroparque', {
+    hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, fechaVuelo: '2026-11-06', tramos: [{ from: 'BRC', to: 'AEP', ventana: null }] }),
+  });
+  assert.match(tarde.text, /00:00/); assert.ok(!tarde.buttons, 'la compra de ese vuelo ya pasó');
+  assert.equal((await listOrders(store)).length, antes + 1, 'sólo el estricto quedó guardado');
+
+  // /pedidos: los vivos con su botón de cancelar; vacío, invita a pedir.
+  assert.equal((await cmdPedidos(memStore())).text, 'No tenés pedidos vivos. Contame qué pasaje necesitás.');
+  const lista = await cmdPedidos(store);
+  assert.equal(lista.buttons.length, 1, 'el cancelado no aparece');
+  assert.equal(lista.buttons[0][0].data, `ord:no:${estricto.buttons[0][0].data.slice(7)}`);
+  assert.match(lista.text, /BRC → AEP/);
+
+  // El webhook: /pedidos por comando y la ayuda del dueño.
+  const porComando = await handleCommand('/pedidos', { store, session: null, user: dueno, chatId: '1' });
+  assert.equal(porComando.buttons.length, 1);
+  const ayuda = await handleCommand('/ayuda', { store, session: null, user: dueno, chatId: '1' });
+  assert.match(ayuda, /\/pedidos — mis pedidos de compra automática/);
+  assert.match(ayuda, /lo compro solo a las 00:00/);
+  const { NECESITA_SESION } = await import('./src/commands.js');
+  assert.ok(!NECESITA_SESION.includes('/pedido') && !NECESITA_SESION.includes('/pedidos'));
+
   process.env = limpio;
 }
 

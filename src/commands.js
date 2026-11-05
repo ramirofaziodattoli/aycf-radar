@@ -9,6 +9,8 @@ import { getCatalog, resolveAirport, airportName, routeExists, destinationsFrom 
 import { Session } from './session.js';
 import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, scoped, nombreDe } from './users.js';
 import { haySecreto } from './crypto.js';
+import { cmdPedido, cmdPedidos } from './intake.js';
+import { getOrder, setEstado, nocheDeCompra } from './orders.js';
 
 const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
 
@@ -42,7 +44,10 @@ _Solo se puede consultar el día siguiente: el pase libera los cupos a las 00:01
 y no existe inventario más allá de eso._`;
 
 // Solo el dueño del deploy (TELEGRAM_CHAT_ID) lo ve y lo puede usar.
-const AYUDA_ADMIN = '/usuarios — quiénes usan el bot (solo vos)';
+const AYUDA_ADMIN = `/usuarios — quiénes usan el bot (solo vos)
+/pedidos — mis pedidos de compra automática
+
+También podés contarme qué pasaje necesitás y lo compro solo a las 00:00.`;
 
 /**
  * Acepta códigos ("BRC") o nombres ("bariloche"). Los nombres pueden traer varias
@@ -298,11 +303,34 @@ async function botonesDestino(store, from, accion = 'a') {
   };
 }
 
+/**
+ * Botones de un pedido: `ord:ok:<id>` confirma, `ord:no:<id>` cancela. Sólo el
+ * dueño (es su tarjeta la que paga), y sólo desde estados que tienen sentido: un
+ * botón viejo en el historial no puede resucitar un cancelado ni "cancelar" algo
+ * que ya se compró.
+ */
+async function callbackPedido(store, chatId, accion, id) {
+  if (!esDueno(chatId)) return { text: 'Ese botón ya no vale.' };
+  const o = await getOrder(store, id);
+  if (!o) return { text: 'Ese pedido ya no existe.' };
+  if (accion === 'ok') {
+    if (o.estado !== 'borrador') return { text: `Ese pedido ya está *${o.estado}*. Mirá /pedidos.` };
+    await setEstado(store, id, 'confirmado');
+    return { text: `✅ Listo, lo compro el ${nocheDeCompra(o)} a las 00:00. Te aviso con el PNR.` };
+  }
+  if (!['borrador', 'confirmado', 'dudoso'].includes(o.estado)) {
+    return { text: `Ese pedido ya está *${o.estado}*, no hay nada que cancelar.` };
+  }
+  await setEstado(store, id, 'cancelado');
+  return { text: '❌ Pedido cancelado.' };
+}
+
 /** Un toque de botón. Devuelve { text, buttons } para reemplazar el mensaje. */
 export async function handleCallback(data, { store, session, user, chatId }) {
   const perfil = user ?? (chatId ? { chatId: String(chatId) } : null);
   const [accion, from, to] = String(data).split(':');
   try {
+    if (accion === 'ord') return await callbackPedido(store, chatId, from, to);
     if (accion === 'menu') {
       return (await botonesOrigen(store, '¿Desde dónde volás?')) ??
         { text: 'Todavía no tengo el mapa de la red. Probá `/vigilar bariloche salta`.' };
@@ -456,8 +484,12 @@ async function cmdEstado(store, session) {
 /**
  * Qué quiso decir el usuario. Escribir comandos es una barrera: si manda
  * "mail contraseña" es un alta, y si manda "bariloche salta" es una búsqueda.
+ *
+ * Con la compra automática prendida, el texto libre del dueño es un pedido
+ * ("el sábado bariloche a aeroparque"). Dos tokens sueltos siguen siendo una
+ * búsqueda: es el atajo de siempre y no tiene fecha para comprar nada.
  */
-export function comandoDe(text, user) {
+export function comandoDe(text, user, { chatId } = {}) {
   const tokens = String(text).trim().split(/\s+/);
   if (tokens[0].startsWith('/')) {
     return { cmd: tokens[0].toLowerCase().replace(/@.*$/, ''), args: tokens.slice(1) };
@@ -465,12 +497,15 @@ export function comandoDe(text, user) {
   if (tokens.length >= 2 && tokens[0].includes('@') && tokens[0].includes('.')) {
     return { cmd: '/conectar', args: tokens };
   }
+  if (esDueno(chatId) && process.env.AUTO_BUY === 'on' && tokens.length !== 2) {
+    return { cmd: '/pedido', args: [String(text).trim()] };
+  }
   if (estaConectado(user)) return { cmd: '/buscar', args: tokens };
   return { cmd: '/start', args: [] };
 }
 
 export async function handleCommand(text, { store, session, user, chatId, from }) {
-  const { cmd, args } = comandoDe(text, user);
+  const { cmd, args } = comandoDe(text, user, { chatId });
 
   // Un chat sin cuenta conectada igual es un chat: sin el chatId, `usaSemilla`
   // lo confundiría con el dueño del deploy y le sembraría las rutas ajenas.
@@ -506,6 +541,13 @@ async function dispatch(cmd, args, { store, session, user, chatId, from }) {
     case '/usuarios':
       if (!esDueno(chatId)) break; // para los demás, el comando no existe
       return cmdUsuarios(store);
+    // Compra automática: del dueño y sin sesión (sólo arma el pedido; paga el cron).
+    case '/pedido':
+      if (!esDueno(chatId) || process.env.AUTO_BUY !== 'on') break;
+      return cmdPedido(store, chatId, args.join(' '));
+    case '/pedidos':
+      if (!esDueno(chatId)) break;
+      return cmdPedidos(store);
     case '/pase':
       return cmdPase(store, chatId, user, args);
     case '/desconectar':

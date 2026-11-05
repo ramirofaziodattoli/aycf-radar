@@ -123,12 +123,35 @@ export async function renovarLock(store, id, owner, ttlSeconds) {
 
 const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
 
-/** Una línea Markdown: "domingo 08/11 · BRC → AEP · AEP → COR · escala ≥ 2.5 h". */
-export function formatPedido(o) {
-  const [y, m, d] = o.fechaVuelo.split('-').map(Number);
+/** "2026-11-07" → "sábado 07/11". UTC a propósito: es una fecha de calendario, no un instante. */
+export function fechaLarga(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
   const dia = DIAS[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
-  const partes = [`${dia} ${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}`];
-  partes.push(...o.tramos.map((t) => `${t.from} → ${t.to}`));
-  if (o.tramos.length >= 2) partes.push(`escala ≥ ${o.escalaMinimaHoras} h`);
-  return partes.join(' · ');
+  return `${dia} ${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}`;
+}
+
+/**
+ * El día de la corrida que lo compra. El inventario de D+1 se libera a las 00:00
+ * de D, así que un vuelo del sábado se compra al arrancar el viernes.
+ */
+export function nocheDeCompra(o) {
+  const [y, m, d] = o.fechaVuelo.split('-').map(Number);
+  return fechaLarga(new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10));
+}
+
+/**
+ * Una línea Markdown con todo lo que se va a pagar, para leerla antes de
+ * confirmar: «📌 *Pedido* · sábado 07/11 · BRC → AEP (cualquier horario) · AEP → COR,
+ * escala ≥ 2,5 h · lo busco el viernes 06/11 a las 00:00». El horario del primer
+ * tramo es la ventana o, sin ventana, la preferencia; los siguientes dependen de
+ * la escala, así que muestran eso (y su ventana si la tienen).
+ */
+export function formatPedido(o) {
+  const tramos = o.tramos.map((t, i) => {
+    const horario = t.ventana ? ` (${t.ventana[0]}–${t.ventana[1]})`
+      : i === 0 ? ` (${o.preferencia ?? 'cualquier horario'})` : '';
+    const escala = i > 0 ? `, escala ≥ ${String(o.escalaMinimaHoras).replace('.', ',')} h` : '';
+    return `${t.from} → ${t.to}${horario}${escala}`;
+  });
+  return ['📌 *Pedido*', fechaLarga(o.fechaVuelo), ...tramos, `lo busco el ${nocheDeCompra(o)} a las 00:00`].join(' · ');
 }

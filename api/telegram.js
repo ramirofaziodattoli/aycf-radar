@@ -59,15 +59,17 @@ export default async function handler(req, res) {
         await editMessage(chatId, msg.message_id, NO_CONECTADO);
         return res.status(200).json({ ok: true, skipped: 'sin cuenta' });
       }
-      const out = normalizar(await withSession(
-        store, (session) => handleCallback(texto, { ...ctx, session }), user
-      ));
+      // Los botones de un pedido sólo tocan el store: abrir sesión acá sería un
+      // login a JetSmart (o un relogin) para nada.
+      const out = normalizar(texto.startsWith('ord:')
+        ? await handleCallback(texto, { ...ctx, session: null })
+        : await withSession(store, (session) => handleCallback(texto, { ...ctx, session }), user));
       await editMessage(chatId, msg.message_id, out.text, out.buttons);
       return res.status(200).json({ ok: true });
     }
 
     // Qué quiso decir: puede no haber escrito ningún comando.
-    const { cmd } = comandoDe(texto, user);
+    const { cmd } = comandoDe(texto, user, { chatId });
 
     // La contraseña no se queda en el historial del chat si podemos evitarlo.
     if (cmd === '/conectar') await deleteMessage(chatId, msg.message_id).catch(() => {});
