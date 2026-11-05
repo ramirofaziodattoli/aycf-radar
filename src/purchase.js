@@ -166,20 +166,24 @@ export async function doPurchase(session, { token, card, quotation }, { _fetch =
 
   const raw = text.slice(0, 300);
   const msg = json?.content?.exceptionMessage ?? json?.exceptionMessage ?? null;
-  const marcador = `${msg ?? ''} ${text}`;
+  // Los <script> de la página traen strings de error genéricos ("declined"): no cuentan.
+  const visible = text.replace(/<script[\s\S]*?<\/script>/gi, ' ');
+  const marcador = `${msg ?? ''} ${visible}`;
   const es2xx = res.status >= 200 && res.status < 300;
 
-  if (/declin|rechaz/i.test(marcador)) return { ok: false, motivo: 'rechazada', raw };
+  // En un 2xx el texto NUNCA decide un fallo: si el cobro pasó, reintentar por un
+  // "sin cupo" falso cobraría dos veces. Solo el exceptionMessage JSON es confiable.
+  if (/declin|rechaz/i.test(es2xx ? (msg ?? '') : marcador)) return { ok: false, motivo: 'rechazada', raw };
 
   // Éxito SOLO con señal positiva: un 2xx pelado no prueba nada (Caravelo devuelve
   // 200 con {"success":false} o con páginas de error). Sin señal → 'desconocido' y
   // el loop verifica contra las reservas antes de reintentar.
   if (es2xx && !msg) {
-    const pnr = señalDeExito(json, text);
+    const pnr = señalDeExito(json, visible);
     if (pnr !== null) return { ok: true, pnr: pnr || undefined, raw };
   }
 
-  if (/no hay asientos|no.?seat|sin cupo|availab/i.test(marcador)) return { ok: false, motivo: 'sin-cupo', raw };
+  if (!es2xx && /no hay asientos|no.?seat|sin cupo|availab/i.test(marcador)) return { ok: false, motivo: 'sin-cupo', raw };
 
   if (res.status >= 300 && res.status < 400) {
     const loc = res.headers?.get?.('location') ?? '';
@@ -203,11 +207,14 @@ function señalDeExito(json, text) {
   if (typeof pnr === 'string' && pnr) return pnr;
   if (/^(ok|confirmed|success)$/i.test(String(json?.status ?? j?.status ?? ''))) return '';
   const plano = text.replace(/<[^>]+>/g, ' ');
-  const m = /confirmad|confirmed|éxito|exitosa/i.exec(plano);
+  // "no confirmada" / "unconfirmed" no son confirmación.
+  const m = /(?<!\bno\s)(?<!\bun)(?:confirmad|confirmed)|éxito|exitosa/i.exec(plano);
   if (!m) return null;
   const cerca = plano.slice(Math.max(0, m.index - 120), m.index + 120);
-  const code = /\b[A-Z0-9]{6}\b/.exec(cerca);
-  return code ? code[0] : null;
+  // El PNR lleva al menos un dígito y no es un código de vuelo (JA3021 también tiene 6).
+  const code = [...cerca.matchAll(/\b[A-Z0-9]{6}\b/g)].map((x) => x[0])
+    .find((c) => /\d/.test(c) && !/^JA\d{3,4}$/.test(c));
+  return code ?? null;
 }
 
 const ok2xx = (res) => res.status >= 200 && res.status < 300;

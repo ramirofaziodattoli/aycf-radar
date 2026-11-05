@@ -836,7 +836,13 @@ const memStore = () => {
   const buy = (fetcher) => doPurchase(session, { token: 'TOK', card, quotation: {} }, { _fetch: fetcher });
 
   assert.equal((await buy(R(200, { success: false }))).motivo, 'desconocido', '2xx sin señal positiva no es éxito');
-  assert.equal((await buy(R(200, '<p>No hay asientos disponibles</p>'))).motivo, 'sin-cupo');
+  assert.equal((await buy(R(200, '<p>No hay asientos disponibles</p>'))).motivo, 'desconocido', '2xx nunca es sin-cupo');
+  assert.equal((await buy(R(409, '<p>No hay asientos disponibles</p>'))).motivo, 'sin-cupo');
+  const conScript = await buy(R(200, '<script>var e="payment declined"</script><h1>Compra confirmada</h1> PNR ABC123'));
+  assert.equal(conScript.ok, true); assert.equal(conScript.pnr, 'ABC123');
+  assert.equal((await buy(R(200, '<p>Vuelo JA3021 confirmado. PNR ABC123</p>'))).pnr, 'ABC123');
+  assert.equal((await buy(R(200, 'COMPRA CONFIRMADA ... ABC123'))).pnr, 'ABC123');
+  assert.equal((await buy(R(200, 'compra no confirmada JA3021'))).motivo, 'desconocido');
   const conf = await buy(R(200, '<h1>Reserva confirmada</h1> Código ABC123'));
   assert.equal(conf.ok, true); assert.equal(conf.pnr, 'ABC123');
   assert.equal((await buy(R(200, { pnr: 'XYZ789' }))).pnr, 'XYZ789');
