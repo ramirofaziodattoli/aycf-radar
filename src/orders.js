@@ -121,6 +121,21 @@ export async function renovarLock(store, id, owner, ttlSeconds) {
   return true;
 }
 
+/** Hoy en Argentina (UTC-3 fijo, sin DST): a las 22 h ART en UTC ya es mañana. */
+export const hoyEnAR = (now = new Date()) => new Date(now.getTime() - 3 * 3600 * 1000).toISOString().slice(0, 10);
+
+const sumarDias = (iso, n) => {
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+};
+
+/**
+ * ¿Lo compra una pasada horaria de hoy? El inventario de mañana ya se liberó a las
+ * 00:01 de hoy y las pasadas (cada hora hasta las 20:00 ART) lo levantan; el resto
+ * espera a la corrida de las 00:00 del día anterior al vuelo.
+ */
+export const esDeMañana = (o, hoy = hoyEnAR()) => o.fechaVuelo === sumarDias(hoy, 1);
+
 const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
 
 /** "2026-11-07" → "sábado 07/11". UTC a propósito: es una fecha de calendario, no un instante. */
@@ -135,8 +150,7 @@ export function fechaLarga(iso) {
  * de D, así que un vuelo del sábado se compra al arrancar el viernes.
  */
 export function nocheDeCompra(o) {
-  const [y, m, d] = o.fechaVuelo.split('-').map(Number);
-  return fechaLarga(new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10));
+  return fechaLarga(sumarDias(o.fechaVuelo, -1));
 }
 
 /**
@@ -144,14 +158,18 @@ export function nocheDeCompra(o) {
  * confirmar: «📌 *Pedido* · sábado 07/11 · BRC → AEP (cualquier horario) · AEP → COR,
  * escala ≥ 2,5 h · lo busco el viernes 06/11 a las 00:00». El horario del primer
  * tramo es la ventana o, sin ventana, la preferencia; los siguientes dependen de
- * la escala, así que muestran eso (y su ventana si la tienen).
+ * la escala, así que muestran eso (y su ventana si la tienen). Un vuelo de mañana
+ * no espera a las 00:00: lo busca la próxima pasada horaria.
  */
-export function formatPedido(o) {
+export function formatPedido(o, { hoy = hoyEnAR() } = {}) {
   const tramos = o.tramos.map((t, i) => {
     const horario = t.ventana ? ` (${t.ventana[0]}–${t.ventana[1]})`
       : i === 0 ? ` (${o.preferencia ?? 'cualquier horario'})` : '';
     const escala = i > 0 ? `, escala ≥ ${String(o.escalaMinimaHoras).replace('.', ',')} h` : '';
     return `${t.from} → ${t.to}${horario}${escala}`;
   });
-  return ['📌 *Pedido*', fechaLarga(o.fechaVuelo), ...tramos, `lo busco el ${nocheDeCompra(o)} a las 00:00`].join(' · ');
+  const cuando = esDeMañana(o, hoy)
+    ? 'lo busco en la próxima pasada (cada hora hasta las 20:00)'
+    : `lo busco el ${nocheDeCompra(o)} a las 00:00`;
+  return ['📌 *Pedido*', fechaLarga(o.fechaVuelo), ...tramos, cuando].join(' · ');
 }

@@ -700,7 +700,7 @@ const memStore = () => {
   const o = newOrder({ chatId: '1', fechaVuelo: '2026-11-08', tramos: [{ from: 'BRC', to: 'AEP' }, { from: 'AEP', to: 'COR' }] });
   assert.match(o.id, /^ord_[0-9a-f]{10}$/); assert.equal(o.estado, 'borrador');
   assert.equal(o.escalaMinimaHoras, 2.5); assert.equal(o.topeTasasPorTramoARS, 40000);
-  assert.equal(formatPedido(o), '📌 *Pedido* · domingo 08/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco el sábado 07/11 a las 00:00');
+  assert.equal(formatPedido(o, { hoy: '2026-11-05' }), '📌 *Pedido* · domingo 08/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco el sábado 07/11 a las 00:00');
 
   await saveOrder(store, o);
   assert.equal((await getOrder(store, o.id)).fechaVuelo, '2026-11-08');
@@ -1593,17 +1593,20 @@ const memStore = () => {
   assert.equal(borrador.fechaVuelo, '2026-11-07', 'el próximo sábado respecto de hoy');
   assert.equal(borrador.tramos.length, 2);
   assert.equal(borrador.escalaMinimaHoras, 2.5, 'null del modelo = el default');
-  assert.equal(out.text, formatPedido(borrador) + '\n\n¿Lo confirmo?');
-  assert.equal(formatPedido(borrador),
+  assert.equal(out.text, formatPedido(borrador, { hoy: HOY }) + '\n\n¿Lo confirmo?');
+  assert.equal(formatPedido(borrador, { hoy: HOY }),
     '📌 *Pedido* · sábado 07/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco el viernes 06/11 a las 00:00');
-  assert.equal(formatPedido({ ...borrador, tramos: [{ from: 'BRC', to: 'AEP', ventana: ['06:00', '12:00'] }] }),
+  assert.equal(formatPedido({ ...borrador, tramos: [{ from: 'BRC', to: 'AEP', ventana: ['06:00', '12:00'] }] }, { hoy: HOY }),
     '📌 *Pedido* · sábado 07/11 · BRC → AEP (06:00–12:00) · lo busco el viernes 06/11 a las 00:00');
+  // Vuelo de mañana: el inventario ya salió a las 00:01 de hoy y lo levantan las pasadas horarias.
+  assert.equal(formatPedido({ ...borrador, fechaVuelo: '2026-11-06' }, { hoy: HOY }),
+    '📌 *Pedido* · viernes 06/11 · BRC → AEP (cualquier horario) · AEP → COR, escala ≥ 2,5 h · lo busco en la próxima pasada (cada hora hasta las 20:00)');
 
   // (c) los botones: confirmar, cancelar, id que no existe, y sólo para el dueño.
   const noDueno = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '2' });
   assert.equal((await getOrder(store, id)).estado, 'borrador', 'otro chat no confirma nada');
   assert.ok(!/Listo/.test(noDueno.text));
-  const conf = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '1' });
+  const conf = await handleCallback(`ord:ok:${id}`, { store, user: null, chatId: '1', hoy: HOY });
   assert.equal((await getOrder(store, id)).estado, 'confirmado');
   assert.equal(conf.text, '✅ Listo, lo compro el viernes 06/11 a las 00:00. Te aviso con el PNR.');
   const canc = await handleCallback(`ord:no:${id}`, { store, user: null, chatId: '1' });
@@ -1659,22 +1662,50 @@ const memStore = () => {
   });
   assert.match(desencadenado.text, /encaden/);
   assert.ok(!desencadenado.buttons);
-  const tarde = await cmdPedido(store, '1', 'mañana a aeroparque', {
+  // Mañana vale (las pasadas horarias lo compran); hoy o antes, no.
+  const manana = await cmdPedido(store, '1', 'mañana a aeroparque', {
     hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, fechaVuelo: '2026-11-06', tramos: [{ from: 'BRC', to: 'AEP', ventana: null }] }),
   });
-  assert.match(tarde.text, /00:00/); assert.ok(!tarde.buttons, 'la compra de ese vuelo ya pasó');
-  assert.equal((await listOrders(store)).length, antes + 1, 'sólo el estricto quedó guardado');
+  assert.match(manana.text, /lo busco en la próxima pasada \(cada hora hasta las 20:00\)/);
+  const idManana = manana.buttons[0][0].data.replace(/^ord:ok:/, '');
+  assert.equal((await getOrder(store, idManana)).estado, 'borrador');
+  const confManana = await handleCallback(`ord:ok:${idManana}`, { store, user: null, chatId: '1', hoy: HOY });
+  assert.equal(confManana.text, '✅ Listo, lo busco en la próxima pasada horaria. Te aviso con el PNR.');
+  const hoyMismo = await cmdPedido(store, '1', 'hoy a aeroparque', {
+    hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, fechaVuelo: HOY, tramos: [{ from: 'BRC', to: 'AEP', ventana: null }] }),
+  });
+  assert.match(hoyMismo.text, /ya está en el pasado o es hoy: el canje cierra 2 h antes de la salida/);
+  assert.ok(!hoyMismo.buttons);
+
+  // Ruta que no existe en la red: no se guarda.
+  const sinRuta = await cmdPedido(store, '1', 'el sábado bariloche a salta', {
+    hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tramos: [{ from: 'BRC', to: 'SLA', ventana: null }] }),
+  });
+  assert.match(sinRuta.text, /BRC → SLA no existe como vuelo directo en la red/);
+  assert.ok(!sinRuta.buttons);
+
+  // Lo que viene del modelo o de un Error no puede romper el Markdown de Telegram.
+  const md = await cmdPedido(store, '1', 'x', {
+    hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, fechaVuelo: null, tramos: [], aclaracion: '¿*Córdoba* o COR_1 [`x`]?' }),
+  });
+  assert.equal(md.text, '¿\\*Córdoba\\* o COR\\_1 \\[\\`x\\`]?');
+  const ventanaRota = await cmdPedido(store, '1', 'x', {
+    hoy: HOY, _fetch: async () => respuesta({ ...PEDIDO, tramos: [{ from: 'BRC', to: 'AEP', ventana: ['6', '12'] }] }),
+  });
+  assert.match(ventanaRota.text, /\\\[HH:MM, HH:MM\]/, 'el [ del error va escapado');
+
+  assert.equal((await listOrders(store)).length, antes + 2, 'quedan el estricto y el de mañana');
 
   // /pedidos: los vivos con su botón de cancelar; vacío, invita a pedir.
   assert.equal((await cmdPedidos(memStore())).text, 'No tenés pedidos vivos. Contame qué pasaje necesitás.');
   const lista = await cmdPedidos(store);
-  assert.equal(lista.buttons.length, 1, 'el cancelado no aparece');
+  assert.equal(lista.buttons.length, 2, 'el cancelado no aparece');
   assert.equal(lista.buttons[0][0].data, `ord:no:${estricto.buttons[0][0].data.slice(7)}`);
   assert.match(lista.text, /BRC → AEP/);
 
   // El webhook: /pedidos por comando y la ayuda del dueño.
   const porComando = await handleCommand('/pedidos', { store, session: null, user: dueno, chatId: '1' });
-  assert.equal(porComando.buttons.length, 1);
+  assert.equal(porComando.buttons.length, 2);
   const ayuda = await handleCommand('/ayuda', { store, session: null, user: dueno, chatId: '1' });
   assert.match(ayuda, /\/pedidos — mis pedidos de compra automática/);
   assert.match(ayuda, /lo compro solo a las 00:00/);

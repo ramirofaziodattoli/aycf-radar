@@ -10,7 +10,7 @@ import { Session } from './session.js';
 import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, scoped, nombreDe } from './users.js';
 import { haySecreto } from './crypto.js';
 import { cmdPedido, cmdPedidos } from './intake.js';
-import { getOrder, setEstado, nocheDeCompra } from './orders.js';
+import { getOrder, setEstado, nocheDeCompra, esDeMañana, hoyEnAR } from './orders.js';
 
 const BIENVENIDA = `🛩️ *Te aviso apenas hay cupo AYCF.*
 
@@ -309,14 +309,18 @@ async function botonesDestino(store, from, accion = 'a') {
  * botón viejo en el historial no puede resucitar un cancelado ni "cancelar" algo
  * que ya se compró.
  */
-async function callbackPedido(store, chatId, accion, id) {
+async function callbackPedido(store, chatId, accion, id, hoy) {
   if (!esDueno(chatId)) return { text: 'Ese botón ya no vale.' };
   const o = await getOrder(store, id);
   if (!o) return { text: 'Ese pedido ya no existe.' };
   if (accion === 'ok') {
     if (o.estado !== 'borrador') return { text: `Ese pedido ya está *${o.estado}*. Mirá /pedidos.` };
     await setEstado(store, id, 'confirmado');
-    return { text: `✅ Listo, lo compro el ${nocheDeCompra(o)} a las 00:00. Te aviso con el PNR.` };
+    return {
+      text: esDeMañana(o, hoy)
+        ? '✅ Listo, lo busco en la próxima pasada horaria. Te aviso con el PNR.'
+        : `✅ Listo, lo compro el ${nocheDeCompra(o)} a las 00:00. Te aviso con el PNR.`,
+    };
   }
   if (!['borrador', 'confirmado', 'dudoso'].includes(o.estado)) {
     return { text: `Ese pedido ya está *${o.estado}*, no hay nada que cancelar.` };
@@ -326,11 +330,11 @@ async function callbackPedido(store, chatId, accion, id) {
 }
 
 /** Un toque de botón. Devuelve { text, buttons } para reemplazar el mensaje. */
-export async function handleCallback(data, { store, session, user, chatId }) {
+export async function handleCallback(data, { store, session, user, chatId, hoy = hoyEnAR() }) {
   const perfil = user ?? (chatId ? { chatId: String(chatId) } : null);
   const [accion, from, to] = String(data).split(':');
   try {
-    if (accion === 'ord') return await callbackPedido(store, chatId, from, to);
+    if (accion === 'ord') return await callbackPedido(store, chatId, from, to, hoy);
     if (accion === 'menu') {
       return (await botonesOrigen(store, '¿Desde dónde volás?')) ??
         { text: 'Todavía no tengo el mapa de la red. Probá `/vigilar bariloche salta`.' };

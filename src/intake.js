@@ -9,8 +9,8 @@
 // Si la API no está (sin key, caída, respuesta rara) queda el formato estricto
 // `comprar 2026-11-08 BRC-AEP AEP-COR`, que se parsea acá sin red.
 
-import { getCatalog } from './airports.js';
-import { newOrder, saveOrder, listOrders, formatPedido, fechaLarga } from './orders.js';
+import { getCatalog, routeExists } from './airports.js';
+import { newOrder, saveOrder, listOrders, formatPedido, fechaLarga, hoyEnAR } from './orders.js';
 
 const API = 'https://api.anthropic.com/v1/messages';
 const TIMEOUT_MS = 30_000;
@@ -52,13 +52,11 @@ export const ORDER_SCHEMA = {
 
 const AYUDA_ESTRICTA = 'No pude interpretar el pedido. Probá el formato: `comprar 2026-11-08 BRC-AEP AEP-COR`';
 
-/** Hoy en Argentina (UTC-3 fijo): a las 22 h ART en UTC ya es mañana. */
-const hoyEnAR = (now = new Date()) => new Date(now.getTime() - 3 * 3600 * 1000).toISOString().slice(0, 10);
-
-const sumarDias = (iso, n) => {
-  const [y, m, d] = iso.split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
-};
+/**
+ * Lo que viene del modelo o de un Error va dentro de un mensaje con Markdown de
+ * Telegram: un `_` o un `[` suelto hace que la API rechace el mensaje entero.
+ */
+const escapeMd = (s) => String(s).replace(/([_*[`])/g, '\\$1');
 
 function reglas(hoy, aeropuertos) {
   const red = Object.entries(aeropuertos ?? {})
@@ -147,7 +145,7 @@ export async function cmdPedido(store, chatId, texto, { _fetch = fetch, hoy = ho
   if (p.tipo === 'busqueda') {
     return { text: 'Parece una búsqueda. Mandame `/buscar <origen> <destino>` o los dos nombres sueltos.' };
   }
-  if (p.aclaracion) return { text: p.aclaracion };
+  if (p.aclaracion) return { text: escapeMd(p.aclaracion) };
 
   let order;
   try {
@@ -162,18 +160,25 @@ export async function cmdPedido(store, chatId, texto, { _fetch = fetch, hoy = ho
       ...(PREFERENCIAS.includes(p.preferencia) ? { preferencia: p.preferencia } : {}),
     });
   } catch (err) {
-    return { text: `⚠️ No pude armar el pedido: ${err.message}.` };
+    return { text: `⚠️ No pude armar el pedido: ${escapeMd(err.message)}.` };
   }
 
-  // La compra de un vuelo del día D corre a las 00:00 de D-1: un pedido para
-  // mañana (o antes) quedaría confirmado sin que ninguna corrida lo levante nunca.
-  if (order.fechaVuelo < sumarDias(hoy, 2)) {
-    return { text: `⚠️ Para el ${fechaLarga(order.fechaVuelo)} ya no llego: la compra corre a las 00:00 del día anterior al vuelo.` };
+  // Mañana todavía se llega (las pasadas horarias de hoy compran el inventario
+  // que salió a las 00:01); hoy o antes, no.
+  if (order.fechaVuelo <= hoy) {
+    return { text: `⚠️ El ${fechaLarga(order.fechaVuelo)} ya está en el pasado o es hoy: el canje cierra 2 h antes de la salida.` };
+  }
+
+  // Un tramo que no existe en la red nunca va a tener cupo: mejor decirlo ahora
+  // que dejar un pedido confirmado que falla solo a las 00:00. Sin catálogo no se bloquea.
+  const inexistente = cat && order.tramos.find((t) => !routeExists(t.from, t.to, cat.rutas));
+  if (inexistente) {
+    return { text: `⚠️ ${inexistente.from} → ${inexistente.to} no existe como vuelo directo en la red.` };
   }
 
   await saveOrder(store, order);
   return {
-    text: formatPedido(order) + '\n\n¿Lo confirmo?',
+    text: formatPedido(order, { hoy }) + '\n\n¿Lo confirmo?',
     buttons: [[
       { text: '✅ Confirmar', data: `ord:ok:${order.id}` },
       { text: '❌ Cancelar', data: `ord:no:${order.id}` },
