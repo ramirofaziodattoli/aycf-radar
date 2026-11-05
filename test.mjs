@@ -1433,6 +1433,54 @@ const memStore = () => {
   assert.ok(!JSON.stringify(r2.body).includes('4111'), 'la tarjeta no se devuelve');
   msgs.length = 0;
 
+  // El loop con tarjeta válida y costuras: dos pedidos, uno que revienta, ?order, y la tarjeta no se filtra.
+  {
+    const CARD = { number: '4111111111111111', month: '12', year: '2030', cvv: '123', holder: 'A B' };
+    process.env.AYCF_CARD = JSON.stringify(CARD);
+    const o2 = newOrder({ chatId: '1', fechaVuelo: tomorrowInAR(), tramos: [{ from: 'AEP', to: 'COR' }] });
+    await saveOrder(duenoStore, { ...o2, estado: 'confirmado' });
+    const fallido = newOrder({ chatId: '1', fechaVuelo: '2030-01-01', tramos: [{ from: 'COR', to: 'AEP' }] });
+    await saveOrder(duenoStore, { ...fallido, estado: 'fallido' });
+    const sesion = (_s, fn) => fn({ fake: true });
+    const llamadas = [];
+    const ok = async (a) => { llamadas.push(a); return { estado: 'comprado' }; };
+
+    const r1 = await buy({ headers: {}, query: {} }, res(), { _runBuy: ok, _withSession: sesion });
+    assert.equal(r1.code, 200);
+    assert.deepEqual(llamadas.map((a) => a.order.id).sort(), [pedido.id, o2.id].sort());
+    assert.deepEqual(r1.body.orders.map((o) => o.id), llamadas.map((a) => a.order.id), 'en el orden en que se procesaron');
+    assert.equal(llamadas.length, 2);
+    assert.deepEqual(r1.body.orders.map((o) => o.estado), ['comprado', 'comprado']);
+    assert.deepEqual(llamadas[0].card, CARD, 'la tarjeta llega entera a runBuy');
+    assert.ok(!JSON.stringify(r1.body).includes(CARD.number) && !JSON.stringify(r1.body).includes('cvv'));
+
+    llamadas.length = 0;
+    let n = 0;
+    const rompe = async (a) => { llamadas.push(a); if (++n === 1) throw new Error(`boom ${CARD.number}`); return { estado: 'comprado' }; };
+    const r2 = await buy({ headers: {}, query: {} }, res(), { _runBuy: rompe, _withSession: sesion });
+    assert.equal(r2.code, 200); assert.equal(llamadas.length, 2, 'el segundo corre igual');
+    assert.deepEqual(r2.body.orders[0], { id: llamadas[0].order.id, error: 'interno' });
+    assert.equal(r2.body.orders[1].estado, 'comprado');
+
+    const r3 = await buy({ headers: {}, query: {} }, res(), { _runBuy: async () => { throw new Error('x'); }, _withSession: sesion });
+    assert.equal(r3.code, 500); assert.equal(r3.body.orders.length, 2);
+
+    llamadas.length = 0;
+    const r4 = await buy({ headers: {}, query: { order: [fallido.id, 'otro'] } }, res(), { _runBuy: ok, _withSession: sesion });
+    assert.equal(llamadas.length, 1); assert.equal(llamadas[0].order.id, fallido.id, '?order fuerza uno en cualquier estado');
+    assert.deepEqual(r4.body.orders, [{ id: fallido.id, estado: 'comprado' }]);
+
+    // Sin cuenta del dueño y con AUTO_BUY on: aviso al chat del dueño.
+    msgs.length = 0;
+    const { AYCF_EMAIL, AYCF_PASS_ID } = process.env;
+    delete process.env.AYCF_EMAIL; delete process.env.AYCF_PASS_ID;
+    const r5 = await buy({ headers: {}, query: {} }, res());
+    assert.equal(r5.body.skipped, 'sin-dueno'); assert.equal(msgs.length, 1);
+    process.env.AYCF_EMAIL = AYCF_EMAIL; process.env.AYCF_PASS_ID = AYCF_PASS_ID;
+    delete process.env.AYCF_CARD;
+    msgs.length = 0;
+  }
+
   // (d) el radar: el dueño se saltea en noche de compra, el otro corre.
   await saveUser(base, '7', { email: 'ana@mail.com', password: 'x', passId: 'p7' });
   await scoped(base, '7').set('watches', [{ from: 'AEP', to: 'COR' }]);

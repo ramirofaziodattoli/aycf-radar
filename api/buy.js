@@ -39,7 +39,10 @@ function leerTarjeta() {
   }
 }
 
-export default async function handler(req, res, { now = new Date() } = {}) {
+// `_runBuy` y `_withSession` son costuras de test: la compra real pega a Caravelo.
+export default async function handler(req, res, {
+  now = new Date(), _runBuy = runBuy, _withSession = withSession,
+} = {}) {
   const secret = process.env.CRON_SECRET;
   if (secret && req.headers.authorization !== `Bearer ${secret}`) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -49,11 +52,18 @@ export default async function handler(req, res, { now = new Date() } = {}) {
 
   try {
     const dueno = envUser();
-    if (!dueno) return res.status(200).json({ ok: true, skipped: 'sin-dueno' });
+    if (!dueno) {
+      // Sin cuenta del dueño no hay sesión con la que comprar: que se entere.
+      if (process.env.TELEGRAM_CHAT_ID) {
+        await reply('🔴 AUTO_BUY está prendido pero no hay cuenta del dueño cargada (AYCF_EMAIL / AYCF_PASS_ID)').catch(() => {});
+      }
+      return res.status(200).json({ ok: true, skipped: 'sin-dueno' });
+    }
     const store = scoped(createStore(), dueno.chatId);
 
     // ?order=<id> fuerza un pedido en cualquier estado (rescates, pruebas a mano).
-    const id = req.query?.order;
+    const q = req.query?.order;
+    const id = Array.isArray(q) ? q[0] : q;
     const pedidos = id ? [await getOrder(store, id)].filter(Boolean) : await ordersDueTonight(store);
     if (!pedidos.length) return res.status(200).json({ ok: true, orders: [] });
 
@@ -68,13 +78,21 @@ export default async function handler(req, res, { now = new Date() } = {}) {
     const orders = [];
     // En serie: un solo Caravelo y una sola tarjeta.
     for (const order of pedidos) {
-      const r = await withSession(store, (session) => runBuy({
-        order, store, session, chatId: undefined, card, deadline, esperarLockMs,
-      }), dueno);
-      orders.push({ id: order.id, estado: r.estado });
+      // Un pedido que revienta no puede dejar sin compra a los que siguen.
+      try {
+        const r = await _withSession(store, (session) => _runBuy({
+          order, store, session, chatId: undefined, card, deadline, esperarLockMs,
+        }), dueno);
+        orders.push({ id: order.id, estado: r.estado });
+      } catch (err) {
+        console.error(`buy ${order.id}: ${err.message}`); // sólo el mensaje: nunca el body ni la tarjeta
+        orders.push({ id: order.id, error: 'interno' });
+      }
     }
-    return res.status(200).json({ ok: true, orders });
+    const fallo = orders.every((o) => o.error);
+    return res.status(fallo ? 500 : 200).json({ ok: !fallo, orders });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
+    console.error(`buy: ${err.message}`);
+    return res.status(500).json({ ok: false, error: 'fallo interno' });
   }
 }
