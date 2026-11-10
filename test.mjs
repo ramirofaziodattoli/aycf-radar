@@ -2092,7 +2092,14 @@ const memStore = () => {
   assert.equal(comandoDe('bariloche salta', dueno, { chatId: '1' }).cmd, '/buscar', 'Review Focus 5');
   assert.deepEqual(comandoDe('el lunes necesito ir a aeroparque', dueno, { chatId: '1' }),
     { cmd: '/pedido', args: ['el lunes necesito ir a aeroparque'] });
-  assert.equal(comandoDe('el lunes necesito ir a aeroparque', { ...dueno, chatId: '2', env: false }, { chatId: '2' }).cmd, '/buscar');
+  // Otro chat: la frase va a /consulta (sólo búsqueda), nunca a /pedido; sin API key, /buscar.
+  assert.equal(comandoDe('el lunes necesito ir a aeroparque', { ...dueno, chatId: '2', env: false }, { chatId: '2' }).cmd, '/consulta');
+  {
+    const key = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    assert.equal(comandoDe('el lunes necesito ir a aeroparque', { ...dueno, chatId: '2', env: false }, { chatId: '2' }).cmd, '/buscar');
+    process.env.ANTHROPIC_API_KEY = key;
+  }
   assert.equal(comandoDe('/rutas', dueno, { chatId: '1' }).cmd, '/rutas');
   assert.equal(comandoDe('mia@mail.com mi clave larga', dueno, { chatId: '1' }).cmd, '/conectar');
   // Con una pregunta del pedido pendiente, hasta dos tokens son la respuesta.
@@ -2103,7 +2110,7 @@ const memStore = () => {
   assert.equal(comandoDe('/pedidos', dueno, { chatId: '1', enDialogo: true }).cmd, '/pedidos', 'los comandos siguen mandando');
   assert.equal(comandoDe('bariloche aeroparque', { ...dueno, chatId: '2', env: false }, { chatId: '2', enDialogo: true }).cmd, '/buscar', 'sólo el dueño');
   process.env.AUTO_BUY = 'off';
-  assert.equal(comandoDe('el lunes necesito ir a aeroparque', dueno, { chatId: '1' }).cmd, '/buscar', 'sin AUTO_BUY no hay pedidos');
+  assert.equal(comandoDe('el lunes necesito ir a aeroparque', dueno, { chatId: '1' }).cmd, '/consulta', 'sin AUTO_BUY no hay pedidos, sólo búsqueda');
   assert.equal(comandoDe('bariloche aeroparque', dueno, { chatId: '1', enDialogo: true }).cmd, '/buscar', 'sin AUTO_BUY tampoco en diálogo');
   process.env.AUTO_BUY = 'on';
 
@@ -2146,18 +2153,22 @@ const memStore = () => {
 
   // La búsqueda con fecha, de punta a punta: handleCommand la corre con la sesión.
   {
-    const V = { code: 'JA3102', from: 'AEP', to: 'COR', departsAt: '2026-11-09T12:04:00', departsHHMM: '12:04', arrivesHHMM: '13:25', duration: '1h 21m', seats: 6 };
+    // Fechas relativas a hoy: con fechas fijas el test se vence solo.
+    const { hoyEnAR } = await import("./src/orders.js");
+    const masDias = (n) => new Date(Date.parse(`${hoyEnAR()}T12:00:00Z`) + n * 864e5).toISOString().slice(0, 10);
+    const F1 = masDias(2), F2 = masDias(3);
+    const V = { code: 'JA3102', from: 'AEP', to: 'COR', departsAt: `${F1}T12:04:00`, departsHHMM: '12:04', arrivesHHMM: '13:25', duration: '1h 21m', seats: 6 };
     const pedidas = [];
     const _search = async (session, q, st) => { pedidas.push(q); assert.ok(st, 'guarda el catálogo'); return q.to === 'COR' ? [V] : []; };
     const ctx = { store, user: { chatId: '1' }, chatId: '1', session: {}, _search };
     // cmdPedido usa fetch real: acá se simula el modelo pisando el fetch global.
     const fetchReal = globalThis.fetch;
-    globalThis.fetch = async () => respuesta({ ...PEDIDO, tipo: 'busqueda', fechaVuelo: '2026-11-09' });
+    globalThis.fetch = async () => respuesta({ ...PEDIDO, tipo: 'busqueda', fechaVuelo: F1 });
     try {
       const out = await handleCommand('fijate qué hay el lunes de bariloche a aeroparque y de ahí a córdoba', ctx);
-      assert.deepEqual(pedidas, [{ from: 'BRC', to: 'AEP', date: '2026-11-09' }, { from: 'AEP', to: 'COR', date: '2026-11-09' }]);
-      assert.match(out, /❌ \*Bariloche → Aeroparque\* — sin cupo para el 2026-11-09/);
-      assert.match(out, /✅ \*Aeroparque → Córdoba\* — 1 vuelo\(s\) el 2026-11-09\n   • JA3102 · 12:04→13:25/);
+      assert.deepEqual(pedidas, [{ from: 'BRC', to: 'AEP', date: F1 }, { from: 'AEP', to: 'COR', date: F1 }]);
+      assert.match(out, new RegExp(`❌ \\*Bariloche → Aeroparque\\* — sin cupo para el ${F1}`));
+      assert.match(out, new RegExp(`✅ \\*Aeroparque → Córdoba\\* — 1 vuelo\\(s\\) el ${F1}\\n   • JA3102 · 12:04→13:25`));
       pedidas.length = 0;
       globalThis.fetch = async () => respuesta({ ...PEDIDO, tipo: 'busqueda', fechaVuelo: null, tramos: [{ from: 'AEP', to: 'COR', ventana: null }] });
       await handleCommand('aeroparque a córdoba qué hay', ctx);
@@ -2168,16 +2179,43 @@ const memStore = () => {
 
     // `/buscar` con fecha: el dueño sí, los demás no; una fecha pasada, tampoco.
     pedidas.length = 0;
-    const conFecha = await handleCommand('/buscar 2026-11-09 aeroparque córdoba', ctx);
-    assert.deepEqual(pedidas, [{ from: 'AEP', to: 'COR', date: '2026-11-09' }]);
-    assert.match(conFecha, /1 vuelo\(s\) el 2026-11-09/);
+    const conFecha = await handleCommand(`/buscar ${F1} aeroparque córdoba`, ctx);
+    assert.deepEqual(pedidas, [{ from: 'AEP', to: 'COR', date: F1 }]);
+    assert.match(conFecha, new RegExp(`1 vuelo\\(s\\) el ${F1}`));
     pedidas.length = 0;
-    await handleCommand('/buscar AEP COR 2026-11-10', ctx);
-    assert.equal(pedidas[0].date, '2026-11-10', 'la fecha puede ir al final');
+    await handleCommand(`/buscar AEP COR ${F2}`, ctx);
+    assert.equal(pedidas[0].date, F2, 'la fecha puede ir al final');
     pedidas.length = 0;
-    const otro = await handleCommand('/buscar 2026-11-09 AEP COR', { ...ctx, user: { chatId: '2' }, chatId: '2' });
-    assert.equal(pedidas.length, 0, 'para otro chat no se busca nada');
-    assert.match(otro, /Sólo puedo buscar el día siguiente/);
+    // Desde el 10/11 cualquiera busca con fecha y en frase libre; comprar, sólo el dueño.
+    const { comandoDe } = await import('./src/commands.js');
+    const storeOtro = memStore();
+    await storeOtro.set('catalog:routes', await store.get('catalog:routes'));
+    const ctxOtro = { ...ctx, store: storeOtro, user: { chatId: '2', email: 'a@b.c', password: 'x', passId: 'p2' }, chatId: '2' };
+    const otro = await handleCommand(`/buscar ${F1} AEP COR`, ctxOtro);
+    assert.deepEqual(pedidas, [{ from: 'AEP', to: 'COR', date: F1 }], 'otro chat también busca con fecha');
+    assert.match(otro, new RegExp(`1 vuelo\\(s\\) el ${F1}`));
+    {
+      const fetchReal2 = globalThis.fetch;
+      try {
+        pedidas.length = 0;
+        globalThis.fetch = async () => respuesta({ ...PEDIDO, fechaVuelo: F1, tramos: [{ from: 'AEP', to: 'COR', ventana: null }] });
+        assert.equal(comandoDe('comprame el lunes aeroparque córdoba', ctxOtro.user, { chatId: '2' }).cmd, '/consulta');
+        const consulta = await handleCommand('comprame el lunes aeroparque córdoba', ctxOtro);
+        assert.deepEqual(pedidas, [{ from: 'AEP', to: 'COR', date: F1 }]);
+        assert.match(consulta, /No compro pasajes/);
+        assert.equal((await listOrders(ctxOtro.store)).length, 0, 'un pedido de otro chat no se guarda');
+        // Si el modelo no da ruta, cae al /buscar de las palabras sueltas.
+        pedidas.length = 0;
+        globalThis.fetch = async () => respuesta({ ...PEDIDO, tipo: 'otro', tramos: [] });
+        await handleCommand(`AEP COR ${F2}`, ctxOtro);
+        assert.deepEqual(pedidas, [{ from: 'AEP', to: 'COR', date: F2 }]);
+      } finally {
+        globalThis.fetch = fetchReal2;
+      }
+    }
+    assert.match(await handleCommand('/ayuda', ctxOtro), /\/buscar `AAAA-MM-DD` origen destino/);
+    assert.doesNotMatch(await handleCommand('/ayuda', ctxOtro), /\/pedidos/);
+    pedidas.length = 0;
     assert.match(await handleCommand('/buscar 2020-01-01 AEP COR', ctx), /ya pasó/);
     pedidas.length = 0;
     await handleCommand('/buscar AEP COR', ctx);

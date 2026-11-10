@@ -143,6 +143,41 @@ export function parseOrderStrict(texto) {
 }
 
 /**
+ * Lo que entendió el modelo → `{ busqueda }` para que commands.js la corra con
+ * sesión, `{ text }` si la fecha ya pasó, o null si no quedó ningún tramo válido.
+ */
+function aBusqueda(p, hoy) {
+  const tramos = (p.tramos ?? [])
+    .map((t) => ({ from: String(t.from ?? '').toUpperCase(), to: String(t.to ?? '').toUpperCase() }))
+    .filter((t) => /^[A-Z]{3}$/.test(t.from) && /^[A-Z]{3}$/.test(t.to) && t.from !== t.to);
+  if (!tramos.length) return null;
+  if (p.fechaVuelo && p.fechaVuelo < hoy) return { text: `⚠️ El ${fechaLarga(p.fechaVuelo)} ya pasó.` };
+  return { busqueda: { fechaVuelo: p.fechaVuelo ?? null, tramos } };
+}
+
+/**
+ * Lenguaje natural para los que no son el dueño: sólo búsqueda, nunca un pedido.
+ * Aunque la frase sea «comprame el sábado…», se muestra lo que hay ese día y no
+ * se guarda nada (ni pedido ni charla pendiente). Devuelve null cuando no hay
+ * API, falla o no entendió una ruta: el que llama cae al `/buscar` de siempre.
+ */
+export async function cmdConsulta(store, texto, { _fetch = fetch, hoy = hoyEnAR() } = {}) {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  const cat = await getCatalog(store);
+  let p;
+  try {
+    p = await parseOrderText(texto, { hoy, aeropuertos: cat?.aeropuertos ?? {}, _fetch });
+  } catch (err) {
+    console.error(`consulta: ${err.message}`);
+    return null;
+  }
+  if (!p || p.tipo === 'otro') return null;
+  const r = aBusqueda(p, hoy);
+  if (r?.busqueda && p.tipo === 'pedido') r.busqueda.soloBusqueda = true;
+  return r;
+}
+
+/**
  * Del texto al borrador con botones. Cualquier falla de la API cae al formato
  * estricto; si tampoco es eso, se le muestra el formato y no se guarda nada.
  *
@@ -169,17 +204,8 @@ export async function cmdPedido(store, chatId, texto, { _fetch = fetch, hoy = ho
   if (p && previos.length) await borrarCtx(store);
   if (!p || p.tipo === 'otro') return { text: AYUDA_ESTRICTA };
   if (p.tipo === 'busqueda') {
-    // La búsqueda la corre quien tiene sesión (commands.js): acá sólo se normaliza.
-    const tramos = (p.tramos ?? [])
-      .map((t) => ({ from: String(t.from ?? '').toUpperCase(), to: String(t.to ?? '').toUpperCase() }))
-      .filter((t) => /^[A-Z]{3}$/.test(t.from) && /^[A-Z]{3}$/.test(t.to) && t.from !== t.to);
-    if (!tramos.length) {
-      return { text: 'Parece una búsqueda. Mandame `/buscar <origen> <destino>` o los dos nombres sueltos.' };
-    }
-    if (p.fechaVuelo && p.fechaVuelo < hoy) {
-      return { text: `⚠️ El ${fechaLarga(p.fechaVuelo)} ya pasó.` };
-    }
-    return { busqueda: { fechaVuelo: p.fechaVuelo ?? null, tramos } };
+    return aBusqueda(p, hoy) ??
+      { text: 'Parece una búsqueda. Mandame `/buscar <origen> <destino>` o los dos nombres sueltos.' };
   }
 
   let order;

@@ -9,7 +9,7 @@ import { getCatalog, resolveAirport, airportName, routeExists, destinationsFrom 
 import { Session } from './session.js';
 import { saveUser, deleteUser, estaConectado, usaSemilla, esDueno, listUsers, scoped, nombreDe } from './users.js';
 import { haySecreto } from './crypto.js';
-import { cmdPedido, cmdPedidos, pedidosVivos } from './intake.js';
+import { cmdPedido, cmdConsulta, cmdPedidos, pedidosVivos } from './intake.js';
 import { runBuy } from './buy.js';
 import { getOrder, setEstado, cancelOrder, hoyEnAR, fechaLarga } from './orders.js';
 
@@ -39,16 +39,17 @@ const AYUDA = `🛩️ *AYCF Radar*
 /estado — cómo viene todo
 
 También podés escribirme suelto *bariloche salta* y busco esa ruta, sin comando
-ni códigos.
+ni códigos, o pedirme «fijate qué hay el domingo de aeroparque a córdoba».
 
-_Solo se puede consultar el día siguiente: el pase libera los cupos a las 00:01
-y no existe inventario más allá de eso._`;
+/buscar \`AAAA-MM-DD\` origen destino — busco otra fecha, no sólo mañana
+
+_El pase libera los cupos a las 00:01, pero los vuelos de 2 o 3 días adelante
+ya se ven: buscalos con fecha. Yo sólo busco, no compro._`;
 
 // Solo el dueño del deploy (TELEGRAM_CHAT_ID) lo ve y lo puede usar.
 const AYUDA_ADMIN = `/usuarios — quiénes usan el bot (solo vos)
 /pedidos — mis pedidos de compra automática
 /ensayo [N] — ensayo de compra sin pagar del último pedido o del N de /pedidos (sólo vos)
-/buscar \`AAAA-MM-DD\` origen destino — busco cualquier fecha, no sólo mañana (sólo vos)
 
 También podés contarme qué pasaje necesitás y lo compro solo apenas aparezca cupo,
 o pedirme «fijate qué hay el domingo de aeroparque a córdoba» y te muestro el listado.`;
@@ -159,8 +160,8 @@ async function buscarRuta(store, session, { from, to, date, cat }, _search = sea
 
 /**
  * `/buscar [AAAA-MM-DD] origen destino`. Sin fecha, mañana (lo único que el portal
- * deja ver). Con fecha, cualquier día desde hoy: sólo el dueño, porque el que
- * confía en «mañana» no tiene por qué saber que el backend da más.
+ * deja ver). Con fecha, cualquier día desde hoy, para todos (desde el 10/11):
+ * buscar no gasta nada del pase; comprar sigue siendo sólo del dueño.
  */
 async function cmdBuscar(store, session, user, args, { chatId, _search = search, hoy = hoyEnAR() } = {}) {
   if (!args.length) {
@@ -175,17 +176,16 @@ async function cmdBuscar(store, session, user, args, { chatId, _search = search,
   }
   const fecha = args.find((a) => ES_FECHA.test(a)) ?? null;
   const resto = args.filter((a) => a !== fecha);
-  if (fecha && !esDueno(chatId)) return 'Sólo puedo buscar el día siguiente: el pase libera los cupos a las 00:01.';
   if (fecha && fecha < hoy) return `⚠️ El ${fechaLarga(fecha)} ya pasó.`;
   const { from, to, cat } = await parseRuta(resto, store);
   return buscarRuta(store, session, { from, to, date: fecha ?? tomorrowInAR(), cat }, _search);
 }
 
 /** La búsqueda que salió del lenguaje natural (`cmdPedido` → `busqueda`): un listado por tramo. */
-async function buscarPedida(store, session, { fechaVuelo, tramos }, _search) {
+async function buscarPedida(store, session, { fechaVuelo, tramos, soloBusqueda }, _search) {
   const cat = await getCatalog(store);
   const date = fechaVuelo ?? tomorrowInAR();
-  const partes = [];
+  const partes = soloBusqueda ? ['_No compro pasajes, pero te muestro qué hay._'] : [];
   for (const { from, to } of tramos) partes.push(await buscarRuta(store, session, { from, to, date, cat }, _search));
   return partes.join('\n\n');
 }
@@ -537,6 +537,11 @@ export function comandoDe(text, user, { chatId, enDialogo = false } = {}) {
   if (esDueno(chatId) && process.env.AUTO_BUY === 'on' && (enDialogo || tokens.length !== 2)) {
     return { cmd: '/pedido', args: [String(text).trim()] };
   }
+  // Los demás también pueden escribir una frase («fijate qué hay el domingo de X a Y»):
+  // pasa por el modelo sólo para buscar. Dos palabras sueltas siguen yendo directo.
+  if (estaConectado(user) && tokens.length > 2 && process.env.ANTHROPIC_API_KEY) {
+    return { cmd: '/consulta', args: [String(text).trim()] };
+  }
   if (estaConectado(user)) return { cmd: '/buscar', args: tokens };
   return { cmd: '/start', args: [] };
 }
@@ -598,7 +603,7 @@ export async function cmdEnsayo(store, session, chatId, args, { _runBuy = runBuy
 /** Los que le pegan a JetSmart: sin cuenta conectada no hay nada que consultar. */
 // `/pedido` entra porque una frase del dueño puede ser una búsqueda («fijate qué hay el
 // domingo»): abrir la sesión es leer el store, el login sólo pasa si venció.
-export const NECESITA_SESION = ['/buscar', '/estado', '/pase', '/ensayo', '/pedido'];
+export const NECESITA_SESION = ['/buscar', '/estado', '/pase', '/ensayo', '/pedido', '/consulta'];
 
 async function dispatch(cmd, args, { store, session, user, chatId, from, _runBuy, _search }) {
   const ayuda = esDueno(chatId) ? `${AYUDA}\n${AYUDA_ADMIN}` : AYUDA;
@@ -621,6 +626,16 @@ async function dispatch(cmd, args, { store, session, user, chatId, from, _runBuy
       {
         const r = await cmdPedido(store, chatId, args.join(' '));
         return r.busqueda ? buscarPedida(store, session, r.busqueda, _search) : r;
+      }
+    // Frase libre de alguien que no es el dueño: sólo búsqueda. Si el modelo no da
+    // una ruta, cae al /buscar de siempre con las palabras sueltas.
+    case '/consulta':
+      {
+        const texto = args.join(' ');
+        const r = await cmdConsulta(store, texto);
+        if (r?.busqueda) return buscarPedida(store, session, r.busqueda, _search);
+        if (r?.text) return r;
+        return cmdBuscar(store, session, user, texto.split(/\s+/), { chatId, _search });
       }
     case '/pedidos':
       if (!esDueno(chatId)) break;
